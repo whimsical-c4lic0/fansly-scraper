@@ -27,7 +27,7 @@ build-backend = "poetry.core.masonry.api"
 
 
 [tool.poetry.dependencies]
-python = ">=3.12,<3.14"
+python = ">=3.12,<3.15"
 imagehash = ">=4.3.1,<5.0.0"
 loguru = ">=0.7.2"
 m3u8 = ">=6.0.0"
@@ -38,7 +38,6 @@ rich = ">=13.7.0,<15.0.0"
 strenum = ">=0.4.15,<0.5.0"
 websockets = ">=15.0.0"
 alembic = ">=1.17.0"
-aiosqlite = ">=0.20.0"
 greenlet = ">=3.2.1"
 aiomultiprocess = ">=0.9.1"
 toml = ">=0.10.2"
@@ -52,7 +51,8 @@ httpx-retries = ">=0.4.3"
 ffmpeg-python = ">=0.2.0"
 jsbeautifier = ">=1.15.4"
 javascript = ">=1!1.2.6"
-stash-graphql-client = ">=0.10.8"
+stash-graphql-client = ">=0.11.0"
+av = "^17.0.0"
 
 
 [tool.poetry.group.browser-auth]
@@ -301,7 +301,6 @@ addopts = [
     "--strict-markers",
     "--strict-config",
     "--tb=short",
-    "--cov=.",
     "--cov-report=term-missing",
     "--cov-report=html:htmlcov",
     "--cov-config=pyproject.toml",
@@ -474,8 +473,12 @@ module = "helpers.checkkey"
 ignore_errors = true
 
 [[tool.mypy.overrides]]
+module = "av.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "download.m3u8"
-# Uses ffmpeg and m3u8 libraries (no type stubs)
+# Uses ffmpeg, m3u8, and av libraries (no type stubs)
 ignore_errors = true
 
 [[tool.mypy.overrides]]

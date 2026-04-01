@@ -86,10 +86,6 @@ class TestFanslyConfig:
         assert isinstance(config._parser, ConfigParser)
         assert config._api is None
 
-        # Check default metadata DB file (None until explicitly set)
-        # metadata_db_file is deprecated in favor of PostgreSQL configuration
-        assert config.metadata_db_file is None
-
     def test_user_names_str_with_names(self, config):
         """Test user_names_str with valid user names."""
         assert config.user_names_str() in ["user1, user2", "user2, user1"]
@@ -263,10 +259,6 @@ class TestFanslyConfig:
         config.token = None
         assert config.get_unscrambled_token() is None
 
-    # NOTE: _get_default_metadata_db_file method doesn't exist in FanslyConfig
-    # metadata_db_file is deprecated in favor of PostgreSQL configuration
-    # Test removed as the method is not implemented
-
     def test_get_api(self, config):
         """Test get_api method with valid credentials."""
         # Make sure _api is None to force a new instance creation
@@ -294,6 +286,7 @@ class TestFanslyConfig:
                 device_id_timestamp=config.cached_device_id_timestamp,
                 on_device_updated=config._save_config,
                 rate_limiter=mock_rate_limiter,
+                config=config,
             )
             assert result is mock_api
             assert config._api is mock_api
@@ -373,7 +366,7 @@ class TestFanslyConfig:
             "apikey": "test_key",
         }
 
-        with patch("stash.StashContext") as mock_stash_context_class:
+        with patch("config.fanslyconfig.StashContext") as mock_stash_context_class:
             mock_stash_context = MagicMock()
             mock_stash_context_class.return_value = mock_stash_context
 

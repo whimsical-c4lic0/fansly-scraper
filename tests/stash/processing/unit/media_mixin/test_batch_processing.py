@@ -6,9 +6,10 @@ objects efficiently by grouping them by mimetype and processing in batches.
 Tests migrated to use respx_stash_processor fixture for HTTP boundary mocking.
 """
 
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
+from stash_graphql_client.types import Studio
 
 from tests.fixtures.metadata.metadata_factories import MediaFactory
 from tests.fixtures.stash.stash_type_factories import (
@@ -17,6 +18,7 @@ from tests.fixtures.stash.stash_type_factories import (
     SceneFactory,
     VideoFileFactory,
 )
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 class TestBatchProcessing:
@@ -31,11 +33,11 @@ class TestBatchProcessing:
         media_list = []
         for i in range(5):
             media = MediaFactory.build(
-                id=20000 + i,
+                id=snowflake_id(),
                 mimetype="image/jpeg",
                 is_downloaded=True,
                 accountId=mock_account.id,
-                stash_id=f"stash_{20000 + i}",
+                stash_id=20000 + i,
             )
             media_list.append(media)
 
@@ -80,11 +82,11 @@ class TestBatchProcessing:
         media_list = []
         for i in range(45):  # 45 items should split into 3 batches (20+20+5)
             media = MediaFactory.build(
-                id=30000 + i,
+                id=snowflake_id(),
                 mimetype="image/jpeg",
                 is_downloaded=True,
                 accountId=mock_account.id,
-                stash_id=f"stash_{30000 + i}",
+                stash_id=30000 + i,
             )
             media_list.append(media)
 
@@ -130,11 +132,11 @@ class TestBatchProcessing:
         media_list = []
         for i in range(3):
             media = MediaFactory.build(
-                id=40000 + i,
+                id=snowflake_id(),
                 mimetype="image/jpeg",
                 is_downloaded=True,
                 accountId=mock_account.id,
-                stash_id=f"stash_id_{40000 + i}",
+                stash_id=40000 + i,
             )
             media_list.append(media)
 
@@ -146,7 +148,7 @@ class TestBatchProcessing:
             # Return fake results
             results = []
             for stash_id, _mimetype in lookup_data:
-                image = ImageFactory(id=stash_id)
+                image = ImageFactory(id=str(stash_id))
                 image_file = ImageFileFactory()
                 results.append((image, image_file))
             return results
@@ -154,7 +156,7 @@ class TestBatchProcessing:
         update_calls = []
 
         async def mock_update_metadata(
-            stash_obj, item, account, media_id, is_preview=False
+            stash_obj, item, account, media_id, is_preview=False, studio=None
         ):
             update_calls.append(
                 {
@@ -163,8 +165,16 @@ class TestBatchProcessing:
                 }
             )
 
+        # Mock studio lookup (hoisted to top of _process_batch_internal)
+        mock_studio = Studio(id="9999", name="test (Fansly)")
+
         # Mock the methods using patch.object
         with (
+            patch.object(
+                respx_stash_processor,
+                "_find_existing_studio",
+                AsyncMock(return_value=mock_studio),
+            ),
             patch.object(
                 respx_stash_processor, "_find_stash_files_by_id", mock_find_by_id
             ),
@@ -197,9 +207,9 @@ class TestBatchProcessing:
         """Test _process_batch_internal processes media without stash_ids (path-based)."""
         # Create media WITHOUT stash_ids (will use path-based lookup)
         media_list = []
-        for i in range(3):
+        for _i in range(3):
             media = MediaFactory.build(
-                id=50000 + i,
+                id=snowflake_id(),
                 mimetype="image/jpeg",
                 is_downloaded=True,
                 accountId=mock_account.id,
@@ -224,12 +234,20 @@ class TestBatchProcessing:
         update_calls = []
 
         async def mock_update_metadata(
-            stash_obj, item, account, media_id, is_preview=False
+            stash_obj, item, account, media_id, is_preview=False, studio=None
         ):
             update_calls.append({"media_id": media_id})
 
+        # Mock studio lookup (hoisted to top of _process_batch_internal)
+        mock_studio = Studio(id="9999", name="test (Fansly)")
+
         # Mock the methods using patch.object
         with (
+            patch.object(
+                respx_stash_processor,
+                "_find_existing_studio",
+                AsyncMock(return_value=mock_studio),
+            ),
             patch.object(
                 respx_stash_processor, "_find_stash_files_by_path", mock_find_by_path
             ),
@@ -264,9 +282,9 @@ class TestBatchProcessing:
         media_list = []
 
         # Add 2 images
-        for i in range(2):
+        for _i in range(2):
             media = MediaFactory.build(
-                id=60000 + i,
+                id=snowflake_id(),
                 mimetype="image/jpeg",
                 is_downloaded=True,
                 accountId=mock_account.id,
@@ -275,9 +293,9 @@ class TestBatchProcessing:
             media_list.append(media)
 
         # Add 2 videos
-        for i in range(2):
+        for _i in range(2):
             media = MediaFactory.build(
-                id=60010 + i,
+                id=snowflake_id(),
                 mimetype="video/mp4",
                 is_downloaded=True,
                 accountId=mock_account.id,
@@ -301,8 +319,16 @@ class TestBatchProcessing:
         async def mock_update_metadata(*args, **kwargs):
             """No-op async mock for metadata update."""
 
+        # Mock studio lookup (hoisted to top of _process_batch_internal)
+        mock_studio = Studio(id="9999", name="test (Fansly)")
+
         # Mock the methods using patch.object
         with (
+            patch.object(
+                respx_stash_processor,
+                "_find_existing_studio",
+                AsyncMock(return_value=mock_studio),
+            ),
             patch.object(
                 respx_stash_processor, "_find_stash_files_by_path", mock_find_by_path
             ),

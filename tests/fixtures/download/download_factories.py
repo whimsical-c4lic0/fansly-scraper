@@ -6,6 +6,7 @@ replacing the need for MagicMock usage in tests.
 
 Usage:
     from tests.fixtures.download import DownloadStateFactory
+    from tests.fixtures.utils.test_isolation import snowflake_id
 
     # Create a basic download state for testing
     state = DownloadStateFactory()
@@ -13,7 +14,7 @@ Usage:
     # Create a state with specific values
     state = DownloadStateFactory(
         creator_name="testuser",
-        creator_id="12345"
+        creator_id=snowflake_id()
     )
 """
 
@@ -39,7 +40,7 @@ class DownloadStateFactory(Factory):
         # State for specific creator
         state = DownloadStateFactory(
             creator_name="mycreator",
-            creator_id="123456789"
+            creator_id=snowflake_id()
         )
 
         # State with paths configured
@@ -102,7 +103,7 @@ class DownloadStateFactoryWithCreator(DownloadStateFactory):
     """
 
     creator_name = Sequence(lambda n: f"creator_{n}")
-    creator_id = Sequence(lambda n: str(100000000000000000 + n))
+    creator_id = Sequence(lambda n: 100000000000000000 + n)
     base_path: Path | None = None
     download_path: Path | None = None
 

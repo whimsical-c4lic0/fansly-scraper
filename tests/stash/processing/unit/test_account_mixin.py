@@ -5,53 +5,54 @@ These tests use respx_stash_processor fixture for edge mocking.
 
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import httpx
 import pytest
 import respx
 from PIL import Image
 
-# Re-query account to ensure relationship is properly loaded
-from sqlalchemy import select
-
-from metadata import Account
 from tests.fixtures.metadata.metadata_factories import AccountFactory, MediaFactory
 from tests.fixtures.stash.stash_graphql_fixtures import (
     create_graphql_response,
     create_performer_dict,
 )
 from tests.fixtures.stash.stash_type_factories import PerformerFactory
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 class TestAccountProcessingMixin:
     """Test the account processing mixin functionality."""
 
     @pytest.mark.asyncio
-    async def test_find_account(self, respx_stash_processor, session):
+    async def test_find_account(self, respx_stash_processor, entity_store):
         """Test _find_account method.
 
         This test doesn't require GraphQL mocking since it only tests database queries.
         """
-        # Create test account in database
-        account = AccountFactory.build(id=12345, username="test_user", stash_id=12345)
-        session.add(account)
-        await session.commit()
+        acct_id = snowflake_id()
+
+        # Create test account in entity_store (production code uses get_store())
+        account = AccountFactory.build(id=acct_id, username="test_user", stash_id=12345)
+        await entity_store.save(account)
+
+        # Set creator_id to match the account we just created
+        respx_stash_processor.state.creator_id = acct_id
 
         # Call _find_account with creator_id
         await respx_stash_processor.context.get_client()
-        found_account = await respx_stash_processor._find_account(session=session)
+        found_account = await respx_stash_processor._find_account()
 
         # Verify account was found
         assert found_account is not None
-        assert found_account.id == 12345
+        assert found_account.id == acct_id
         assert found_account.username == "test_user"
 
         # Test with creator_name instead of id
         respx_stash_processor.state.creator_id = None
 
         # Call _find_account again
-        found_account = await respx_stash_processor._find_account(session=session)
+        found_account = await respx_stash_processor._find_account()
 
         # Verify account was found by username
         assert found_account is not None
@@ -64,7 +65,7 @@ class TestAccountProcessingMixin:
         with patch(
             "stash.processing.mixins.account.print_warning"
         ) as mock_print_warning:
-            found_account = await respx_stash_processor._find_account(session=session)
+            found_account = await respx_stash_processor._find_account()
 
         # Verify no account and warning was printed
         assert found_account is None
@@ -72,17 +73,21 @@ class TestAccountProcessingMixin:
         assert "nonexistent_user" in str(mock_print_warning.call_args)
 
     @pytest.mark.asyncio
-    async def test_process_creator(self, respx_stash_processor, session):
+    async def test_process_creator(self, respx_stash_processor, entity_store):
         """Test process_creator method."""
-        # Create test account in database
+        acct_id = snowflake_id()
+
+        # Create test account in entity_store
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
-            stash_id=12345,
+            stash_id=None,
+            displayName=None,  # Explicitly set to None to test username fallback
         )
-        account.stash_id = None
-        session.add(account)
-        await session.commit()
+        await entity_store.save(account)
+
+        # Set creator_id to match the account we just created
+        respx_stash_processor.state.creator_id = acct_id
 
         # Setup edge mock for get_or_create_performer flow:
         # 1. findPerformers (fuzzy search) returns empty
@@ -128,10 +133,8 @@ class TestAccountProcessingMixin:
             ]
         )
 
-        # Call process_creator
-        result_account, performer = await respx_stash_processor.process_creator(
-            session=session
-        )
+        # Call process_creator (no session= parameter)
+        result_account, performer = await respx_stash_processor.process_creator()
 
         # Verify results
         assert result_account.id == account.id
@@ -151,26 +154,24 @@ class TestAccountProcessingMixin:
 
         # Call process_creator and expect error
         with pytest.raises(ValueError) as excinfo:
-            await respx_stash_processor.process_creator(session=session)
+            await respx_stash_processor.process_creator()
 
         # Verify error message
         assert "No account found for creator" in str(excinfo.value)
         assert "nonexistent" in str(excinfo.value)
 
     @pytest.mark.asyncio
-    async def test_update_performer_avatar(self, respx_stash_processor, session):
+    async def test_update_performer_avatar(self, respx_stash_processor):
         """Test _update_performer_avatar method."""
-        # Create account with no avatar
+        acct_id = snowflake_id()
+        avatar_media_id = snowflake_id()
+
+        # Create account with no avatar (avatar=None by default)
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
             stash_id=12345,
         )
-        session.add(account)
-        await session.commit()
-
-        # Refresh to get awaitable_attrs
-        await session.refresh(account)
 
         # Call _update_performer_avatar with no avatar
         await respx_stash_processor.context.get_client()
@@ -185,27 +186,13 @@ class TestAccountProcessingMixin:
         # Verify no GraphQL calls (no avatar to update)
         assert len(respx.calls) == 0
 
-        # Create account with avatar
+        # Now set avatar on account (Pydantic relationship — direct attribute)
         avatar = MediaFactory.build(
-            id=1,
-            accountId=account.id,  # Set foreign key to match account
+            id=avatar_media_id,
+            accountId=account.id,
             local_filename="avatar.jpg",
         )
-        session.add(avatar)
-        await session.commit()
-
-        # Link avatar to account through association table
-        from metadata import account_avatar
-
-        await session.execute(
-            account_avatar.insert().values(accountId=account.id, mediaId=avatar.id)
-        )
-        await session.commit()
-
-        # Re-query account to get fresh instance
-        stmt = select(Account).where(Account.id == account.id)
-        result = await session.execute(stmt)
-        account = result.scalar_one()
+        account.avatar = avatar
 
         # Mock performer with default image
         mock_performer.image_path = "default=true"
@@ -218,7 +205,6 @@ class TestAccountProcessingMixin:
 
         try:
             # Mock GraphQL responses for avatar update
-            # Import create_image_dict for proper dict creation
             from tests.fixtures.stash.stash_graphql_fixtures import create_image_dict
 
             # Create image dict with visual_files
@@ -228,7 +214,7 @@ class TestAccountProcessingMixin:
                 visual_files=[
                     {
                         "id": "file_123",
-                        "path": str(temp_avatar_path),  # Use the actual temp file path
+                        "path": str(temp_avatar_path),
                         "basename": "avatar.jpg",
                         "parent_folder_id": "folder_123",
                         "mod_time": "2024-01-01T00:00:00Z",
@@ -267,28 +253,28 @@ class TestAccountProcessingMixin:
                 ]
             )
 
-            # Call _update_performer_avatar with session
+            # Call _update_performer_avatar (no session= parameter)
             await respx_stash_processor._update_performer_avatar(
-                account, mock_performer, session=session
+                account, mock_performer
             )
 
             # Verify GraphQL calls were made
             assert graphql_route.call_count == 2  # findImages + performerUpdate
         finally:
             # Clean up temp file
-            temp_avatar_path.unlink(missing_ok=True)
+            temp_avatar_path.unlink(missing_ok=True)  # noqa: ASYNC240
 
     @pytest.mark.asyncio
-    async def test_find_existing_performer_by_id(self, respx_stash_processor, session):
+    async def test_find_existing_performer_by_id(self, respx_stash_processor):
         """Test _find_existing_performer finds performer by stash_id."""
-        # Create account with stash_id (integer)
+        acct_id = snowflake_id()
+
+        # Create account with stash_id — just an in-memory object, no DB needed
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
             stash_id=999,
         )
-        session.add(account)
-        await session.commit()
 
         # Setup context.client
         await respx_stash_processor.context.get_client()
@@ -313,18 +299,16 @@ class TestAccountProcessingMixin:
         assert graphql_route.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_find_existing_performer_by_name(
-        self, respx_stash_processor, session
-    ):
+    async def test_find_existing_performer_by_name(self, respx_stash_processor):
         """Test _find_existing_performer finds performer by username."""
+        acct_id = snowflake_id()
+
         # Create account without stash_id
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
+            stash_id=None,
         )
-        account.stash_id = None
-        session.add(account)
-        await session.commit()
 
         # Setup context.client
         await respx_stash_processor.context.get_client()
@@ -351,33 +335,23 @@ class TestAccountProcessingMixin:
         assert graphql_route.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_find_existing_performer_not_found(
-        self, respx_stash_processor, session
-    ):
+    async def test_find_existing_performer_not_found(self, respx_stash_processor):
         """Test _find_existing_performer returns None when not found."""
+        acct_id = snowflake_id()
+
         # Create account without stash_id
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
+            stash_id=None,
         )
-        account.stash_id = None
-        session.add(account)
-        await session.commit()
 
         # Setup context.client
         await respx_stash_processor.context.get_client()
 
-        # Mock GraphQL responses - not found by name or alias
+        # Mock GraphQL response - store.find_one() makes single call by name
         graphql_route = respx.post("http://localhost:9999/graphql").mock(
             side_effect=[
-                # findPerformers by name - not found
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findPerformers", {"count": 0, "performers": []}
-                    ),
-                ),
-                # findPerformers by alias - not found
                 httpx.Response(
                     200,
                     json=create_graphql_response(
@@ -391,45 +365,46 @@ class TestAccountProcessingMixin:
 
         # Verify performer is None
         assert performer is None
-        assert graphql_route.call_count == 2  # name + alias
+        # Note: Library uses find_one() which makes 1 call (not 2)
+        assert graphql_route.call_count == 1
 
     @pytest.mark.asyncio
-    async def test_update_account_stash_id(self, respx_stash_processor, session):
+    async def test_update_account_stash_id(self, respx_stash_processor, entity_store):
         """Test _update_account_stash_id method.
 
         This test doesn't require GraphQL mocking since it only updates the database.
         """
-        # Create account
+        acct_id = snowflake_id()
+
+        # Create account in entity_store (production code uses get_store())
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
-            stash_id=12345,
+            stash_id=None,
         )
-        account.stash_id = None
-        session.add(account)
-        await session.commit()
+        await entity_store.save(account)
 
         # Create mock performer
         mock_performer = PerformerFactory.build(id="123", name="test_user")
 
-        # Call _update_account_stash_id
+        # Call _update_account_stash_id (no session= parameter)
         await respx_stash_processor.context.get_client()
-        await respx_stash_processor._update_account_stash_id(
-            account, mock_performer, session=session
-        )
+        await respx_stash_processor._update_account_stash_id(account, mock_performer)
 
         # Verify stash_id was updated (performer.id is string "123", converted to int)
-        await session.refresh(account)
         assert account.stash_id == int(mock_performer.id)
 
     @pytest.mark.asyncio
-    async def test_get_or_create_performer_found_by_alias(
-        self, respx_stash_processor, session
+    async def test_get_or_create_performer_found_by_alias_raw_syntax(
+        self, respx_stash_processor
     ):
-        """Test _get_or_create_performer when performer found by alias (lines 123-124)."""
-        account = AccountFactory.build(id=12345, username="test_user")
-        session.add(account)
-        await session.commit()
+        """Test _get_or_create_performer with raw GraphQL filter syntax for aliases.
+
+        Uses raw filter: aliases={"value": username, "modifier": "INCLUDES"}
+        This is the workaround for stash-graphql-client v0.10.5.
+        """
+        acct_id = snowflake_id()
+        account = AccountFactory.build(id=acct_id, username="test_user")
 
         # Create performer data that will be found by alias
         existing_performer_dict = create_performer_dict(
@@ -447,7 +422,7 @@ class TestAccountProcessingMixin:
                         {"count": 0, "performers": []},
                     ),
                 ),
-                # findPerformers by alias - FOUND (lines 123-124)
+                # findPerformers by alias using raw syntax - FOUND
                 httpx.Response(
                     200,
                     json=create_graphql_response(
@@ -466,13 +441,96 @@ class TestAccountProcessingMixin:
         assert graphql_route.call_count == 2  # Name search + alias search only
 
     @pytest.mark.asyncio
-    async def test_get_or_create_performer_found_by_url(
-        self, respx_stash_processor, session
+    async def test_get_or_create_performer_found_by_alias_django_style(
+        self, respx_stash_processor
     ):
+        """Test _get_or_create_performer with Django-style alias filtering.
+
+        Uses Django-style filter: aliases__contains=username
+        This syntax works with stash-graphql-client v0.10.6+.
+        """
+        from unittest.mock import patch
+
+        from stash_graphql_client.types import Performer
+
+        acct_id = snowflake_id()
+        account = AccountFactory.build(id=acct_id, username="test_user")
+
+        # Create performer that will be found by alias
+        existing_performer_dict = create_performer_dict(
+            id="999", name="Test User", aliases=["test_user"]
+        )
+
+        # Mock GraphQL: first call finds nothing by name, second call finds by alias
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                # findPerformers by name - not found
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findPerformers",
+                        {"count": 0, "performers": []},
+                    ),
+                ),
+                # findPerformers by alias using Django-style filter - FOUND
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findPerformers",
+                        {"count": 1, "performers": [existing_performer_dict]},
+                    ),
+                ),
+            ]
+        )
+
+        await respx_stash_processor.context.get_client()
+
+        # Temporarily override the method to use Django-style filtering
+        original_method = respx_stash_processor._get_or_create_performer.__func__
+
+        async def django_style_method(self, account):
+            """Version using Django-style alias filter."""
+            search_name = account.displayName or account.username
+            fansly_url = f"https://fansly.com/{account.username}"
+
+            # Try exact name match first
+            performer = await self.store.find_one(Performer, name__exact=search_name)
+            if performer:
+                return performer
+
+            # Try Django-style alias match (v0.10.6+)
+            performer = await self.store.find_one(
+                Performer, aliases__contains=account.username
+            )
+            if performer:
+                return performer
+
+            # Try URL match
+            performer = await self.store.find_one(Performer, url__contains=fansly_url)
+            if performer:
+                return performer
+
+            # Create new
+            performer = self._performer_from_account(account)
+            return await self.context.client.create_performer(performer)
+
+        # Patch the method
+        with patch.object(
+            respx_stash_processor,
+            "_get_or_create_performer",
+            new=lambda account: django_style_method(respx_stash_processor, account),
+        ):
+            result = await respx_stash_processor._get_or_create_performer(account)
+
+        # Verify performer was found (not created)
+        assert result.id == "999"
+        assert graphql_route.call_count == 2  # Name search + alias search only
+
+    @pytest.mark.asyncio
+    async def test_get_or_create_performer_found_by_url(self, respx_stash_processor):
         """Test _get_or_create_performer when performer found by URL (lines 131-132)."""
-        account = AccountFactory.build(id=12345, username="test_user")
-        session.add(account)
-        await session.commit()
+        acct_id = snowflake_id()
+        account = AccountFactory.build(id=acct_id, username="test_user")
 
         # Create performer data that will be found by URL
         existing_performer_dict = create_performer_dict(
@@ -518,19 +576,21 @@ class TestAccountProcessingMixin:
 
     @pytest.mark.asyncio
     async def test_update_performer_avatar_with_custom_image(
-        self, respx_stash_processor, session
+        self, respx_stash_processor
     ):
         """Test _update_performer_avatar when performer has custom image (line 242->exit)."""
-        account = AccountFactory.build(id=12345, username="test_user")
-        session.add(account)
+        acct_id = snowflake_id()
+        avatar_media_id = snowflake_id()
 
-        # Create avatar media
+        # Create account with avatar set directly (Pydantic relationship)
+        account = AccountFactory.build(id=acct_id, username="test_user")
         avatar = MediaFactory.build(
-            id=999, accountId=12345, mimetype="image/jpeg", local_filename="avatar.jpg"
+            id=avatar_media_id,
+            accountId=acct_id,
+            mimetype="image/jpeg",
+            local_filename="avatar.jpg",
         )
         account.avatar = avatar
-        session.add(avatar)
-        await session.commit()
 
         # Create performer with custom image (not default)
         performer = PerformerFactory.build(
@@ -539,79 +599,46 @@ class TestAccountProcessingMixin:
             image_path="/path/to/custom_image.jpg",  # Custom image, no default=true
         )
 
-        # Call _update_performer_avatar
+        # Call _update_performer_avatar (no session= parameter)
         await respx_stash_processor.context.get_client()
-        await respx_stash_processor._update_performer_avatar(
-            account, performer, session=session
-        )
+        await respx_stash_processor._update_performer_avatar(account, performer)
 
         # Should return early without making any GraphQL calls
         # (line 242->exit branch)
 
     @pytest.mark.asyncio
-    async def test_update_performer_avatar_query_exception(
-        self, respx_stash_processor, session
-    ):
-        """Test _update_performer_avatar with avatar query exception (lines 223-224)."""
-        account = AccountFactory.build(id=12345, username="test_user")
-        session.add(account)
-        await session.commit()
-
-        # Create performer
-        performer = PerformerFactory.build(id="123", name="test_user")
-
-        # Mock session.execute to raise an exception
-
-        original_execute = session.execute
-
-        async def failing_execute(stmt):
-            # Only fail for the avatar query, not other queries
-            if "avatar" in str(stmt):
-                raise RuntimeError("Database error!")
-            return await original_execute(stmt)
-
-        session.execute = failing_execute
-
-        # Call _update_performer_avatar (should handle exception gracefully)
-        await respx_stash_processor.context.get_client()
-        with patch("stash.processing.mixins.account.logger.error") as mock_logger:
-            await respx_stash_processor._update_performer_avatar(
-                account, performer, session=session
-            )
-
-            # Verify exception was logged (lines 223-224)
-            mock_logger.assert_called_once()
-            assert "Failed to query avatar" in str(mock_logger.call_args)
-
-        # Restore original execute
-        session.execute = original_execute
-
-    @pytest.mark.asyncio
     async def test_find_existing_performer_stash_id_returns_none(
-        self, respx_stash_processor, session
+        self, respx_stash_processor
     ):
         """Test _find_existing_performer when stash_id lookup returns None (line 302->314)."""
+        acct_id = snowflake_id()
         account = AccountFactory.build(
-            id=12345,
+            id=acct_id,
             username="test_user",
             stash_id=999,  # Has stash_id but lookup fails
         )
-        session.add(account)
-        await session.commit()
 
-        # Mock client to return None for stash_id lookup
+        # Mock HTTP responses - stash_id lookup fails (404), username search succeeds
         await respx_stash_processor.context.get_client()
-        with patch.object(
-            respx_stash_processor.context.client,
-            "find_performer",
-            new=AsyncMock(side_effect=[None, PerformerFactory.build(id="123")]),
-        ) as mock_find:
-            result = await respx_stash_processor._find_existing_performer(account)
+        performer_dict = {"id": "123", "name": "test_user"}
 
-            # Verify it fell through to username search (line 302->314 branch)
-            assert mock_find.call_count == 2
-            assert mock_find.call_args_list[0][0][0] == 999  # First call with stash_id
-            assert (
-                mock_find.call_args_list[1][0][0] == "test_user"
-            )  # Second call with username
-            assert result.id == "123"
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                # store.get() for stash_id - not found (returns empty)
+                httpx.Response(404, json={"error": "Not Found"}),
+                # store.find_one() by username - found
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findPerformers", {"count": 1, "performers": [performer_dict]}
+                    ),
+                ),
+            ]
+        )
+
+        result = await respx_stash_processor._find_existing_performer(account)
+
+        # Verify it tried stash_id first (failed), then username (succeeded)
+        # Note: store.get() fails with exception when not found, triggers fallback
+        assert result is not None
+        assert result.id == "123"

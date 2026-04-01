@@ -6,11 +6,24 @@ import asyncio
 import contextlib
 import logging
 import traceback
+import warnings
+from collections import defaultdict
 from copy import deepcopy
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any
 
-from stash_graphql_client import StashContext
+from stash_graphql_client import ServerCapabilities, StashContext
+from stash_graphql_client.errors import StashUnmappedFieldWarning, StashVersionError
+from stash_graphql_client.store import StashEntityStore
+from stash_graphql_client.types import (
+    Gallery,
+    Image,
+    Performer,
+    Scene,
+    Studio,
+    Tag,
+    is_set,
+)
 
 from metadata import Account, Database
 from pathio import set_create_directory_for_download
@@ -18,6 +31,7 @@ from textio import print_error, print_info, print_warning
 
 from ..logging import debug_print
 from ..logging import processing_logger as logger
+from .protocols import StashProcessingProtocol
 
 
 if TYPE_CHECKING:
@@ -25,19 +39,7 @@ if TYPE_CHECKING:
     from download.core import DownloadState
 
 
-@runtime_checkable
-class HasMetadata(Protocol):
-    """Protocol for models that have metadata for Stash."""
-
-    id: int
-    content: str | None
-    createdAt: datetime
-    attachments: list[Any]
-    # Messages don't have accountMentions, only Posts do
-    accountMentions: list[Account] | None = None
-
-
-class StashProcessingBase:
+class StashProcessingBase(StashProcessingProtocol):
     """Base class for StashProcessing functionality.
 
     This class handles:
@@ -53,6 +55,18 @@ class StashProcessingBase:
         await processor.cleanup()
         ```
     """
+
+    # Class-level declarations for Pylance — values set in __init__
+    config: FanslyConfig
+    state: DownloadState
+    context: StashContext
+    database: Database
+    _account: Account | None
+    _performer: Performer | None
+    _studio: Studio | None
+    _stash_parent_task: str | None
+    _scene_code_index: dict[str, list[Scene]]
+    _image_code_index: dict[str, list[Image]]
 
     def __init__(
         self,
@@ -83,6 +97,189 @@ class StashProcessingBase:
         self._cleanup_event = _cleanup_event or asyncio.Event()
         self._owns_db = _owns_db
         self.log = logging.getLogger(__name__)
+
+        # Per-creator cached lookups — set in continue_stash_processing(),
+        # cleared in its finally block. Eliminates redundant GraphQL calls
+        # when processing batches for the same creator.
+        self._account: Account | None = None
+        self._performer: Performer | None = None
+        self._studio: Studio | None = None
+        self._stash_parent_task: str | None = None
+
+        # Media code indexes — built during _preload_creator_media(),
+        # enable O(1) lookups by media_id extracted from filenames.
+        # Pattern: {date}_at_{time}_UTC_id_{media_id}.{ext}
+        self._scene_code_index: dict[str, list[Scene]] = defaultdict(list)
+        self._image_code_index: dict[str, list[Image]] = defaultdict(list)
+
+    @property
+    def store(self) -> StashEntityStore:
+        """Convenient access to Stash entity store.
+
+        Returns:
+            StashEntityStore from context for ORM-style operations
+        """
+        return self.context.store
+
+    @property
+    def capabilities(self) -> ServerCapabilities:
+        """Convenient access to server capabilities."""
+        return self.context.capabilities
+
+    async def _preload_stash_entities(self) -> None:
+        """Preload shared entities (Tags, Performers, Studios) into identity map.
+
+        Sets TTL to None (no expiration) since the script is the sole writer
+        to Stash during processing. These entities are shared across creators
+        and persist for the entire run. Per-creator entities (Gallery, Image,
+        Scene) also get TTL=None but are invalidated per-creator.
+        """
+        logger.info("Preloading shared Stash entities into identity map...")
+
+        try:
+            # Shared entities — never expire, preload all
+            # Use find_iter() to avoid the 1000-result limit on find()
+            for entity_type in (Performer, Tag, Studio):
+                self.store.set_ttl(entity_type, None)
+                count = 0
+                async for _ in self.store.find_iter(entity_type, query_batch=500):
+                    count += 1
+                logger.info(f"Preloaded {count} {entity_type.__name__}s")
+
+            # Per-creator entities — never expire, but invalidated per-creator
+            for entity_type in (Gallery, Image, Scene):
+                self.store.set_ttl(entity_type, None)
+
+        except Exception as e:
+            logger.warning(f"Failed to preload entities (continuing anyway): {e}")
+
+        # Log cache state after shared entity preload
+        stats = self.store.cache_stats()
+        logger.info(
+            f"Cache after shared preload: {stats.total_entries} entries "
+            f"({', '.join(f'{k}: {v}' for k, v in sorted(stats.by_type.items()))})"
+        )
+
+    async def _preload_creator_media(self) -> None:
+        """Preload Galleries, Images, and Scenes for current creator into identity map.
+
+        Uses self.state.base_path as path filter to load only this creator's media.
+        Dramatically speeds up subsequent lookups by avoiding per-item GraphQL queries.
+
+        Also builds media code indexes for O(1) lookups by media_id extracted from
+        filenames. Pattern from pyofscraperstash: preload per-performer, build index,
+        invalidate after processing.
+        """
+        if not self.state.base_path:
+            logger.debug("No base_path set, skipping creator media preload")
+            return
+
+        path_filter = str(self.state.base_path).rstrip("/")
+        logger.info(f"Preloading creator media from: {path_filter}")
+
+        # Clear indexes before rebuilding
+        self._scene_code_index.clear()
+        self._image_code_index.clear()
+
+        try:
+            scene_count = 0
+            async for scene in self.store.find_iter(
+                Scene, query_batch=500, path__contains=path_filter
+            ):
+                scene_count += 1
+                self._index_scene_files(scene)
+            logger.info(f"Preloaded {scene_count} scenes")
+
+            image_count = 0
+            async for image in self.store.find_iter(
+                Image, query_batch=500, path__contains=path_filter
+            ):
+                image_count += 1
+                self._index_image_files(image)
+            logger.info(f"Preloaded {image_count} images")
+
+            # Galleries are metadata-only containers (no file path) — they're
+            # looked up by code (post ID) on demand and cached individually.
+            # Preloading all galleries is counterproductive: it loads the entire
+            # library and pulls in scene references via the GraphQL fragment.
+
+        except Exception as e:
+            logger.warning(f"Failed to preload creator media (continuing anyway): {e}")
+
+        logger.info(
+            f"Built media code indexes: {len(self._scene_code_index)} scene codes, "
+            f"{len(self._image_code_index)} image codes"
+        )
+
+        # Log cache state after creator media preload
+        stats = self.store.cache_stats()
+        logger.info(
+            f"Cache after creator preload: {stats.total_entries} entries "
+            f"({', '.join(f'{k}: {v}' for k, v in sorted(stats.by_type.items()))})"
+        )
+
+    def _index_scene_files(self, scene: Scene) -> None:
+        """Index a scene's files by media code for O(1) lookups."""
+        if not is_set(scene.files) or not scene.files:
+            return
+        for f in scene.files:
+            if is_set(f.path) and f.path:
+                # Extract media_id from fansly filename pattern:
+                # {date}_at_{time}_UTC_id_{media_id}.{ext}
+                # OR: {date}_at_{time}_UTC_preview_id_{media_id}.{ext}
+                for marker in ("_id_", "_preview_id_"):
+                    if marker in f.path:
+                        after_marker = f.path.split(marker)[-1]
+                        media_code = after_marker.split(".")[0]
+                        if media_code:
+                            self._scene_code_index[media_code].append(scene)
+
+    def _index_image_files(self, image: Image) -> None:
+        """Index an image's visual files by media code for O(1) lookups."""
+        if not is_set(image.visual_files) or not image.visual_files:
+            return
+        for f in image.visual_files:
+            if is_set(f.path) and f.path:
+                for marker in ("_id_", "_preview_id_"):
+                    if marker in f.path:
+                        after_marker = f.path.split(marker)[-1]
+                        media_code = after_marker.split(".")[0]
+                        if media_code:
+                            self._image_code_index[media_code].append(image)
+
+    def find_scenes_by_media_codes(
+        self, media_codes: list[str]
+    ) -> dict[str, list[Scene]]:
+        """Find scenes by media codes using the pre-built index. O(1) per lookup."""
+        result: dict[str, list[Scene]] = {}
+        for code in media_codes:
+            candidates = self._scene_code_index.get(code, [])
+            if candidates:
+                seen_ids: set[str] = set()
+                unique = [
+                    s
+                    for s in candidates
+                    if s.id not in seen_ids and not seen_ids.add(s.id)
+                ]
+                result[code] = unique
+        return result
+
+    def find_images_by_media_codes(
+        self, media_codes: list[str]
+    ) -> dict[str, list[Image]]:
+        """Find images by media codes using the pre-built index. O(1) per lookup."""
+        result: dict[str, list[Image]] = {}
+        for code in media_codes:
+            candidates = self._image_code_index.get(code, [])
+            if candidates:
+                seen_ids: set[str] = set()
+                unique = [
+                    i
+                    for i in candidates
+                    if i.id not in seen_ids and not seen_ids.add(i.id)
+                ]
+                result[code] = unique
+        return result
 
     @classmethod
     def from_config(
@@ -130,6 +327,10 @@ class StashProcessingBase:
                 print_error(f"Failed to create download path: {e}")
                 return
 
+        # Log scan path capability (v0.11 gates this via __safe_to_eat__)
+        if self.capabilities.input_has_field("GenerateMetadataInput", "paths"):
+            logger.debug("Server supports targeted metadata scan paths")
+
         # Start metadata scan with all generation flags enabled
         flags = {
             "scanGenerateCovers": True,
@@ -173,10 +374,33 @@ class StashProcessingBase:
 
         # Initialize Stash client
         logger.debug(f"Initializing client on context {id(self.context)}")
-        await self.context.get_client()
+        try:
+            await self.context.get_client()
+        except StashVersionError as e:
+            print_error(f"Stash server too old: {e}")
+            print_warning("Minimum required: Stash v0.30.0 (appSchema 75)")
+            return
+        except RuntimeError as e:
+            print_error(f"Failed to initialize Stash client: {e}")
+            return
         logger.debug("Client initialized, proceeding with scan")
 
+        # Surface v0.11 deprecation/unmapped field warnings in logs
+        warnings.filterwarnings(
+            "always", category=DeprecationWarning, module="stash_graphql_client"
+        )
+        warnings.filterwarnings("always", category=StashUnmappedFieldWarning)
+
+        # Preload global entities (performers, tags, studios) into the store
+        # cache BEFORE any processing starts. Without this, every lookup
+        # hits GraphQL.
+        await self._preload_stash_entities()
+
+        # scan_creator_folder() sets base_path AND triggers the Stash scan
+        # that discovers files. _preload_creator_media() must run AFTER so
+        # it can build the media-code index from the scanned results.
         await self.scan_creator_folder()
+        await self._preload_creator_media()
         account, performer = await self.process_creator()
 
         # Continue processing in background with proper task management
@@ -248,6 +472,16 @@ class StashProcessingBase:
         3. Closes client connection
         4. Cleans up any tracked tasks
         """
+
+        # Log final cache state before cleanup
+        try:
+            stats = self.store.cache_stats()
+            logger.info(
+                f"Cache at cleanup: {stats.total_entries} entries "
+                f"({', '.join(f'{k}: {v}' for k, v in sorted(stats.by_type.items()))})"
+            )
+        except Exception:
+            logger.debug("Failed to collect cache stats during cleanup")
 
         logger.debug(f"Starting cleanup for {self.__class__.__name__}")
 

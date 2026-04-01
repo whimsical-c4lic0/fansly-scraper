@@ -2,170 +2,83 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from fileio.normalize import normalize_filename
-from metadata.database import Database
-from tests.fixtures.metadata import AccountFactory, MediaFactory
+from metadata import Account, Media
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 class TestNormalizeFilenameIntegration:
-    """Integration tests for normalize_filename."""
+    """Integration tests for normalize_filename with EntityStore."""
 
-    def test_normalize_filename_with_database(self, uuid_test_db_factory):
+    @pytest.mark.asyncio
+    async def test_normalize_filename_with_database(self, entity_store, config):
         """Test normalize_filename with database match."""
-        config = uuid_test_db_factory
-        config._database = Database(config)
+        store = entity_store
 
-        # Create Account first (FK requirement with proper 60-bit BigInt)
-        account = AccountFactory.build(
-            id=555000000000000000,
-            username="test_user",
-        )
+        acct_id = snowflake_id()
+        media_id = snowflake_id()
 
-        # ID must match filename for database lookup (id_12345 in filename)
-        media = MediaFactory.build(
-            id=12345,
-            accountId=555000000000000000,
+        account = Account(id=acct_id, username="test_user")
+        await store.save(account)
+
+        media = Media(
+            id=media_id,
+            accountId=acct_id,
             createdAt=datetime(2023, 1, 1, 15, 30, tzinfo=UTC),
         )
+        await store.save(media)
 
-        # Insert into database
-        with config._database.session_scope() as session:
-            session.add(account)
-            session.add(media)
-            session.commit()
+        filename = f"2023-01-01_at_10-30_id_{media_id}.jpg"
+        result = await normalize_filename(filename, config=config)
+        assert result == f"2023-01-01_at_15-30_UTC_id_{media_id}.jpg"
 
-        # Test local time converts to UTC with database match
-        filename = "2023-01-01_at_10-30_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
-        assert result == "2023-01-01_at_15-30_UTC_id_12345.jpg"
-
-        # Test UTC time stays unchanged
-        filename = "2023-01-01_at_15-30_UTC_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
+        filename = f"2023-01-01_at_15-30_UTC_id_{media_id}.jpg"
+        result = await normalize_filename(filename, config=config)
         assert result == filename
 
-    def test_normalize_filename_with_database_no_match(self, uuid_test_db_factory):
+    @pytest.mark.asyncio
+    async def test_normalize_filename_with_database_no_match(
+        self, entity_store, config
+    ):
         """Test normalize_filename without database match."""
-        config = uuid_test_db_factory
-        config._database = Database(config)
+        media_id = snowflake_id()
+        filename = f"2023-01-01_at_10-30_id_{media_id}.jpg"
+        result = await normalize_filename(filename, config=config)
+        assert result == f"2023-01-01_at_15-30_UTC_id_{media_id}.jpg"
 
-        # No media in database, so query returns None
-        filename = "2023-01-01_at_10-30_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
-        # Even without database match, local time is converted to UTC
-        assert result == "2023-01-01_at_15-30_UTC_id_12345.jpg"
+    @pytest.mark.parametrize("ext", ["mp4", "m3u8", "ts"])
+    @pytest.mark.asyncio
+    async def test_normalize_filename_with_extensions(self, entity_store, config, ext):
+        """Test normalize_filename preserves different extensions."""
+        store = entity_store
 
-    def test_normalize_filename_with_mp4(self, uuid_test_db_factory):
-        """Test normalize_filename with mp4 extension."""
-        config = uuid_test_db_factory
-        config._database = Database(config)
+        acct_id = snowflake_id()
+        media_id = snowflake_id()
 
-        # Create Account first (FK requirement with proper 60-bit BigInt)
-        account = AccountFactory.build(
-            id=555000000000000000,
-            username="test_user",
-        )
+        account = Account(id=acct_id, username="test_user")
+        await store.save(account)
 
-        media = MediaFactory.build(
-            id=12345,
-            accountId=555000000000000000,
+        media = Media(
+            id=media_id,
+            accountId=acct_id,
             createdAt=datetime(2023, 1, 1, 15, 30, tzinfo=UTC),
         )
+        await store.save(media)
 
-        # Insert into database
-        with config._database.session_scope() as session:
-            session.add(account)
-            session.add(media)
-            session.commit()
+        filename = f"2023-01-01_at_10-30_id_{media_id}.{ext}"
+        result = await normalize_filename(filename, config=config)
+        assert result == f"2023-01-01_at_15-30_UTC_id_{media_id}.{ext}"
 
-        # Test local time converts to UTC but preserves extension
-        filename = "2023-01-01_at_10-30_id_12345.mp4"
-        result = normalize_filename(filename, config=config)
-        assert result == "2023-01-01_at_15-30_UTC_id_12345.mp4"
-
-        # Test UTC time stays unchanged
-        filename = "2023-01-01_at_15-30_UTC_id_12345.mp4"
-        result = normalize_filename(filename, config=config)
+        filename = f"2023-01-01_at_15-30_UTC_id_{media_id}.{ext}"
+        result = await normalize_filename(filename, config=config)
         assert result == filename
 
-    def test_normalize_filename_with_m3u8(self, uuid_test_db_factory):
-        """Test normalize_filename with m3u8 extension."""
-        config = uuid_test_db_factory
-        config._database = Database(config)
-
-        # Create Account first (FK requirement with proper 60-bit BigInt)
-        account = AccountFactory.build(
-            id=555000000000000000,
-            username="test_user",
-        )
-
-        media = MediaFactory.build(
-            id=12345,
-            accountId=555000000000000000,
-            createdAt=datetime(2023, 1, 1, 15, 30, tzinfo=UTC),
-        )
-
-        # Insert into database
-        with config._database.session_scope() as session:
-            session.add(account)
-            session.add(media)
-            session.commit()
-
-        # Test local time converts to UTC but preserves extension
-        filename = "2023-01-01_at_10-30_id_12345.m3u8"
-        result = normalize_filename(filename, config=config)
-        assert result == "2023-01-01_at_15-30_UTC_id_12345.m3u8"
-
-        # Test UTC time stays unchanged
-        filename = "2023-01-01_at_15-30_UTC_id_12345.m3u8"
-        result = normalize_filename(filename, config=config)
-        assert result == filename
-
-    def test_normalize_filename_with_ts(self, uuid_test_db_factory):
-        """Test normalize_filename with ts extension."""
-        config = uuid_test_db_factory
-        config._database = Database(config)
-
-        # Create Account first (FK requirement with proper 60-bit BigInt)
-        account = AccountFactory.build(
-            id=555000000000000000,
-            username="test_user",
-        )
-
-        media = MediaFactory.build(
-            id=12345,
-            accountId=555000000000000000,
-            createdAt=datetime(2023, 1, 1, 15, 30, tzinfo=UTC),
-        )
-
-        # Insert into database
-        with config._database.session_scope() as session:
-            session.add(account)
-            session.add(media)
-            session.commit()
-
-        # Test local time converts to UTC but preserves extension
-        filename = "2023-01-01_at_10-30_id_12345.ts"
-        result = normalize_filename(filename, config=config)
-        assert result == "2023-01-01_at_15-30_UTC_id_12345.ts"
-
-        # Test UTC time stays unchanged
-        filename = "2023-01-01_at_15-30_UTC_id_12345.ts"
-        result = normalize_filename(filename, config=config)
-        assert result == filename
-
-    def test_normalize_filename_hash_pattern(self, uuid_test_db_factory):
+    @pytest.mark.asyncio
+    async def test_normalize_filename_hash_pattern(self, entity_store, config):
         """Test normalize_filename preserves hash patterns."""
-        config = uuid_test_db_factory
-        # Hash patterns should be preserved exactly as is
-        filename = "2023-01-01_at_10-30_hash_abcdef_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
-        assert result == filename
-
-        filename = "2023-01-01_at_10-30_hash1_abcdef_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
-        assert result == filename
-
-        filename = "2023-01-01_at_10-30_hash2_abcdef_id_12345.jpg"
-        result = normalize_filename(filename, config=config)
-        assert result == filename
+        for hash_type in ["hash", "hash1", "hash2"]:
+            filename = f"2023-01-01_at_10-30_{hash_type}_abcdef_id_12345.jpg"
+            result = await normalize_filename(filename, config=config)
+            assert result == filename

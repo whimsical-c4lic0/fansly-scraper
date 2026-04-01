@@ -8,7 +8,7 @@ from textio import input_enter_continue, print_error, print_info, print_warning
 
 from .common import get_unique_media_ids, process_download_accessible_media
 from .core import DownloadState
-from .media import download_media_infos
+from .media import fetch_and_process_media
 from .types import DownloadType
 
 
@@ -40,7 +40,7 @@ async def download_single_post(config: FanslyConfig, state: DownloadState) -> No
         print()
 
         while True:
-            requested_post = input(f"\n{17 * ' '}► Post Link or ID: ")
+            requested_post = input(f"\n{17 * ' '}► Post Link or ID: ")  # noqa: ASYNC250 # intentional blocking input
             post_id = get_post_id_from_request(requested_post)
 
             if is_valid_post_id(post_id):
@@ -101,11 +101,10 @@ async def download_single_post(config: FanslyConfig, state: DownloadState) -> No
             await dedupe_init(config, state)
 
             all_media_ids = get_unique_media_ids(post_object)
-            media_infos = await download_media_infos(
-                config=config, state=state, media_ids=all_media_ids
+            accessible = await fetch_and_process_media(
+                config, state, all_media_ids, post_id
             )
-
-            await process_download_accessible_media(config, state, media_infos, post_id)
+            await process_download_accessible_media(config, state, accessible)
 
             if (
                 state.duplicate_count > 0

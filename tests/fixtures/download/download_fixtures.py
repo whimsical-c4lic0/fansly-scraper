@@ -12,6 +12,7 @@ Usage:
 import pytest
 
 from tests.fixtures.download.download_factories import DownloadStateFactory
+from tests.fixtures.metadata import MediaFactory
 
 
 @pytest.fixture
@@ -106,10 +107,43 @@ def mock_temp_dir(temp_config_dir):
     return temp_dir
 
 
+@pytest.fixture
+def mock_process_media_download(mocker):
+    """Create a mock for process_media_download that simulates database interaction."""
+
+    async def mock_process_download(config, state, media):
+        # Always return a new media record using MediaFactory
+        result = MediaFactory.build(
+            id=media.id,
+            is_downloaded=False,
+            content_hash=None,
+        )
+        return result
+
+    return mocker.patch(
+        "metadata.process_media_download", side_effect=mock_process_download
+    )
+
+
+@pytest.fixture
+def mock_process_media_bundles(mocker):
+    """Create a mock for process_media_bundles that simulates bundle processing."""
+
+    async def mock_bundles(config, account_id, media_bundles, session=None):
+        # Just pass through without marking anything as downloaded
+        return media_bundles
+
+    return mocker.patch(
+        "metadata.account.process_media_bundles", side_effect=mock_bundles
+    )
+
+
 __all__ = [
     "download_state",
     "mock_download_dir",
     "mock_metadata_dir",
+    "mock_process_media_bundles",
+    "mock_process_media_download",
     "mock_temp_dir",
     "test_downloads_dir",
 ]

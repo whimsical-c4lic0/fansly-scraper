@@ -5,6 +5,8 @@ from .download_fixtures import (
     download_state,
     mock_download_dir,
     mock_metadata_dir,
+    mock_process_media_bundles,
+    mock_process_media_download,
     mock_temp_dir,
     test_downloads_dir,
 )
@@ -16,6 +18,8 @@ __all__ = [
     "download_state",
     "mock_download_dir",
     "mock_metadata_dir",
+    "mock_process_media_bundles",
+    "mock_process_media_download",
     "mock_temp_dir",
     "test_downloads_dir",
 ]

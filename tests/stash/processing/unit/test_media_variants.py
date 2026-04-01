@@ -10,7 +10,8 @@ import httpx
 import pytest
 import respx
 
-from tests.fixtures import MediaLocationFactory
+from metadata import MediaLocation
+from metadata.models import get_store
 from tests.fixtures.metadata.metadata_factories import AccountMediaFactory, MediaFactory
 from tests.fixtures.stash.stash_graphql_fixtures import (
     create_find_images_result,
@@ -23,6 +24,7 @@ from tests.fixtures.stash.stash_graphql_fixtures import (
     create_scene_dict,
     create_studio_dict,
 )
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 @pytest.mark.asyncio
@@ -32,7 +34,7 @@ async def test_process_hls_variant(
     mock_performer,
     test_account,
     test_post,
-    session,
+    entity_store,
 ):
     """Test processing media with HLS stream variant.
 
@@ -40,35 +42,33 @@ async def test_process_hls_variant(
     1. Finding the scene in Stash via find_scenes GraphQL query
     2. Updating the scene metadata via sceneUpdate mutation
     """
+    store = get_store()
+
     # Arrange - Create REAL HLS variant Media using factory
     hls_variant = MediaFactory.build(
-        id=100102,
+        id=snowflake_id(),
         accountId=test_account.id,
         type=302,  # HLS stream
         mimetype="application/vnd.apple.mpegurl",
         meta_info='{"variants":[{"w":1920,"h":1080},{"w":1280,"h":720}]}',
         is_downloaded=True,
     )
-    session.add(hls_variant)
-    await session.commit()
+    await store.save(hls_variant)
 
     # Create MediaLocation for the variant
-    hls_location = MediaLocationFactory.build(
+    hls_location = MediaLocation(
         mediaId=hls_variant.id,
         locationId=102,
         location="https://example.com/test.m3u8",
     )
-    session.add(hls_location)
-    await session.commit()
+    hls_variant.locations = [hls_location]
+    await store.save(hls_variant)
 
-    # Add variant to test_media - use async session to avoid lazy-load issues
-    # First, ensure all objects are in the session and load existing relationships
-    await session.refresh(test_media, attribute_names=["variants"])
-    test_media.variants = {hls_variant}
+    # Add variant to test_media
+    test_media.variants = [hls_variant]
     test_media.stash_id = None
     test_media.is_downloaded = True
-    session.add(test_media)
-    await session.commit()
+    await store.save(test_media)
 
     # Mock Stash GraphQL HTTP responses using helpers
     # The code makes MULTIPLE GraphQL calls in this order:
@@ -78,7 +78,7 @@ async def test_process_hls_variant(
     # 4. findStudios - to find the creator-specific studio
     # 5. sceneUpdate - to save the updated scene metadata
 
-    # Response 1: findScenesByPathRegex
+    # Response 1: FindScenes
     # NOTE: The path must contain the VARIANT media ID, not the parent media ID
     scene_data = create_scene_dict(
         id="scene_123",
@@ -90,8 +90,12 @@ async def test_process_hls_variant(
                 "path": f"/path/to/media_{hls_variant.id}",
                 "basename": f"media_{hls_variant.id}.m3u8",
                 "size": 1024,
-                # VideoFile required fields
-                "parent_folder_id": None,
+                # VideoFile fields
+                "parent_folder": {
+                    "id": "folder_123",
+                    "path": "/path/to",
+                    "mod_time": "2024-01-01T00:00:00Z",
+                },
                 "format": "m3u8",
                 "width": 1920,
                 "height": 1080,
@@ -107,15 +111,8 @@ async def test_process_hls_variant(
     )
     find_scenes_data = create_find_scenes_result(count=1, scenes=[scene_data])
 
-    # Response 2-3: findPerformers (name + alias searches)
+    # Response 2: findPerformers by name (not found - _find_existing_performer doesn't create)
     empty_performers_result = create_find_performers_result(count=0, performers=[])
-    performer_dict = create_performer_dict(
-        id=mock_performer.id,
-        name=mock_performer.name,
-    )
-    find_performers_data = create_find_performers_result(
-        count=1, performers=[performer_dict]
-    )
 
     # Response 3: findStudios - Fansly network studio
     fansly_studio_dict = create_studio_dict(id="fansly_246", name="Fansly (network)")
@@ -123,14 +120,14 @@ async def test_process_hls_variant(
         count=1, studios=[fansly_studio_dict]
     )
 
-    # Response 4: findStudios - Creator-specific studio
+    # Response 4: findStudios - Creator-specific studio (not found)
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
+    # Response 5: studioCreate - Creator-specific studio (get_or_create creates immediately)
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
-    )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
     )
 
     # Response 6: sceneUpdate - mutation returns the updated scene
@@ -142,24 +139,30 @@ async def test_process_hls_variant(
 
     graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
+            # Call 0: findScenes (only 1 result, so no pagination check needed)
             httpx.Response(
                 200,
-                json=create_graphql_response("findScenesByPathRegex", find_scenes_data),
+                json=create_graphql_response("findScenes", find_scenes_data),
             ),
+            # Call 1: findPerformers by name (not found - _find_existing_performer makes single call)
             httpx.Response(
                 200,
                 json=create_graphql_response("findPerformers", empty_performers_result),
             ),
-            httpx.Response(
-                200,
-                json=create_graphql_response("findPerformers", find_performers_data),
-            ),
+            # Call 2: findStudios - Fansly network
             httpx.Response(
                 200, json=create_graphql_response("findStudios", fansly_studio_result)
             ),
+            # Call 3: findStudios - Creator-specific studio (not found)
             httpx.Response(
-                200, json=create_graphql_response("findStudios", creator_studio_result)
+                200,
+                json=create_graphql_response("findStudios", creator_not_found_result),
             ),
+            # Call 4: studioCreate (v0.10.4: get_or_create creates immediately)
+            httpx.Response(
+                200, json=create_graphql_response("studioCreate", creator_studio_dict)
+            ),
+            # Call 5: sceneUpdate
             httpx.Response(
                 200, json=create_graphql_response("sceneUpdate", updated_scene_data)
             ),
@@ -168,9 +171,13 @@ async def test_process_hls_variant(
 
     # Act
     result = {"images": [], "scenes": []}
-    await respx_stash_processor._process_media(
-        test_media, test_post, test_account, result
-    )
+
+    try:
+        await respx_stash_processor._process_media(
+            test_media, test_post, test_account, result
+        )
+    finally:
+        pass  # Debug block removed after test fixed
 
     # Assert
     # Verify that a scene was found and added to results
@@ -178,27 +185,27 @@ async def test_process_hls_variant(
     assert result["scenes"][0].id == "scene_123"
 
     # Verify GraphQL call sequence (permanent assertion)
-    import json
-
-    # 6 calls: findScenesByPathRegex + 2 findPerformers + 2 findStudios + sceneUpdate
+    # v0.10.4: 6 calls: findScenes + findPerformers + findStudios + findStudios + studioCreate + sceneUpdate
     assert len(graphql_route.calls) == 6, "Expected exactly 6 GraphQL calls"
     calls = graphql_route.calls
 
     # Verify query types in order
     req0 = json.loads(calls[0].request.content)
-    assert "findScenesByPathRegex" in req0["query"]
+    assert "FindScenes" in req0["query"]  # Find scenes by path regex
 
     req1 = json.loads(calls[1].request.content)
-    assert "findPerformers" in req1["query"]
+    assert "findPerformers" in req1["query"]  # By name (not found)
 
     req2 = json.loads(calls[2].request.content)
-    assert "findPerformers" in req2["query"]
+    assert "findStudios" in req2["query"]  # Fansly network studio
 
     req3 = json.loads(calls[3].request.content)
-    assert "findStudios" in req3["query"]
+    assert "findStudios" in req3["query"]  # Creator studio lookup (not found)
 
     req4 = json.loads(calls[4].request.content)
-    assert "findStudios" in req4["query"]
+    assert (
+        "studioCreate" in req4["query"]
+    )  # v0.10.4: Creator studio (get_or_create creates)
 
     req5 = json.loads(calls[5].request.content)
     assert "sceneUpdate" in req5["query"]
@@ -211,7 +218,7 @@ async def test_process_dash_variant(
     mock_performer,
     test_account,
     test_post,
-    session,
+    entity_store,
 ):
     """Test processing media with DASH stream variant.
 
@@ -219,35 +226,33 @@ async def test_process_dash_variant(
     1. Finding the scene in Stash via find_scenes GraphQL query
     2. Updating the scene metadata via sceneUpdate mutation
     """
+    store = get_store()
+
     # Arrange - Create REAL DASH variant Media using factory
     dash_variant = MediaFactory.build(
-        id=100103,
+        id=snowflake_id(),
         accountId=test_account.id,
         type=303,  # DASH stream
         mimetype="application/dash+xml",
         meta_info='{"variants":[{"w":1920,"h":1080},{"w":1280,"h":720}]}',
         is_downloaded=True,
     )
-    session.add(dash_variant)
-    await session.commit()
+    await store.save(dash_variant)
 
     # Create MediaLocation for the variant
-    dash_location = MediaLocationFactory.build(
+    dash_location = MediaLocation(
         mediaId=dash_variant.id,
         locationId=103,
         location="https://example.com/test.mpd",
     )
-    session.add(dash_location)
-    await session.commit()
+    dash_variant.locations = [dash_location]
+    await store.save(dash_variant)
 
-    # Add variant to test_media - use async session to avoid lazy-load issues
-    # First, ensure all objects are in the session and load existing relationships
-    await session.refresh(test_media, attribute_names=["variants"])
-    test_media.variants = {dash_variant}
+    # Add variant to test_media
+    test_media.variants = [dash_variant]
     test_media.stash_id = None
     test_media.is_downloaded = True
-    session.add(test_media)
-    await session.commit()
+    await store.save(test_media)
 
     # Mock Stash GraphQL HTTP responses using helpers
     # The code makes MULTIPLE GraphQL calls in this order:
@@ -298,17 +303,17 @@ async def test_process_dash_variant(
         count=1, studios=[fansly_studio_dict]
     )
 
-    # Response 4: findStudios - Creator-specific studio
+    # Response 4: findStudios - Creator-specific studio (not found)
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
+    # Response 5: studioCreate - Creator-specific studio
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
     )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
-    )
 
-    # Response 5: sceneUpdate - mutation returns the updated scene
+    # Response 6: sceneUpdate - mutation returns the updated scene
     updated_scene_data = create_scene_dict(
         id="scene_456",
         title="DASH Test Scene",
@@ -327,8 +332,14 @@ async def test_process_dash_variant(
             httpx.Response(
                 200, json=create_graphql_response("findStudios", fansly_studio_result)
             ),
+            # findStudios - Creator-specific studio (not found)
             httpx.Response(
-                200, json=create_graphql_response("findStudios", creator_studio_result)
+                200,
+                json=create_graphql_response("findStudios", creator_not_found_result),
+            ),
+            # v0.10.4: studioCreate instead of findStudios (get_or_create creates immediately)
+            httpx.Response(
+                200, json=create_graphql_response("studioCreate", creator_studio_dict)
             ),
             httpx.Response(
                 200, json=create_graphql_response("sceneUpdate", updated_scene_data)
@@ -348,15 +359,22 @@ async def test_process_dash_variant(
     assert result["scenes"][0].id == "scene_456"
 
     # Verify GraphQL call sequence (permanent assertion)
-    assert len(graphql_route.calls) == 5, "Expected exactly 5 GraphQL calls"
+    assert len(graphql_route.calls) == 6, "Expected exactly 6 GraphQL calls"
     calls = graphql_route.calls
 
     # Verify query types in order (same as HLS variant)
     assert "findScenes" in json.loads(calls[0].request.content)["query"]
     assert "findPerformers" in json.loads(calls[1].request.content)["query"]
-    assert "findStudios" in json.loads(calls[2].request.content)["query"]
-    assert "findStudios" in json.loads(calls[3].request.content)["query"]
-    assert "sceneUpdate" in json.loads(calls[4].request.content)["query"]
+    assert (
+        "findStudios" in json.loads(calls[2].request.content)["query"]
+    )  # Fansly network
+    assert (
+        "findStudios" in json.loads(calls[3].request.content)["query"]
+    )  # Creator studio lookup (not found)
+    assert (
+        "studioCreate" in json.loads(calls[4].request.content)["query"]
+    )  # v0.10.4: Creator studio
+    assert "sceneUpdate" in json.loads(calls[5].request.content)["query"]
 
 
 @pytest.mark.asyncio
@@ -366,7 +384,7 @@ async def test_process_preview_variant(
     mock_performer,
     test_account,
     test_post,
-    session,
+    entity_store,
 ):
     """Test processing media with preview image variant.
 
@@ -374,35 +392,33 @@ async def test_process_preview_variant(
     1. Finding the image in Stash via find_images GraphQL query
     2. Updating the image metadata via imageUpdate mutation
     """
+    store = get_store()
+
     # Arrange - Create REAL preview variant Media using factory
     preview_variant = MediaFactory.build(
-        id=100001,
+        id=snowflake_id(),
         accountId=test_account.id,
         type=1,  # Preview image
         mimetype="image/jpeg",
         meta_info='{"resolutionMode":1}',
         is_downloaded=True,
     )
-    session.add(preview_variant)
-    await session.commit()
+    await store.save(preview_variant)
 
     # Create MediaLocation for the variant
-    preview_location = MediaLocationFactory.build(
+    preview_location = MediaLocation(
         mediaId=preview_variant.id,
         locationId=1,
         location="https://example.com/preview.jpg",
     )
-    session.add(preview_location)
-    await session.commit()
+    preview_variant.locations = [preview_location]
+    await store.save(preview_variant)
 
-    # Add variant to test_media - use async session to avoid lazy-load issues
-    # First, ensure all objects are in the session and load existing relationships
-    await session.refresh(test_media, attribute_names=["variants"])
-    test_media.variants = {preview_variant}
+    # Add variant to test_media
+    test_media.variants = [preview_variant]
     test_media.stash_id = None
     test_media.is_downloaded = True
-    session.add(test_media)
-    await session.commit()
+    await store.save(test_media)
 
     # Mock Stash GraphQL HTTP responses using helpers
     # The code makes MULTIPLE GraphQL calls in this order:
@@ -455,17 +471,17 @@ async def test_process_preview_variant(
         count=1, studios=[fansly_studio_dict]
     )
 
-    # Response 5: findStudios - Creator-specific studio
+    # Response 5: findStudios - Creator-specific studio (not found)
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
+    # Response 6: studioCreate - Creator-specific studio
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
     )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
-    )
 
-    # Response 6: imageUpdate - mutation returns the updated image
+    # Response 7: imageUpdate - mutation returns the updated image
     updated_image_data = create_image_dict(
         id="image_789",
         title="Preview Test Image",
@@ -487,8 +503,14 @@ async def test_process_preview_variant(
             httpx.Response(
                 200, json=create_graphql_response("findStudios", fansly_studio_result)
             ),
+            # findStudios - Creator-specific studio (not found)
             httpx.Response(
-                200, json=create_graphql_response("findStudios", creator_studio_result)
+                200,
+                json=create_graphql_response("findStudios", creator_not_found_result),
+            ),
+            # v0.10.4: studioCreate instead of findStudios (get_or_create creates immediately)
+            httpx.Response(
+                200, json=create_graphql_response("studioCreate", creator_studio_dict)
             ),
             httpx.Response(
                 200, json=create_graphql_response("imageUpdate", updated_image_data)
@@ -508,16 +530,23 @@ async def test_process_preview_variant(
     assert result["images"][0].id == "image_789"
 
     # Verify GraphQL call sequence (permanent assertion)
-    assert len(graphql_route.calls) == 6, "Expected exactly 6 GraphQL calls"
+    assert len(graphql_route.calls) == 7, "Expected exactly 7 GraphQL calls"
     calls = graphql_route.calls
 
     # Verify query types in order
     assert "findImages" in json.loads(calls[0].request.content)["query"]
     assert "findScenes" in json.loads(calls[1].request.content)["query"]
     assert "findPerformers" in json.loads(calls[2].request.content)["query"]
-    assert "findStudios" in json.loads(calls[3].request.content)["query"]
-    assert "findStudios" in json.loads(calls[4].request.content)["query"]
-    assert "imageUpdate" in json.loads(calls[5].request.content)["query"]
+    assert (
+        "findStudios" in json.loads(calls[3].request.content)["query"]
+    )  # Fansly network
+    assert (
+        "findStudios" in json.loads(calls[4].request.content)["query"]
+    )  # Creator studio lookup (not found)
+    assert (
+        "studioCreate" in json.loads(calls[5].request.content)["query"]
+    )  # v0.10.4: Creator studio
+    assert "imageUpdate" in json.loads(calls[6].request.content)["query"]
 
 
 @pytest.mark.asyncio
@@ -525,83 +554,64 @@ async def test_process_bundle_ordering(
     respx_stash_processor,
     mock_performer,
     test_account,
-    session,
+    entity_store,
 ):
     """Test processing media bundle with specific ordering.
 
     Tests that _process_bundle_media correctly processes bundles and maintains
     the order of media items within the bundle.
     """
+    store = get_store()
+
     # Arrange
-    # Create multiple REAL media items in bundle using factories
-    from metadata.account import account_media_bundle_media
     from tests.fixtures import PostFactory
     from tests.fixtures.metadata.metadata_factories import AccountMediaBundleFactory
-
-    # Create bundle fresh in the async session
     from tests.fixtures.metadata.metadata_fixtures import ACCOUNT_MEDIA_BUNDLE_ID_BASE
 
+    # Create bundle
     test_media_bundle = AccountMediaBundleFactory.build(
         id=ACCOUNT_MEDIA_BUNDLE_ID_BASE + 111222,
         accountId=test_account.id,
     )
-    session.add(test_media_bundle)
-    await session.commit()
+    await store.save(test_media_bundle)
 
     # Create a post to pass to _process_bundle_media
     test_post = PostFactory.build(accountId=test_account.id)
-    session.add(test_post)
-    await session.commit()
+    await store.save(test_post)
 
     media_items = []
     for i in range(3):
         # Create Media with unique ID and downloaded status
         media = MediaFactory.build(
-            id=200000 + i,  # Unique IDs for each media
+            id=snowflake_id(),
             accountId=test_media_bundle.accountId,
             mimetype="image/jpeg",
             is_downloaded=True,
         )
-        session.add(media)
-        await session.commit()
+        await store.save(media)
 
         # Create MediaLocation for the media
-        media_location = MediaLocationFactory.build(
+        media_location = MediaLocation(
             mediaId=media.id,
             locationId=200 + i,
             location=f"https://example.com/bundle_media_{i}.jpg",
         )
-        session.add(media_location)
-        await session.commit()
+        media.locations = [media_location]
+        await store.save(media)
 
         # Create AccountMedia to link Media to Account
         account_media = AccountMediaFactory.build(
             accountId=test_media_bundle.accountId,
             mediaId=media.id,
         )
-        session.add(account_media)
-        await session.commit()
+        await store.save(account_media)
+        # account_media.media auto-resolves via identity map (Media already saved)
 
         media_items.append(account_media)
 
-    # Link AccountMedia items to bundle using the junction table
-    # This is the proper way to add media to a bundle!
-    for i, account_media in enumerate(media_items):
-        await session.execute(
-            account_media_bundle_media.insert().values(
-                bundle_id=test_media_bundle.id,
-                media_id=account_media.id,
-                pos=i,
-            )
-        )
-    await session.commit()
-
-    # Refresh bundle to load relationships
-    await session.refresh(test_media_bundle, attribute_names=["accountMedia"])
-
-    # Eagerly load media and preview relationships for each account_media
-    for account_media in media_items:
-        await session.refresh(account_media, attribute_names=["media", "preview"])
+    # Set accountMedia on the bundle (the relationship)
+    test_media_bundle.accountMedia = media_items
+    await store.save(test_media_bundle)
 
     # Mock Stash GraphQL HTTP responses
     # Bundle processing: findImages, findScenes, then for EACH image: findPerformers, 2x findStudios, imageUpdate
@@ -647,55 +657,61 @@ async def test_process_bundle_ordering(
         count=1, studios=[fansly_studio_dict]
     )
 
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
     )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
-    )
 
-    # findPerformers call 1: by name (not found)
+    # findPerformers: by name (not found - _find_existing_performer doesn't create)
     empty_performers_result = create_find_performers_result(count=0, performers=[])
 
     # Build the full response sequence (no findScenes - bundle has only images)
-    # For each of 3 images: 2 findPerformers + 2 findStudios + 1 imageUpdate
+    # Studio lookup is hoisted to batch level (_find_existing_studio called at top of
+    # _process_batch_internal), so findStudios + studioCreate come FIRST, before findImages.
     responses = [
+        # Studio lookup (hoisted to batch level)
+        httpx.Response(
+            200, json=create_graphql_response("findStudios", fansly_studio_result)
+        ),
+        httpx.Response(
+            200,
+            json=create_graphql_response("findStudios", creator_not_found_result),
+        ),
+        httpx.Response(
+            200, json=create_graphql_response("studioCreate", creator_studio_dict)
+        ),
+        # findImages: find by path (only 3 results, so no pagination check needed)
         httpx.Response(
             200, json=create_graphql_response("findImages", find_images_data)
         ),
+        # Image 1: findPerformers + imageUpdate (studio already resolved at batch level)
+        httpx.Response(
+            200,
+            json=create_graphql_response("findPerformers", empty_performers_result),
+        ),
+        httpx.Response(
+            200, json=create_graphql_response("imageUpdate", images_data[0])
+        ),
+        # Image 2: findPerformers + imageUpdate (studio already resolved at batch level)
+        httpx.Response(
+            200,
+            json=create_graphql_response("findPerformers", empty_performers_result),
+        ),
+        httpx.Response(
+            200, json=create_graphql_response("imageUpdate", images_data[1])
+        ),
+        # Image 3: findPerformers + imageUpdate (studio already resolved at batch level)
+        httpx.Response(
+            200,
+            json=create_graphql_response("findPerformers", empty_performers_result),
+        ),
+        httpx.Response(
+            200, json=create_graphql_response("imageUpdate", images_data[2])
+        ),
     ]
-
-    # Add responses for each image (performer/studio lookups not cached)
-    for i in range(3):
-        responses.extend(
-            [
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findPerformers", empty_performers_result
-                    ),
-                ),
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findPerformers", find_performers_data
-                    ),
-                ),
-                httpx.Response(
-                    200,
-                    json=create_graphql_response("findStudios", fansly_studio_result),
-                ),
-                httpx.Response(
-                    200,
-                    json=create_graphql_response("findStudios", creator_studio_result),
-                ),
-                httpx.Response(
-                    200, json=create_graphql_response("imageUpdate", images_data[i])
-                ),
-            ]
-        )
 
     graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=responses
@@ -703,50 +719,50 @@ async def test_process_bundle_ordering(
 
     # Act
     result = {"images": [], "scenes": []}
-    await respx_stash_processor._process_bundle_media(
-        test_media_bundle, test_post, test_account, result
-    )
+    try:
+        await respx_stash_processor._process_bundle_media(
+            test_media_bundle, test_post, test_account, result
+        )
+    finally:
+        from tests.fixtures.stash import dump_graphql_calls
+
+        dump_graphql_calls(graphql_route.calls, "test_process_bundle_ordering")
 
     # Assert
     # Verify all 3 images were processed
     assert len(result["images"]) == 3
 
-    # Verify items are in correct order by manually querying the junction table
-    stmt = (
-        account_media_bundle_media.select()
-        .where(account_media_bundle_media.c.bundle_id == test_media_bundle.id)
-        .order_by(account_media_bundle_media.c.pos)
-    )
-    result_rows = await session.execute(stmt)
-    bundle_media_ids = [row.media_id for row in result_rows.all()]
-    assert len(bundle_media_ids) == 3
+    # Verify items are in correct order
+    assert len(test_media_bundle.accountMedia) == 3
+    bundle_media_ids = [m.id for m in test_media_bundle.accountMedia]
     assert bundle_media_ids == [m.id for m in media_items]
 
     # Verify GraphQL call sequence (permanent assertion)
-    # 16 calls: 1 findImages + (2 findPerformers + 2 findStudios + 1 imageUpdate) x 3 images
-    assert len(graphql_route.calls) == 16, "Expected exactly 16 GraphQL calls"
+    # Studio lookup hoisted to batch level: 10 calls =
+    #   3 (findStudios + findStudios + studioCreate) + 1 findImages + 2*3 (per-image: findPerformers + imageUpdate)
+    assert len(graphql_route.calls) == 10, (
+        f"Expected exactly 10 GraphQL calls, got {len(graphql_route.calls)}"
+    )
     calls = graphql_route.calls
 
     # Verify query types in order
-    assert "findImages" in json.loads(calls[0].request.content)["query"]
-    # Image 1
-    assert "findPerformers" in json.loads(calls[1].request.content)["query"]
-    assert "findPerformers" in json.loads(calls[2].request.content)["query"]
-    assert "findStudios" in json.loads(calls[3].request.content)["query"]
-    assert "findStudios" in json.loads(calls[4].request.content)["query"]
+    # Studio lookup (hoisted to batch level)
+    assert "findStudios" in json.loads(calls[0].request.content)["query"]  # Fansly
+    assert (
+        "findStudios" in json.loads(calls[1].request.content)["query"]
+    )  # Creator (not found)
+    assert "studioCreate" in json.loads(calls[2].request.content)["query"]  # Creator
+    # Find images
+    assert "findImages" in json.loads(calls[3].request.content)["query"]  # Find by path
+    # Image 1: performer + update (studio already resolved)
+    assert "findPerformers" in json.loads(calls[4].request.content)["query"]
     assert "imageUpdate" in json.loads(calls[5].request.content)["query"]
-    # Image 2
+    # Image 2: performer + update (studio already resolved)
     assert "findPerformers" in json.loads(calls[6].request.content)["query"]
-    assert "findPerformers" in json.loads(calls[7].request.content)["query"]
-    assert "findStudios" in json.loads(calls[8].request.content)["query"]
-    assert "findStudios" in json.loads(calls[9].request.content)["query"]
-    assert "imageUpdate" in json.loads(calls[10].request.content)["query"]
-    # Image 3
-    assert "findPerformers" in json.loads(calls[11].request.content)["query"]
-    assert "findPerformers" in json.loads(calls[12].request.content)["query"]
-    assert "findStudios" in json.loads(calls[13].request.content)["query"]
-    assert "findStudios" in json.loads(calls[14].request.content)["query"]
-    assert "imageUpdate" in json.loads(calls[15].request.content)["query"]
+    assert "imageUpdate" in json.loads(calls[7].request.content)["query"]
+    # Image 3: performer + update (studio already resolved)
+    assert "findPerformers" in json.loads(calls[8].request.content)["query"]
+    assert "imageUpdate" in json.loads(calls[9].request.content)["query"]
 
 
 @pytest.mark.asyncio
@@ -754,63 +770,61 @@ async def test_process_bundle_with_preview(
     respx_stash_processor,
     mock_performer,
     test_account,
-    session,
+    entity_store,
 ):
     """Test processing media bundle with preview image.
 
     Tests that _process_bundle_media correctly handles bundles with preview images.
     """
+    store = get_store()
+
     # Arrange
     from tests.fixtures import PostFactory
     from tests.fixtures.metadata.metadata_factories import AccountMediaBundleFactory
     from tests.fixtures.metadata.metadata_fixtures import ACCOUNT_MEDIA_BUNDLE_ID_BASE
 
-    # Create bundle fresh in the async session
+    # Create bundle
     test_media_bundle = AccountMediaBundleFactory.build(
         id=ACCOUNT_MEDIA_BUNDLE_ID_BASE + 111223,
         accountId=test_account.id,
     )
-    session.add(test_media_bundle)
-    await session.commit()
+    await store.save(test_media_bundle)
 
     # Create a post to pass to _process_bundle_media
     test_post = PostFactory.build(accountId=test_account.id)
-    session.add(test_post)
-    await session.commit()
+    await store.save(test_post)
 
     # Create REAL preview media using factory
     preview_media = MediaFactory.build(
-        id=123456,  # Specific ID for this test
+        id=snowflake_id(),
         accountId=test_media_bundle.accountId,
         mimetype="image/jpeg",
         type=1,  # Image type
         is_downloaded=True,
     )
-    session.add(preview_media)
-    await session.commit()
+    await store.save(preview_media)
 
     # Create MediaLocation for preview
-    preview_location = MediaLocationFactory.build(
+    preview_location = MediaLocation(
         mediaId=preview_media.id,
         locationId=999,
         location="https://example.com/preview.jpg",
     )
-    session.add(preview_location)
-    await session.commit()
+    preview_media.locations = [preview_location]
+    await store.save(preview_media)
 
     # Update bundle to reference this preview
     test_media_bundle.previewId = preview_media.id
-    session.add(test_media_bundle)
-    await session.commit()
-    await session.refresh(test_media_bundle, attribute_names=["preview"])
+    test_media_bundle.preview = preview_media  # Resolve relationship in-memory
+    await store.save(test_media_bundle)
 
     # Mock Stash GraphQL HTTP responses
     # Bundle with preview (IMAGE only, NO videos):
-    # 1. findImages (for preview image)
-    # 2. findPerformers by name (empty - not found by exact name match)
-    # 3. findPerformers by alias (returns performer - found by alias)
-    # 4. findStudios (Fansly network)
-    # 5. findStudios (creator studio)
+    # 1. findStudios (Fansly network) -- hoisted to batch level
+    # 2. findStudios (creator studio -- not found) -- hoisted to batch level
+    # 3. studioCreate (creator studio) -- hoisted to batch level
+    # 4. findImages (for preview image by path)
+    # 5. findPerformers (by name via _find_existing_performer - not found)
     # 6. imageUpdate (save metadata)
     # NOTE: No findScenes call because bundle has no video files
 
@@ -833,51 +847,48 @@ async def test_process_bundle_with_preview(
     )
     find_images_data = create_find_images_result(count=1, images=[image_data])
 
-    # findPerformers call 1: by name (not found)
+    # findPerformers: by name (not found - _find_existing_performer doesn't create)
     empty_performers_result = create_find_performers_result(count=0, performers=[])
-
-    # findPerformers call 2: by alias (found)
-    performer_dict = create_performer_dict(
-        id=mock_performer.id,
-        name=mock_performer.name,
-    )
-    find_performers_data = create_find_performers_result(
-        count=1, performers=[performer_dict]
-    )
 
     fansly_studio_dict = create_studio_dict(id="fansly_246", name="Fansly (network)")
     fansly_studio_result = create_find_studios_result(
         count=1, studios=[fansly_studio_dict]
     )
 
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
     )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
-    )
 
     graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
+            # Studio lookup (hoisted to batch level)
+            # findStudios: find Fansly (network) studio
+            httpx.Response(
+                200, json=create_graphql_response("findStudios", fansly_studio_result)
+            ),
+            # findStudios: find creator studio (not found)
+            httpx.Response(
+                200,
+                json=create_graphql_response("findStudios", creator_not_found_result),
+            ),
+            # studioCreate (get_or_create creates creator studio immediately)
+            httpx.Response(
+                200, json=create_graphql_response("studioCreate", creator_studio_dict)
+            ),
+            # findImages: find by path (only 1 result, so no pagination check needed)
             httpx.Response(
                 200, json=create_graphql_response("findImages", find_images_data)
             ),
+            # findPerformers: _find_existing_performer makes single call by name (not found)
             httpx.Response(
                 200,
                 json=create_graphql_response("findPerformers", empty_performers_result),
             ),
-            httpx.Response(
-                200,
-                json=create_graphql_response("findPerformers", find_performers_data),
-            ),
-            httpx.Response(
-                200, json=create_graphql_response("findStudios", fansly_studio_result)
-            ),
-            httpx.Response(
-                200, json=create_graphql_response("findStudios", creator_studio_result)
-            ),
+            # imageUpdate: save metadata
             httpx.Response(
                 200, json=create_graphql_response("imageUpdate", image_data)
             ),
@@ -886,9 +897,28 @@ async def test_process_bundle_with_preview(
 
     # Act
     result = {"images": [], "scenes": []}
-    await respx_stash_processor._process_bundle_media(
-        test_media_bundle, test_post, test_account, result
-    )
+    try:
+        await respx_stash_processor._process_bundle_media(
+            test_media_bundle, test_post, test_account, result
+        )
+    finally:
+        # Debug: Print all GraphQL calls made
+        print("\n" + "=" * 80)
+        print("****RESPX Call Debugging****")
+        print("=" * 80)
+        for index, call in enumerate(graphql_route.calls):
+            req_body = json.loads(call.request.content)
+            resp_data = call.response.json() if call.response else {}
+            print(f"\nCall {index}:")
+            print(f"  Query: {req_body.get('query', '')[:100]}...")
+            print(f"  Variables: {req_body.get('variables', {})}")
+            print(f"  Response keys: {list(resp_data.get('data', {}).keys())}")
+            # Show actual response data for debugging
+            if resp_data.get("data"):
+                for key, value in resp_data["data"].items():
+                    if isinstance(value, dict) and "count" in value:
+                        print(f"    {key}.count = {value['count']}")
+        print("=" * 80 + "\n")
 
     # Assert
     # Verify preview was used (check that previewId is set)
@@ -897,15 +927,28 @@ async def test_process_bundle_with_preview(
     assert len(result["images"]) == 1
 
     # Verify GraphQL call sequence (permanent assertion)
+    # 6 calls: findStudios + findStudios + studioCreate + findImages + findPerformers + imageUpdate
+    # Studio lookup hoisted to batch level, runs before findImages
     assert len(graphql_route.calls) == 6, "Expected exactly 6 GraphQL calls"
     calls = graphql_route.calls
 
     # Verify query types in order
-    assert "findImages" in json.loads(calls[0].request.content)["query"]
-    assert "findPerformers" in json.loads(calls[1].request.content)["query"]  # By name
-    assert "findPerformers" in json.loads(calls[2].request.content)["query"]  # By alias
-    assert "findStudios" in json.loads(calls[3].request.content)["query"]
-    assert "findStudios" in json.loads(calls[4].request.content)["query"]
+    # Studio lookup (hoisted to batch level)
+    assert (
+        "findStudios" in json.loads(calls[0].request.content)["query"]
+    )  # Fansly network
+    assert (
+        "findStudios" in json.loads(calls[1].request.content)["query"]
+    )  # Creator studio lookup (not found)
+    assert (
+        "studioCreate" in json.loads(calls[2].request.content)["query"]
+    )  # Creator studio
+    # Find images
+    assert "findImages" in json.loads(calls[3].request.content)["query"]  # Find by path
+    # Per-image: performer + update (studio already resolved)
+    assert (
+        "findPerformers" in json.loads(calls[4].request.content)["query"]
+    )  # By name (not found)
     assert "imageUpdate" in json.loads(calls[5].request.content)["query"]
 
 
@@ -914,81 +957,65 @@ async def test_bundle_permission_inheritance(
     respx_stash_processor,
     mock_performer,
     test_account,
-    session,
+    entity_store,
 ):
     """Test that media items inherit bundle permissions.
 
     Note: permissions is just data, not a database field in AccountMediaBundle.
     This test verifies that _process_bundle_media properly handles permissions.
     """
+    store = get_store()
+
     # Arrange
-    from metadata.account import account_media_bundle_media
     from tests.fixtures import PostFactory
     from tests.fixtures.metadata.metadata_factories import AccountMediaBundleFactory
     from tests.fixtures.metadata.metadata_fixtures import ACCOUNT_MEDIA_BUNDLE_ID_BASE
 
-    # Create bundle fresh in the async session
+    # Create bundle
     test_media_bundle = AccountMediaBundleFactory.build(
         id=ACCOUNT_MEDIA_BUNDLE_ID_BASE + 111224,
         accountId=test_account.id,
     )
-    session.add(test_media_bundle)
-    await session.commit()
+    await store.save(test_media_bundle)
 
     # Create a post to pass to _process_bundle_media
     test_post = PostFactory.build(accountId=test_account.id)
-    session.add(test_post)
-    await session.commit()
+    await store.save(test_post)
 
     # Create REAL media items using factories
     media_items = []
     for i in range(2):
         # Create Media
         media = MediaFactory.build(
-            id=300000 + i,
+            id=snowflake_id(),
             accountId=test_media_bundle.accountId,
             mimetype="image/jpeg",
             is_downloaded=True,
         )
-        session.add(media)
-        await session.commit()
+        await store.save(media)
 
         # Create MediaLocation
-        media_location = MediaLocationFactory.build(
+        media_location = MediaLocation(
             mediaId=media.id,
             locationId=300 + i,
             location=f"https://example.com/permission_media_{i}.jpg",
         )
-        session.add(media_location)
-        await session.commit()
+        media.locations = [media_location]
+        await store.save(media)
 
         # Create AccountMedia to link Media to Account
         account_media = AccountMediaFactory.build(
             accountId=test_media_bundle.accountId,
             mediaId=media.id,
         )
-        session.add(account_media)
-        await session.commit()
+        await store.save(account_media)
+        # account_media.media auto-resolves via identity map (Media already saved)
 
         media_items.append(account_media)
 
-    # Link AccountMedia items to bundle using the junction table
-    for i, account_media in enumerate(media_items):
-        await session.execute(
-            account_media_bundle_media.insert().values(
-                bundle_id=test_media_bundle.id,
-                media_id=account_media.id,
-                pos=i,
-            )
-        )
-    await session.commit()
-
-    # Refresh bundle to load relationships
-    await session.refresh(test_media_bundle, attribute_names=["accountMedia"])
-
-    # Eagerly load media and preview relationships
-    for account_media in media_items:
-        await session.refresh(account_media, attribute_names=["media", "preview"])
+    # Set accountMedia on the bundle (the relationship)
+    test_media_bundle.accountMedia = media_items
+    await store.save(test_media_bundle)
 
     # Mock Stash GraphQL HTTP responses
     # 2 images: findImages, findScenes, findPerformers, 2x findStudios, 2x imageUpdate
@@ -1016,10 +1043,7 @@ async def test_bundle_permission_inheritance(
 
     find_images_data = create_find_images_result(count=2, images=images_data)
 
-    # findPerformers call 1: by name (not found)
-    empty_performers_result = create_find_performers_result(count=0, performers=[])
-
-    # findPerformers call 2: by alias (found)
+    # v0.10.3 pattern: findPerformers (name only), findStudios (Fansly), studioCreate (creator)
     performer_dict = create_performer_dict(
         id=mock_performer.id,
         name=mock_performer.name,
@@ -1033,48 +1057,42 @@ async def test_bundle_permission_inheritance(
         count=1, studios=[fansly_studio_dict]
     )
 
+    creator_not_found_result = create_find_studios_result(count=0, studios=[])
+
     creator_studio_dict = create_studio_dict(
         id="creator_999",
         name=f"{test_account.username} (Fansly)",
         urls=[f"https://fansly.com/{test_account.username}"],
     )
-    creator_studio_result = create_find_studios_result(
-        count=1, studios=[creator_studio_dict]
-    )
 
     # Build response sequence (no findScenes - bundle has only images)
+    # Studio lookup is hoisted to batch level (_find_existing_studio called at top of
+    # _process_batch_internal), so findStudios + studioCreate come FIRST, before findImages.
     responses = [
-        httpx.Response(
-            200, json=create_graphql_response("findImages", find_images_data)
-        ),
-        # First image processing
-        httpx.Response(
-            200, json=create_graphql_response("findPerformers", empty_performers_result)
-        ),
-        httpx.Response(
-            200, json=create_graphql_response("findPerformers", find_performers_data)
-        ),
+        # Studio lookup (hoisted to batch level)
         httpx.Response(
             200, json=create_graphql_response("findStudios", fansly_studio_result)
         ),
         httpx.Response(
-            200, json=create_graphql_response("findStudios", creator_studio_result)
+            200, json=create_graphql_response("findStudios", creator_not_found_result)
+        ),
+        httpx.Response(
+            200, json=create_graphql_response("studioCreate", creator_studio_dict)
+        ),
+        # findImages
+        httpx.Response(
+            200, json=create_graphql_response("findImages", find_images_data)
+        ),
+        # First image: findPerformers + imageUpdate (studio already resolved at batch level)
+        httpx.Response(
+            200, json=create_graphql_response("findPerformers", find_performers_data)
         ),
         httpx.Response(
             200, json=create_graphql_response("imageUpdate", images_data[0])
         ),
-        # Second image processing (performer/studio lookups not cached)
-        httpx.Response(
-            200, json=create_graphql_response("findPerformers", empty_performers_result)
-        ),
+        # Second image: findPerformers + imageUpdate (studio already resolved at batch level)
         httpx.Response(
             200, json=create_graphql_response("findPerformers", find_performers_data)
-        ),
-        httpx.Response(
-            200, json=create_graphql_response("findStudios", fansly_studio_result)
-        ),
-        httpx.Response(
-            200, json=create_graphql_response("findStudios", creator_studio_result)
         ),
         httpx.Response(
             200, json=create_graphql_response("imageUpdate", images_data[1])
@@ -1087,41 +1105,44 @@ async def test_bundle_permission_inheritance(
 
     # Act
     result = {"images": [], "scenes": []}
-    await respx_stash_processor._process_bundle_media(
-        test_media_bundle, test_post, test_account, result
-    )
+    try:
+        await respx_stash_processor._process_bundle_media(
+            test_media_bundle, test_post, test_account, result
+        )
+    finally:
+        from tests.fixtures.stash import dump_graphql_calls
+
+        dump_graphql_calls(graphql_route.calls, "test_bundle_permission_inheritance")
 
     # Assert
     # Verify bundle was processed
     assert len(result["images"]) == 2
 
-    # Verify items are in correct order by manually querying the junction table
-    stmt = (
-        account_media_bundle_media.select()
-        .where(account_media_bundle_media.c.bundle_id == test_media_bundle.id)
-        .order_by(account_media_bundle_media.c.pos)
-    )
-    result_rows = await session.execute(stmt)
-    bundle_media_ids = [row.media_id for row in result_rows.all()]
-    assert len(bundle_media_ids) == 2
+    # Verify items are in correct order
+    assert len(test_media_bundle.accountMedia) == 2
+    bundle_media_ids = [m.id for m in test_media_bundle.accountMedia]
     assert bundle_media_ids == [m.id for m in media_items]
 
-    # Verify GraphQL call sequence (permanent assertion)
-    # 11 calls: 1 findImages + (2 findPerformers + 2 findStudios + 1 imageUpdate) x 2 images
-    assert len(graphql_route.calls) == 11, "Expected exactly 11 GraphQL calls"
+    # Verify GraphQL call sequence
+    # Studio lookup hoisted to batch level: 8 calls =
+    #   3 (findStudios + findStudios + studioCreate) + 1 findImages + 2*2 (per-image: findPerformers + imageUpdate)
+    assert len(graphql_route.calls) == 8, (
+        f"Expected exactly 8 GraphQL calls, got {len(graphql_route.calls)}"
+    )
     calls = graphql_route.calls
 
     # Verify query types in order
-    assert "findImages" in json.loads(calls[0].request.content)["query"]
-    # First image
-    assert "findPerformers" in json.loads(calls[1].request.content)["query"]  # By name
-    assert "findPerformers" in json.loads(calls[2].request.content)["query"]  # By alias
-    assert "findStudios" in json.loads(calls[3].request.content)["query"]  # Fansly
-    assert "findStudios" in json.loads(calls[4].request.content)["query"]  # Creator
+    # Studio lookup (hoisted to batch level)
+    assert "findStudios" in json.loads(calls[0].request.content)["query"]  # Fansly
+    assert (
+        "findStudios" in json.loads(calls[1].request.content)["query"]
+    )  # Creator lookup (not found)
+    assert "studioCreate" in json.loads(calls[2].request.content)["query"]  # Creator
+    # Find images
+    assert "findImages" in json.loads(calls[3].request.content)["query"]
+    # First image: findPerformers + imageUpdate (studio already resolved)
+    assert "findPerformers" in json.loads(calls[4].request.content)["query"]
     assert "imageUpdate" in json.loads(calls[5].request.content)["query"]
-    # Second image
-    assert "findPerformers" in json.loads(calls[6].request.content)["query"]  # By name
-    assert "findPerformers" in json.loads(calls[7].request.content)["query"]  # By alias
-    assert "findStudios" in json.loads(calls[8].request.content)["query"]  # Fansly
-    assert "findStudios" in json.loads(calls[9].request.content)["query"]  # Creator
-    assert "imageUpdate" in json.loads(calls[10].request.content)["query"]
+    # Second image: findPerformers + imageUpdate (studio already resolved)
+    assert "findPerformers" in json.loads(calls[6].request.content)["query"]
+    assert "imageUpdate" in json.loads(calls[7].request.content)["query"]

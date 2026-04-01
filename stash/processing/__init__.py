@@ -6,16 +6,15 @@ import asyncio
 import traceback
 from typing import TYPE_CHECKING
 
-from sqlalchemy import inspect, select
-from sqlalchemy.ext.asyncio import AsyncSession
 from stash_graphql_client import StashContext
-from stash_graphql_client.types import Performer
+from stash_graphql_client.types import Gallery, GalleryChapter, Image, Performer, Scene
 
+from helpers.rich_progress import get_progress_manager
 from metadata import Account, Database
-from metadata.decorators import with_session
 from textio import print_error, print_info
 
 from ..logging import debug_print
+from ..logging import processing_logger as logger
 from .base import StashProcessingBase
 from .mixins import (
     AccountProcessingMixin,
@@ -91,24 +90,19 @@ class StashProcessing(
         BatchProcessingMixin.__init__(self)
         TagProcessingMixin.__init__(self)
 
-    @with_session()
     async def continue_stash_processing(
         self,
         account: Account | None,
         performer: Performer | None,
-        session: AsyncSession | None = None,
     ) -> None:
         """Continue processing in background.
 
         Args:
             account: Account to process
             performer: Performer created from account
-            session: Optional database session to use
-
-        Note:
-            This method requires a session and will ensure the account is properly bound to it.
-            The performer object is a Stash GraphQL type, not a SQLAlchemy model.
         """
+        progress_mgr = get_progress_manager()
+
         try:
             if not account or not performer:
                 raise ValueError("Missing account or performer data")
@@ -116,13 +110,8 @@ class StashProcessing(
             if not isinstance(performer, Performer):
                 raise TypeError("performer must be a Stash Performer object")
 
-            # Get account ID safely without triggering lazy loading
-            account_id = inspect(account).identity[0]
-
-            # Ensure we have a fresh account instance bound to the session
-            stmt = select(Account).where(Account.id == account_id)
-            result = await session.execute(stmt)
-            account = result.scalar_one()
+            self._account = account
+            self._performer = performer
 
             # Convert performer.id (string) to int for comparison with account.stash_id (int)
             if account.stash_id != int(performer.id):
@@ -131,38 +120,40 @@ class StashProcessing(
                     performer=performer,
                 )
 
-            # Process creator studio
-            print_info("Processing creator Studio...")
-            studio = await self.process_creator_studio(
-                account=account,
-                performer=performer,
-                session=session,
-            )
+            # 3 phases: studio, posts, messages
+            performer_label = performer.name or "creator"
+            with progress_mgr.session():
+                self._stash_parent_task = progress_mgr.add_task(
+                    name="stash_creator",
+                    description=f"Stash: {performer_label}",
+                    total=3,
+                    show_elapsed=True,
+                )
 
-            # Process creator content
-            # Refresh account to ensure it's still bound
-            await session.refresh(account)
-            print_info("Processing creator posts...")
-            await self.process_creator_posts(
-                account=account,
-                performer=performer,
-                studio=studio,
-                session=session,
-            )
+                # Process creator studio
+                print_info("Processing creator Studio...")
+                studio = await self.process_creator_studio(account=account)
+                self._studio = studio
+                progress_mgr.update_task(self._stash_parent_task, advance=1)
 
-            # Refresh account again before processing messages
-            await session.refresh(account)
-            print_info("Processing creator messages...")
-            await self.process_creator_messages(
-                account=account,
-                performer=performer,
-                studio=studio,
-                session=session,
-            )
+                # Process creator content
+                print_info("Processing creator posts...")
+                await self.process_creator_posts(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                )
+                progress_mgr.update_task(self._stash_parent_task, advance=1)
+
+                print_info("Processing creator messages...")
+                await self.process_creator_messages(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                )
+                progress_mgr.update_task(self._stash_parent_task, advance=1)
 
         except Exception as e:
-            from config.logging import logger
-
             print_error(f"Error in Stash processing: {e}")
             logger.exception("Error in Stash processing", exc_info=e)
             debug_print(
@@ -175,6 +166,16 @@ class StashProcessing(
             )
             raise
         finally:
+            self._stash_parent_task = None
+            self._account = None
+            self._performer = None
+            self._studio = None
+            self._scene_code_index.clear()
+            self._image_code_index.clear()
+            for entity_type in (Gallery, GalleryChapter, Scene, Image):
+                self.store.invalidate_type(entity_type)
+            logger.debug("Invalidated per-creator entity caches and media code indexes")
+
             performer_name = (
                 performer.name if isinstance(performer, Performer) else repr(performer)
             )

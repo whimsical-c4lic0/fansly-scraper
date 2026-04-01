@@ -19,6 +19,7 @@ import os
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from unittest.mock import patch
 
 import httpx
@@ -28,6 +29,7 @@ import respx
 from faker import Faker
 from stash_graphql_client.types import StashID, Studio
 
+from download.downloadstate import DownloadState
 from fileio.fnmanip import extract_media_id
 from metadata import AccountMedia
 from stash.processing import StashProcessing
@@ -36,6 +38,8 @@ from tests.fixtures.metadata.metadata_factories import (
     AccountMediaFactory,
     MediaFactory,
 )
+from tests.fixtures.stash.stash_api_fixtures import _mock_capability_response
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 # ============================================================================
@@ -126,8 +130,9 @@ def test_state(tmp_path):
     download_path = base_path / "test_user"
     download_path.mkdir(parents=True, exist_ok=True)
 
+    creator_id = snowflake_id()
     return DownloadStateFactory(
-        creator_id="12345",
+        creator_id=creator_id,
         creator_name="test_user",
         base_path=base_path,
         download_path=download_path,
@@ -185,17 +190,20 @@ def mock_permissions():
 
 
 @pytest_asyncio.fixture
-async def real_stash_processor(config, test_database_sync, test_state, stash_context):
+async def real_stash_processor(config, test_database_sync, stash_context, test_state):
     """Fixture for StashProcessing with REAL database and REAL Docker Stash.
 
     This is for TRUE integration tests that hit the real Stash instance.
     All HTTP calls go to the actual Docker Stash server (localhost:9999).
 
+    Uses the Stash server's actual library path as base_path so that
+    path-based regex searches match real file paths in the Stash instance.
+
     Args:
         config: Real FanslyConfig with UUID-isolated database
         test_database_sync: Real Database instance
-        test_state: Real TestState (download state)
         stash_context: Real StashContext connected to Docker (localhost:9999)
+        test_state: DownloadState fixture (shares creator_id with test assertions)
 
     Yields:
         StashProcessing: Fully functional processor hitting real Docker Stash
@@ -205,7 +213,31 @@ async def real_stash_processor(config, test_database_sync, test_state, stash_con
     config._stash = stash_context
 
     # Initialize the client (will make REAL HTTP calls)
-    await stash_context.get_client()
+    client = await stash_context.get_client()
+
+    # Query the Stash server's library path for a real base_path
+    stash_config = await client.get_configuration()
+    if stash_config.general.stashes:
+        stash_library_path = Path(stash_config.general.stashes[0].path)
+    else:
+        stash_library_path = Path("/")
+
+    # Create a real DownloadState with the Stash server's actual library path,
+    # using the same creator_id as test_state for assertion consistency
+    state = DownloadState(
+        creator_name="test_user",
+        creator_id=test_state.creator_id,
+        base_path=stash_library_path,
+        download_path=stash_library_path,
+    )
+
+    # Invalidate the store cache so each test starts with a clean identity map.
+    # Without this, find_images()/find_scenes() calls within the test populate
+    # the cache, and process_creator_attachment's cache-first path serves lookups
+    # without making GraphQL calls — which is correct production behavior but
+    # makes integration test assertions unpredictable.
+    if stash_context._store is not None:
+        stash_context._store.invalidate_all()
 
     # Disable prints for testing
     with (
@@ -213,12 +245,15 @@ async def real_stash_processor(config, test_database_sync, test_state, stash_con
         patch("textio.textio.print_warning"),
         patch("textio.textio.print_error"),
     ):
-        processor = StashProcessing.from_config(config, test_state)
+        processor = StashProcessing.from_config(config, state)
         yield processor
         # Cleanup: Clear LRU caches to prevent pollution in sequential test execution
         # Only clear if client is still initialized (some tests call cleanup() which closes client)
         if processor.context._client is not None:
             _clear_stash_client_caches(processor.context.client)
+        # Also clear the store cache for the next test
+        if processor.context._store is not None:
+            processor.context._store.invalidate_all()
 
 
 @pytest_asyncio.fixture
@@ -256,16 +291,21 @@ async def respx_stash_processor(config, test_database_sync, test_state, stash_co
     config._database = test_database_sync
     config._stash = stash_context
 
-    # Set up default respx mock for GraphQL endpoint
-    # Tests can add more specific mocks as needed
+    # Set up respx mock with capability detection for v0.11 initialization
     with respx.mock:
-        # Default response for any GraphQL requests
+        # Serve capability detection response for v0.11 initialization
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[_mock_capability_response()]
+        )
+
+        # Initialize the client (consumes the capability response)
+        await stash_context.get_client()
+
+        # Reset all routes and global call history so tests start clean
+        respx.reset()
         respx.post("http://localhost:9999/graphql").mock(
             return_value=httpx.Response(200, json={"data": {}})
         )
-
-        # Initialize the client (will use mocked HTTP)
-        await stash_context.get_client()
 
         # Disable prints for testing
         with (
@@ -827,9 +867,9 @@ async def message_media_generator(factory_session, real_stash_processor):
                         media = MediaFactory.build(**media_kwargs)
                         media_items.append(media)  # Store for test to commit
 
-                        # Build AccountMedia without accountId (test will set it)
+                        # Build AccountMedia with placeholder accountId (test will set it)
                         account_media = AccountMediaFactory.build(
-                            mediaId=media.id, accountId=None
+                            mediaId=media.id,
                         )
 
                         # Store bundle link metadata (position in bundle)
@@ -875,9 +915,9 @@ async def message_media_generator(factory_session, real_stash_processor):
                         media = MediaFactory.build(**media_kwargs)
                         media_items.append(media)  # Store for test to commit
 
-                        # Build AccountMedia without accountId (test will set it)
+                        # Build AccountMedia with placeholder accountId (test will set it)
                         account_media = AccountMediaFactory.build(
-                            mediaId=media.id, accountId=None
+                            mediaId=media.id,
                         )
                         account_media_items.append(account_media)
 
@@ -929,9 +969,9 @@ async def message_media_generator(factory_session, real_stash_processor):
                     media = MediaFactory.build(**media_kwargs)
                     media_items.append(media)  # Store for test to commit
 
-                    # Build AccountMedia without accountId (test will set it)
+                    # Build AccountMedia with placeholder accountId (test will set it)
                     account_media = AccountMediaFactory.build(
-                        mediaId=media.id, accountId=None
+                        mediaId=media.id,
                     )
                     account_media_items.append(account_media)
 

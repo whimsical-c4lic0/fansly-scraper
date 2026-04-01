@@ -2,150 +2,170 @@
 
 from __future__ import annotations
 
-import asyncio
 import traceback
 from typing import TYPE_CHECKING
 
-from sqlalchemy import inspect
-from sqlalchemy.orm import Session
-from sqlalchemy.sql import func, select
-from stash_graphql_client.types import Performer, is_set
+from stash_graphql_client.types import Image, Performer
 
-from metadata import Account, Media, account_avatar
-from metadata.decorators import with_session
+from metadata import Account, Media
+from metadata.models import get_store
 from textio import print_error, print_warning
 
 from ...logging import debug_print
 from ...logging import processing_logger as logger
+from ..protocols import StashProcessingProtocol
 
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from metadata.entity_store import PostgresEntityStore
 
 
-class AccountProcessingMixin:
+class AccountProcessingMixin(StashProcessingProtocol):
     """Account and performer processing functionality."""
 
-    @with_session()
-    async def _find_account(
-        self,
-        session: Session | None = None,
-    ) -> Account | None:
-        """Find account in database.
-
-        Args:
-            session: Optional database session to use
+    async def _find_account(self) -> Account | None:
+        """Find account in database using identity map (cache-first).
 
         Returns:
             Account if found, None otherwise
         """
+        store: PostgresEntityStore = get_store()
+
         if self.state.creator_id is not None:
-            stmt = select(Account).where(Account.id == int(self.state.creator_id))
+            # Cache-first: identity map lookup is O(1)
+            account = store.get_from_cache(Account, self.state.creator_id)
+            if not account:
+                account = await store.get(Account, self.state.creator_id)
         else:
-            stmt = select(Account).where(
-                func.lower(Account.username) == func.lower(self.state.creator_name)
-            )
-        result = await session.execute(stmt)
-        account = result.scalar_one_or_none()
+            # Search by username (case-insensitive) — filter cache first
+            name_lower = self.state.creator_name.lower()
+            cached = [
+                obj
+                for obj in store._cache.get(Account, {}).values()
+                if getattr(obj, "username", None) and obj.username.lower() == name_lower
+            ]
+            account = cached[0] if cached else None
+            if not account:
+                account = await store.find_one(
+                    Account, username__iexact=self.state.creator_name
+                )
+
         if not account:
             print_warning(f"No account found for username: {self.state.creator_name}")
         return account
 
     def _performer_from_account(self, account: Account) -> Performer:
-        """Create a Performer object from a Fansly Account.
+        """Create a Performer object from a Fansly Account (or PostMention).
 
         This is a local helper that maps Account model fields to the Performer
-        type from stash-graphql-client.
-
-        Note: This was originally `Performer.from_account()` but when all of the
-        StashClient/StashContext/Stash types were moved into a centralized library,
-        application-specific code like this was removed so the library could be generic.
+        type from stash-graphql-client. Supports both Account (displayName,
+        username, about) and PostMention (handle) via duck-typing.
 
         Args:
-            account: The Account database model to convert
+            account: The Account or PostMention to convert
 
         Returns:
             Performer object suitable for creating/updating in Stash.
             For new performers, the id field is omitted and auto-generates
             a UUID4 placeholder.
         """
-        # Use displayName as the primary name, fallback to username
-        name = account.displayName or account.username
+        # Use displayName as the primary name, fallback to username or handle
+        name = (
+            getattr(account, "displayName", None)
+            or getattr(account, "username", None)
+            or getattr(account, "handle", None)
+        )
+        username = getattr(account, "username", None) or getattr(
+            account, "handle", None
+        )
 
         # Build Fansly profile URL
-        url = f"https://fansly.com/{account.username}"
+        url = f"https://fansly.com/{username}"
 
         # Create Performer without id (auto-generates UUID4 for new objects)
         return Performer(
             name=name,
-            alias_list=[account.username],  # Username as alias for searchability
+            alias_list=[username],  # Username as alias for searchability
             urls=[url],
-            details=account.about or "",  # Biography/about text
+            details=getattr(account, "about", "") or "",  # Biography/about text
         )
 
     async def _get_or_create_performer(self, account: Account) -> Performer:
         """Get existing performer from Stash or create from account if not found.
 
-        Uses intelligent fuzzy search to find performers by:
-        1. Exact name match (displayName or username)
-        2. Alias match (username)
-        3. URL match (Fansly profile URL)
-        4. Creates new performer from account if no match found
+        IMPORTANT: Performs deduplication checks (name→alias→URL) BEFORE creating.
+        Pattern 1 migration: Use store.find_one() for identity map caching,
+        preserving critical sequential deduplication logic.
 
         Args:
             account: Account database model to search for or create from
 
         Returns:
             Performer object from Stash (either found or newly created)
-
-        Note:
-            This searches Stash BEFORE creating a Performer object to avoid
-            polluting the StashEntityStore with temporary UUID placeholders.
         """
-        # Determine search criteria from account
-        search_name = account.displayName or account.username
-        fansly_url = f"https://fansly.com/{account.username}"
-
-        # Try exact name match
-        result = await self.context.client.find_performers(
-            performer_filter={"name": {"value": search_name, "modifier": "EQUALS"}}
+        # Determine search criteria from account (or PostMention via duck-typing)
+        search_name = (
+            getattr(account, "displayName", None)
+            or getattr(account, "username", None)
+            or getattr(account, "handle", None)
         )
-        if is_set(result.count) and result.count > 0:
-            logger.debug(f"Found existing performer by name: {search_name}")
-            return result.performers[0]
-
-        # Try alias match with username
-        result = await self.context.client.find_performers(
-            performer_filter={
-                "aliases": {"value": account.username, "modifier": "INCLUDES"}
-            }
+        username = getattr(account, "username", None) or getattr(
+            account, "handle", None
         )
-        if is_set(result.count) and result.count > 0:
-            logger.debug(f"Found existing performer by alias: {account.username}")
-            return result.performers[0]
+        fansly_url = f"https://fansly.com/{username}"
 
-        # Try URL match
-        result = await self.context.client.find_performers(
-            performer_filter={"url": {"value": fansly_url, "modifier": "INCLUDES"}}
-        )
-        if is_set(result.count) and result.count > 0:
-            logger.debug(f"Found existing performer by URL: {fansly_url}")
-            return result.performers[0]
+        # Cache-first: try sync filter() on preloaded performers before GraphQL.
+        # Performers are preloaded in _preload_stash_entities() at startup.
+        # Sequential name → alias → URL checks prevent duplicates.
+        performer = None
 
-        # Not found - create from account
-        logger.debug(f"Creating new performer for account: {account.username}")
+        # 1. Exact name match
+        results = self.store.filter(Performer, lambda p: p.name == search_name)
+        if results:
+            logger.debug(f"Cache hit: performer by name: {search_name}")
+            performer = results[0]
+        if not performer:
+            performer = await self.store.find_one(Performer, name__exact=search_name)
+
+        # 2. Alias match (critical for deduplication)
+        if not performer:
+            results = self.store.filter(
+                Performer,
+                lambda p: (
+                    hasattr(p, "alias_list")
+                    and p.alias_list
+                    and username in p.alias_list
+                ),
+            )
+            if results:
+                logger.debug(f"Cache hit: performer by alias: {username}")
+                performer = results[0]
+        if not performer:
+            performer = await self.store.find_one(Performer, aliases__contains=username)
+
+        # 3. URL match (catches edge cases)
+        if not performer:
+            results = self.store.filter(
+                Performer,
+                lambda p: hasattr(p, "urls") and p.urls and fansly_url in p.urls,
+            )
+            if results:
+                logger.debug(f"Cache hit: performer by URL: {fansly_url}")
+                performer = results[0]
+        if not performer:
+            performer = await self.store.find_one(Performer, url__contains=fansly_url)
+
+        if performer:
+            return performer
+
+        # Not found after all deduplication checks - create new performer
+        logger.debug(f"Creating new performer for account: {username}")
         performer = self._performer_from_account(account)
-        return await self.context.client.create_performer(performer)
+        await self.store.save(performer)
+        return performer
 
-    @with_session()
-    async def process_creator(
-        self,
-        session: Session | None = None,
-    ) -> tuple[Account, Performer]:
+    async def process_creator(self) -> tuple[Account, Performer]:
         """Process creator metadata into Stash.
-
-        Args:
-            session: Optional database session to use
 
         Returns:
             Tuple of (Account, Performer)
@@ -155,7 +175,7 @@ class AccountProcessingMixin:
         """
         try:
             # Find account
-            account = await self._find_account(session)
+            account = await self._find_account()
             debug_print(
                 {
                     "method": "StashProcessing - process_creator",
@@ -181,7 +201,7 @@ class AccountProcessingMixin:
                 }
             )
             # Handle avatar if needed
-            await self._update_performer_avatar(account, performer, session=session)
+            await self._update_performer_avatar(account, performer)
         except Exception as e:
             print_error(f"Failed to process creator: {e}")
             logger.exception("Failed to process creator", exc_info=e)
@@ -198,7 +218,7 @@ class AccountProcessingMixin:
             return account, performer
 
     async def _update_performer_avatar(
-        self, account: Account, performer: Performer, session: Session | None = None
+        self, account: Account, performer: Performer
     ) -> None:
         """Update performer's avatar if needed.
 
@@ -207,26 +227,9 @@ class AccountProcessingMixin:
         Args:
             account: Account object containing avatar information
             performer: Performer object to update
-            session: Database session for querying avatar
         """
-        # Query avatar explicitly instead of using relationship
-        # (relationship lazy loading has issues with async sessions)
-        avatar = None
-        if session:
-            try:
-                stmt = (
-                    select(Media)
-                    .join(account_avatar)
-                    .where(account_avatar.c.accountId == account.id)
-                )
-                result = await session.execute(stmt)
-                avatar = result.scalar_one_or_none()
-            except Exception as e:
-                logger.error(
-                    f"Failed to query avatar for account {account.id}: {e}",
-                    exc_info=e,
-                )
-
+        # Account.avatar is a Pydantic relationship — directly accessible
+        avatar: Media | None = account.avatar
         has_avatar = avatar and avatar.local_filename
 
         if not has_avatar:
@@ -241,21 +244,19 @@ class AccountProcessingMixin:
 
         # Only update if current image is default
         if not performer.image_path or "default=true" in performer.image_path:
-            # Get avatar file path
-            avatar_stash_obj = await self.context.client.find_images(
-                image_filter={
-                    "path": {
-                        "modifier": "INCLUDES",
-                        "value": avatar.local_filename,
-                    }
-                },
-                filter_={
-                    "per_page": -1,
-                    "sort": "created_at",
-                    "direction": "DESC",
-                },
+            # Cache-first: try sync filter on preloaded images, then GraphQL
+            filename = avatar.local_filename
+            images = self.store.filter(
+                Image,
+                lambda img: (
+                    hasattr(img, "visual_files")
+                    and img.visual_files
+                    and any(filename in f.path for f in img.visual_files)
+                ),
             )
-            if avatar_stash_obj.count == 0:
+            if not images:
+                images = await self.store.find(Image, path__contains=filename)
+            if not images:
                 debug_print(
                     {
                         "method": "StashProcessing - _update_performer_avatar",
@@ -264,9 +265,9 @@ class AccountProcessingMixin:
                     }
                 )
                 return
-            # Library returns Image objects directly - no conversion needed
-            avatar = avatar_stash_obj.images[0]
-            avatar_path = avatar.visual_files[0].path
+            # Use first image (sorted by created_at in Stash)
+            avatar_img = images[0]
+            avatar_path = avatar_img.visual_files[0].path
             try:
                 await performer.update_avatar(self.context.client, avatar_path)
                 debug_print(
@@ -289,7 +290,7 @@ class AccountProcessingMixin:
                 )
 
     async def _find_existing_performer(self, account: Account) -> Performer | None:
-        """Find existing performer in Stash.
+        """Find existing performer in Stash using identity map.
 
         Args:
             account: Account to find performer for
@@ -297,57 +298,63 @@ class AccountProcessingMixin:
         Returns:
             Performer data if found, None otherwise
         """
-        # Try finding by stash_id first
-        if account.stash_id:
-            performer_data = await self.context.client.find_performer(account.stash_id)
-            if performer_data:
-                debug_print(
-                    {
-                        "method": "StashProcessing - _find_existing_performer",
-                        "stash_id": account.stash_id,
-                        "performer_data": performer_data,
-                    }
-                )
-                # Await the coroutine if we got one
-                if asyncio.iscoroutine(performer_data):
-                    performer_data = await performer_data
-                return performer_data or None
-        performer_data = await self.context.client.find_performer(account.username)
-        debug_print(
-            {
-                "method": "StashProcessing - _find_existing_performer",
-                "username": account.username,
-                "performer_data": performer_data,
-            }
-        )
-        # Await the coroutine if we got one
-        if asyncio.iscoroutine(performer_data):
-            performer_data = await performer_data
-        return performer_data or None
+        # Cache-first: try sync get_cached() (zero-cost after preload),
+        # fall back to async get() only if cache misses.
+        # Uses getattr for duck-typing: works with both Account (stash_id/username)
+        # and PostMention (handle) objects after the Pydantic migration.
+        stash_id = getattr(account, "stash_id", None)
+        if stash_id:
+            try:
+                performer = self.store.get_cached(Performer, str(stash_id))
+                if not performer:
+                    performer = await self.store.get(Performer, str(stash_id))
+                if performer:
+                    debug_print(
+                        {
+                            "method": "StashProcessing - _find_existing_performer",
+                            "stash_id": stash_id,
+                            "performer": performer,
+                            "cached": "identity_map",
+                        }
+                    )
+                    return performer
+            except Exception as e:
+                logger.debug(f"Failed to get performer by stash_id: {e}")
 
-    @with_session()
+        # Fallback to name search (cache-first, then GraphQL)
+        # Supports both Account (username) and PostMention (handle)
+        name = getattr(account, "username", None) or getattr(account, "handle", None)
+        if not name:
+            return None
+        results = self.store.filter(Performer, lambda p: p.name == name)
+        performer = results[0] if results else None
+        if not performer:
+            performer = await self.store.find_one(Performer, name=name)
+        if performer:
+            debug_print(
+                {
+                    "method": "StashProcessing - _find_existing_performer",
+                    "username": name,
+                    "performer": performer,
+                }
+            )
+        return performer
+
     async def _update_account_stash_id(
         self,
         account: Account,
         performer: Performer,
-        session: AsyncSession | None = None,
     ) -> None:
-        """Update account's stash ID.
+        """Update account's stash ID and persist to database.
+
+        Supports both Account (has stash_id field) and PostMention (skipped).
 
         Args:
-            account: Account to update
+            account: Account (or PostMention) to update
             performer: Performer containing the stash ID
-            session: Optional database session
         """
-        # Get account ID safely without triggering lazy loading
-        account_id = inspect(account).identity[0]
-
-        # Get a fresh account instance bound to the session
-        stmt = select(Account).where(Account.id == account_id)
-        result = await session.execute(stmt)
-        account = result.scalar_one()
-
-        # Update stash ID (convert from string to int)
+        if not hasattr(account, "stash_id"):
+            return  # PostMention doesn't have stash_id
+        store: PostgresEntityStore = get_store()
         account.stash_id = int(performer.id)
-        session.add(account)
-        await session.flush()
+        await store.save(account)

@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from metadata.attachment import ContentType
+from metadata import ContentType
 from tests.fixtures.metadata.metadata_factories import (
     AccountMediaBundleFactory,
     AccountMediaFactory,
@@ -19,6 +19,7 @@ from tests.fixtures.metadata.metadata_factories import (
     PostFactory,
 )
 from tests.fixtures.stash import ImageFactory, SceneFactory
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 class TestAttachmentProcessing:
@@ -26,29 +27,33 @@ class TestAttachmentProcessing:
 
     @pytest.mark.asyncio
     async def test_process_attachment_with_direct_media(
-        self, respx_stash_processor, mock_item, mock_account
+        self, respx_stash_processor, mock_item, mock_account, entity_store
     ):
         """Test process_creator_attachment collects media from direct attachment.
 
         User authorized mocking only because of over-testing of deeper methods.
         """
         # Create real Media object using factory
+        media_id = snowflake_id()
+        acct_media_id = snowflake_id()
         media = MediaFactory.build(
-            id=20789,
+            id=media_id,
             mimetype="image/jpeg",
             is_downloaded=True,
             accountId=mock_account.id,
-            stash_id="stash_attachment_789",
+            stash_id=789,
         )
 
         # Create real AccountMedia object using factory
         account_media = AccountMediaFactory.build(
-            id=70456,
+            id=acct_media_id,
             accountId=mock_account.id,
             mediaId=media.id,
         )
-        # Set up the relationship
-        account_media.media = media
+        # Populate identity map so property lookups resolve
+        store = entity_store
+        store.cache_instance(media)
+        store.cache_instance(account_media)
 
         # Create real Attachment object using factory
         attachment = AttachmentFactory.build(
@@ -57,11 +62,9 @@ class TestAttachmentProcessing:
             contentType=1,  # ContentType.ACCOUNT_MEDIA
             postId=mock_item.id,
         )
-        # Set up the relationship
-        attachment.media = account_media
 
         # Mock result to return
-        mock_image = ImageFactory.build(id="image_123", title=mock_item.content)
+        mock_image = ImageFactory.build(id="123", title=mock_item.content)
         mock_batch_result = {"images": [mock_image], "scenes": []}
 
         # Mock _process_batch_internal to capture what gets passed
@@ -88,7 +91,7 @@ class TestAttachmentProcessing:
         assert len(media_list) == 1, f"Expected 1 media item, got {len(media_list)}"
         assert media_list[0].id == media.id
         assert media_list[0].mimetype == "image/jpeg"
-        assert media_list[0].stash_id == "stash_attachment_789"
+        assert media_list[0].stash_id == 789
 
         # Verify item and account were passed correctly
         assert item == mock_item
@@ -101,50 +104,60 @@ class TestAttachmentProcessing:
 
     @pytest.mark.asyncio
     async def test_process_attachment_with_bundle(
-        self, respx_stash_processor, mock_item, mock_account
+        self, respx_stash_processor, mock_item, mock_account, entity_store
     ):
         """Test process_creator_attachment collects media from bundle.
 
         User authorized mocking only because of over-testing of deeper methods.
         """
         # Create real Media objects using factory
+        media_id_1 = snowflake_id()
+        media_id_2 = snowflake_id()
+        acct_media_id_1 = snowflake_id()
+        acct_media_id_2 = snowflake_id()
+        bundle_id = snowflake_id()
         media1 = MediaFactory.build(
-            id=20456,
+            id=media_id_1,
             mimetype="image/jpeg",
             is_downloaded=True,
             accountId=mock_account.id,
-            stash_id="stash_bundle_456",
+            stash_id=456,
         )
         media2 = MediaFactory.build(
-            id=20457,
+            id=media_id_2,
             mimetype="video/mp4",
             is_downloaded=True,
             accountId=mock_account.id,
-            stash_id="stash_bundle_457",
+            stash_id=457,
         )
 
         # Create real AccountMedia objects
         account_media1 = AccountMediaFactory.build(
-            id=70123,
+            id=acct_media_id_1,
             accountId=mock_account.id,
             mediaId=media1.id,
         )
-        account_media1.media = media1
-
         account_media2 = AccountMediaFactory.build(
-            id=70124,
+            id=acct_media_id_2,
             accountId=mock_account.id,
             mediaId=media2.id,
         )
-        account_media2.media = media2
 
         # Create real AccountMediaBundle object using factory
         bundle = AccountMediaBundleFactory.build(
-            id=80789,
+            id=bundle_id,
             accountId=mock_account.id,
         )
-        # Set up the relationship (accountMedia is a set)
-        bundle.accountMedia = {account_media1, account_media2}
+        # Set up the relationship (accountMedia is a list field)
+        bundle.accountMedia = [account_media1, account_media2]
+
+        # Populate identity map so property lookups resolve
+        store = entity_store
+        store.cache_instance(media1)
+        store.cache_instance(media2)
+        store.cache_instance(account_media1)
+        store.cache_instance(account_media2)
+        store.cache_instance(bundle)
 
         # Create real Attachment object using factory
         attachment = AttachmentFactory.build(
@@ -153,12 +166,10 @@ class TestAttachmentProcessing:
             contentType=2,  # ContentType.ACCOUNT_MEDIA_BUNDLE
             postId=mock_item.id,
         )
-        # Set up the relationship
-        attachment.bundle = bundle
 
         # Mock results to return
-        mock_image = ImageFactory.build(id="image_456", title=mock_item.content)
-        mock_scene = SceneFactory.build(id="scene_457", title=mock_item.content)
+        mock_image = ImageFactory.build(id="456", title=mock_item.content)
+        mock_scene = SceneFactory.build(id="457", title=mock_item.content)
         mock_batch_result = {"images": [mock_image], "scenes": [mock_scene]}
 
         # Mock _process_batch_internal to capture what gets passed
@@ -203,34 +214,36 @@ class TestAttachmentProcessing:
 
     @pytest.mark.asyncio
     async def test_process_attachment_with_aggregated_post(
-        self, respx_stash_processor, mock_item, mock_account
+        self, respx_stash_processor, mock_item, mock_account, entity_store
     ):
         """Test process_creator_attachment recursively processes aggregated posts.
 
         User authorized mocking only because of over-testing of deeper methods.
         """
         # Create an aggregated post using factory
+        agg_post_id = snowflake_id()
+        agg_media_id = snowflake_id()
+        agg_acct_media_id = snowflake_id()
         agg_post = PostFactory.build(
-            id=30789,
+            id=agg_post_id,
             accountId=mock_account.id,
             content="Aggregated post content",
         )
 
         # Create media for the aggregated post's attachment
         agg_media = MediaFactory.build(
-            id=20999,
+            id=agg_media_id,
             mimetype="image/jpeg",
             is_downloaded=True,
             accountId=mock_account.id,
-            stash_id="stash_agg_999",
+            stash_id=999,
         )
 
         agg_account_media = AccountMediaFactory.build(
-            id=71000,
+            id=agg_acct_media_id,
             accountId=mock_account.id,
             mediaId=agg_media.id,
         )
-        agg_account_media.media = agg_media
 
         # Create an attachment that belongs to the aggregated post
         agg_attachment = AttachmentFactory.build(
@@ -239,7 +252,6 @@ class TestAttachmentProcessing:
             contentType=1,  # ContentType.ACCOUNT_MEDIA
             postId=agg_post.id,
         )
-        agg_attachment.media = agg_account_media
 
         # Set up post's attachments list
         agg_post.attachments = [agg_attachment]
@@ -251,11 +263,15 @@ class TestAttachmentProcessing:
             contentType=ContentType.AGGREGATED_POSTS,
             postId=mock_item.id,
         )
-        # Set up the relationship (is_aggregated_post property auto-computed from contentType)
-        attachment.aggregated_post = agg_post
+
+        # Populate identity map so property lookups resolve
+        store = entity_store
+        store.cache_instance(agg_media)
+        store.cache_instance(agg_account_media)
+        store.cache_instance(agg_post)
 
         # Mock result to return
-        mock_image = ImageFactory.build(id="image_999", title=agg_post.content)
+        mock_image = ImageFactory.build(id="999", title=agg_post.content)
         mock_batch_result = {"images": [mock_image], "scenes": []}
 
         # Mock _process_batch_internal to capture what gets passed

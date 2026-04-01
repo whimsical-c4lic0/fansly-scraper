@@ -29,6 +29,7 @@ from .api import (
 )
 from .core import (
     FanslyConfigFactory,
+    complete_args,
     config_parser,
     mock_config_file,
     temp_config_dir,
@@ -39,6 +40,7 @@ from .database import (
     config,
     config_with_database,
     conversation_data,
+    entity_store,
     factory_async_session,
     factory_session,
     json_conversation_data,
@@ -67,6 +69,8 @@ from .download import (
     download_state,
     mock_download_dir,
     mock_metadata_dir,
+    mock_process_media_bundles,
+    mock_process_media_download,
     mock_temp_dir,
     test_downloads_dir,
 )
@@ -123,11 +127,18 @@ from .stash import (
     account_mixin,
     batch_mixin,
     content_mixin,
+    create_find_galleries_result,
+    create_find_gallery_result,
+    create_find_images_result,
     create_find_performers_result,
     create_find_scenes_result,
     create_find_studios_result,
     create_find_tags_result,
+    create_gallery_create_result,
+    create_gallery_dict,
+    create_gallery_update_result,
     create_graphql_response,
+    create_image_dict,
     create_performer_dict,
     create_scene_dict,
     create_studio_dict,
@@ -167,6 +178,7 @@ from .utils import (
     cleanup_mock_patches,
     cleanup_rich_progress_state,
     cleanup_unawaited_coroutines,
+    snowflake_id,
 )
 
 
@@ -178,6 +190,7 @@ mod_core_factories = [
 ]
 
 mod_core_fixtures = [
+    "complete_args",
     "config_parser",
     "mock_config_file",
     "temp_config_dir",
@@ -193,6 +206,8 @@ mod_download_fixtures = [
     "download_state",
     "mock_download_dir",
     "mock_metadata_dir",
+    "mock_process_media_bundles",
+    "mock_process_media_download",
     "mock_temp_dir",
     "test_downloads_dir",
 ]
@@ -264,11 +279,18 @@ mod_stash_type_factories = [
 ]
 
 mod_stash_fixtures = [
+    "create_find_galleries_result",
+    "create_find_gallery_result",
+    "create_find_images_result",
     "create_find_performers_result",
     "create_find_scenes_result",
     "create_find_studios_result",
     "create_find_tags_result",
+    "create_gallery_create_result",
+    "create_gallery_dict",
+    "create_gallery_update_result",
     "create_graphql_response",
+    "create_image_dict",
     "create_performer_dict",
     "create_scene_dict",
     "create_studio_dict",
@@ -309,6 +331,7 @@ mod_database_fixtures = [
     "test_async_session",
     "config",
     "config_with_database",
+    "entity_store",
     "test_sync_engine",
     "session_factory",
     "test_database_sync",

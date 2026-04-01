@@ -16,7 +16,7 @@ from config.modes import DownloadMode
 
 
 if TYPE_CHECKING:
-    from metadata import Base, Database
+    from metadata import Database
 
 
 @dataclass
@@ -33,7 +33,6 @@ class FanslyConfig:
     # The getters will ensure they're not None when accessed
     _api: FanslyApi | None = None
     _database: Database | None = None
-    _base: Base | None = None
     _stash: Any = None  # StashContext | None
 
     # Command line flags
@@ -61,7 +60,9 @@ class FanslyConfig:
     updated_to: str | None = None
 
     # Objects
-    _parser = ConfigParser(interpolation=None)
+    _parser: ConfigParser = field(
+        default_factory=lambda: ConfigParser(interpolation=None)
+    )
     _background_tasks: list[asyncio.Task] = field(default_factory=list)
 
     # endregion File-Independent
@@ -102,10 +103,6 @@ class FanslyConfig:
     # This helps for semi-automated runs (interactive=False) when coming back
     # to the computer and wanting to see what happened in the console window.
     prompt_on_exit: bool = True
-    # Note: metadata_db_file is deprecated in favor of PostgreSQL configuration
-    # Only kept for backwards compatibility with SQLite-based configs
-    metadata_db_file: Path | None = None
-
     # Number of retries to get a timeline
     timeline_retries: int = 1
     # Anti-rate-limiting delay in seconds
@@ -185,10 +182,13 @@ class FanslyConfig:
                 and self.check_key
                 and (self.token_is_valid() or has_login_credentials)
             ):
-                # Initialize rate limiter
+                # Initialize rate limiter with visual display
                 from api.rate_limiter import RateLimiter
+                from api.rate_limiter_display import RateLimiterDisplay
 
                 rate_limiter = RateLimiter(self)
+                self._rate_limiter_display = RateLimiterDisplay(rate_limiter)
+                self._rate_limiter_display.start()
 
                 # Use empty string if token is invalid (for login flow)
                 # Otherwise use the valid unscrambled token
@@ -202,6 +202,7 @@ class FanslyConfig:
                     device_id_timestamp=self.cached_device_id_timestamp,
                     on_device_updated=self._save_config,
                     rate_limiter=rate_limiter,
+                    config=self,
                 )
 
                 # If we have login credentials but no valid token, perform login
@@ -327,16 +328,9 @@ class FanslyConfig:
         self._parser.set("Options", "separate_previews", str(self.separate_previews))
         self._parser.set("Options", "separate_timeline", str(self.separate_timeline))
         self._parser.set("Options", "separate_metadata", str(self.separate_metadata))
-        # Don't save metadata_db_file - it's deprecated in favor of PostgreSQL
-        # Only preserve it if it already exists in the config file
+        # Clean up deprecated metadata_db_file if it exists in the config file
         if self._parser.has_option("Options", "metadata_db_file"):
-            if self.metadata_db_file is not None:
-                self._parser.set(
-                    "Options", "metadata_db_file", str(self.metadata_db_file)
-                )
-            else:
-                # Remove the option if it's None to clean up config
-                self._parser.remove_option("Options", "metadata_db_file")
+            self._parser.remove_option("Options", "metadata_db_file")
         self._parser.set(
             "Options", "use_duplicate_threshold", str(self.use_duplicate_threshold)
         )
@@ -389,10 +383,10 @@ class FanslyConfig:
             conn = self._stash.conn
             if not self._parser.has_section("StashContext"):
                 self._parser.add_section("StashContext")
-            self._parser.set("StashContext", "scheme", conn["scheme"])
-            self._parser.set("StashContext", "host", conn["host"])
-            self._parser.set("StashContext", "port", str(conn["port"]))
-            self._parser.set("StashContext", "apikey", conn["apikey"])
+            self._parser.set("StashContext", "scheme", conn["Scheme"])
+            self._parser.set("StashContext", "host", conn["Host"])
+            self._parser.set("StashContext", "port", str(conn["Port"]))
+            self._parser.set("StashContext", "apikey", conn.get("ApiKey", ""))
         # Cache
         if self._api is not None:
             self._parser.set("Cache", "device_id", str(self._api.device_id))
