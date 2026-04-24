@@ -291,9 +291,9 @@ async def respx_stash_processor(config, test_database_sync, test_state, stash_co
     config._database = test_database_sync
     config._stash = stash_context
 
-    # Set up respx mock with capability detection for v0.11 initialization
+    # Set up respx mock with capability detection for StashClient initialization
     with respx.mock:
-        # Serve capability detection response for v0.11 initialization
+        # Serve capability detection response for StashClient initialization
         graphql_route = respx.post("http://localhost:9999/graphql").mock(
             side_effect=[_mock_capability_response()]
         )
@@ -847,8 +847,8 @@ async def message_media_generator(factory_session, real_stash_processor):
                         fansly_media_id = extract_media_id(image_path)
                         used_fallback = fansly_media_id is None
                         if used_fallback:
-                            # Fallback to using Stash ID if filename doesn't contain _id_ pattern
-                            fansly_media_id = int(stash_image_id)
+                            # Fallback: generate a valid Snowflake ID (Stash IDs are too small)
+                            fansly_media_id = snowflake_id()
 
                         # Build Media object (not committed - test will set accountId and commit)
                         # 33% chance to include stash_id (tests both code paths)
@@ -895,8 +895,8 @@ async def message_media_generator(factory_session, real_stash_processor):
                         fansly_media_id = extract_media_id(image_path)
                         used_fallback = fansly_media_id is None
                         if used_fallback:
-                            # Fallback to using Stash ID if filename doesn't contain _id_ pattern
-                            fansly_media_id = int(stash_image_id)
+                            # Fallback: generate a valid Snowflake ID (Stash IDs are too small)
+                            fansly_media_id = snowflake_id()
 
                         # Build Media object (not committed)
                         # 33% chance to include stash_id (tests both code paths)
@@ -926,7 +926,7 @@ async def message_media_generator(factory_session, real_stash_processor):
                 scene_result = await client.find_scenes(
                     filter_={"per_page": 1, "page": page_num}
                 )
-                if scene_result.count > 0:
+                if scene_result.count > 0 and scene_result.scenes:
                     real_scene = scene_result.scenes[0]
                     # Handle both dict (GraphQL) and object responses (Pydantic transition)
                     scene_id = _get_id(real_scene)
@@ -948,8 +948,8 @@ async def message_media_generator(factory_session, real_stash_processor):
                     )
                     used_fallback = fansly_media_id is None
                     if used_fallback:
-                        # Fallback to using Stash ID if filename doesn't contain _id_ pattern
-                        fansly_media_id = int(scene_id)
+                        # Fallback: generate a valid Snowflake ID (Stash IDs are too small)
+                        fansly_media_id = snowflake_id()
 
                     # Build Media object (not committed)
                     # 33% chance to include stash_id (tests both code paths)

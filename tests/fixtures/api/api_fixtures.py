@@ -29,11 +29,13 @@ Usage:
         assert result["id"] == "123"
 """
 
+from collections.abc import Generator
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import pytest
+import respx
 
 
 @pytest.fixture
@@ -240,11 +242,74 @@ def mock_fansly_timeline_response():
     }
 
 
+@pytest.fixture
+def respx_fansly_api(
+    mock_config,
+    fansly_api,
+) -> Generator[None, None, None]:
+    """Activate respx mocking with CORS preflight handling for Fansly API tests.
+
+    Wires fansly_api into mock_config, then activates respx.mock with a
+    blanket OPTIONS route (FanslyApi.cors_options_request sends an OPTIONS
+    preflight before every GET).
+
+    Tests add their own respx.get/post routes for specific endpoints.
+
+    NOTE: Uses ``respx.mock(using="httpcore")`` to intercept at the lowest
+    transport level, which works with httpx_retries wrapped transports.
+
+    Example::
+
+        @pytest.mark.asyncio
+        async def test_collections(respx_fansly_api, mock_config):
+            respx.get("https://apiv3.fansly.com/api/v1/account/media/orders/").mock(
+                side_effect=[httpx.Response(200, json={"success": True, "response": {...}})]
+            )
+            await download_collections(mock_config, state)
+    """
+    mock_config._api = fansly_api
+    with respx.mock:
+        respx.route(method="OPTIONS").mock(return_value=httpx.Response(200))
+        yield
+
+
+def dump_fansly_calls(calls, label: str = "Fansly API calls") -> None:
+    """Print request/response details for each Fansly API call.
+
+    Works with respx route.calls or respx.calls. Use in try/finally blocks
+    when debugging test failures to see exactly what HTTP calls were made:
+
+        route = respx.get(...).mock(side_effect=[...])
+        try:
+            await function_under_test()
+        finally:
+            dump_fansly_calls(route.calls)
+
+    Args:
+        calls: respx route.calls or respx.calls list
+        label: Header label for the output
+    """
+    print(f"\n{'=' * 70}")
+    print(f"  {label} ({len(calls)} total)")
+    print(f"{'=' * 70}")
+    for i, call in enumerate(calls):
+        req = call.request
+        resp = call.response
+        status = resp.status_code if resp else "NO RESPONSE"
+        print(f"\n  [{i}] {req.method} {req.url}")
+        if req.content:
+            print(f"      body: {req.content[:200]}")
+        print(f"      → {status}")
+    print(f"\n{'=' * 70}\n")
+
+
 __all__ = [
     "create_mock_json_response",
+    "dump_fansly_calls",
     "fansly_api",
     "fansly_api_factory",
     "fansly_api_with_respx",
     "mock_fansly_account_response",
     "mock_fansly_timeline_response",
+    "respx_fansly_api",
 ]

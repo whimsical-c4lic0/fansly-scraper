@@ -21,11 +21,13 @@ from typing import Any
 # Import from nested modules
 from .api import (
     create_mock_json_response,
+    dump_fansly_calls,
     fansly_api,
     fansly_api_factory,
     fansly_api_with_respx,
     mock_fansly_account_response,
     mock_fansly_timeline_response,
+    respx_fansly_api,
 )
 from .core import (
     FanslyConfigFactory,
@@ -84,11 +86,12 @@ from .metadata import (
     HashtagFactory,
     MediaFactory,
     MediaLocationFactory,
+    MediaStoryFactory,
     MediaStoryStateFactory,
     MessageFactory,
     MetadataGroupFactory,
+    MonitorStateFactory,
     PostFactory,
-    StoryFactory,
     StubTrackerFactory,
     TimelineStatsFactory,
     WallFactory,
@@ -214,11 +217,13 @@ mod_download_fixtures = [
 
 mod_api_fixtures = [
     "create_mock_json_response",
+    "dump_fansly_calls",
     "fansly_api",
     "fansly_api_factory",
     "fansly_api_with_respx",
     "mock_fansly_account_response",
     "mock_fansly_timeline_response",
+    "respx_fansly_api",
 ]
 
 mod_metadata_factories = [
@@ -230,11 +235,12 @@ mod_metadata_factories = [
     "HashtagFactory",
     "MediaFactory",
     "MediaLocationFactory",
+    "MediaStoryFactory",
     "MediaStoryStateFactory",
     "MessageFactory",
     "MetadataGroupFactory",
+    "MonitorStateFactory",
     "PostFactory",
-    "StoryFactory",
     "StubTrackerFactory",
     "TimelineStatsFactory",
     "WallFactory",

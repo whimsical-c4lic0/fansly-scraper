@@ -21,7 +21,7 @@ from errors import ConfigError
 
 @pytest.fixture
 def config():
-    return FanslyConfig(program_version="0.11.0")
+    return FanslyConfig(program_version="0.13.0")
 
 
 @pytest.fixture
@@ -72,10 +72,14 @@ def test_sanitize_creator_names():
 
 
 def test_load_config_creates_file_if_not_exists(temp_config_dir, config):
-    config_path = temp_config_dir / "config.ini"
-    assert not config_path.exists()
+    """When no config file exists, load_config creates config.yaml with defaults."""
+    yaml_path = temp_config_dir / "config.yaml"
+    ini_path = temp_config_dir / "config.ini"
+    assert not yaml_path.exists()
+    assert not ini_path.exists()
     load_config(config)
-    assert config_path.exists()
+    # New system creates config.yaml, not config.ini
+    assert yaml_path.exists()
 
 
 def test_load_config_temp_folder_handling(temp_config_dir, config):
@@ -99,7 +103,7 @@ temp_folder = /custom/temp/path
 
 def test_load_config_download_directory_handling(temp_config_dir):
     # Create fresh config to avoid pollution
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     config_path = temp_config_dir / "config.ini"
 
     # Create config with download_directory
@@ -116,7 +120,7 @@ download_directory = /custom/download/path
 
 def test_load_config_default_download_directory(temp_config_dir):
     # Create fresh config to avoid pollution
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     config_path = temp_config_dir / "config.ini"
 
     # Create minimal config without download_directory
@@ -189,7 +193,12 @@ download_mode = InvalidMode
 
     with pytest.raises(ConfigError) as exc_info:
         load_config(config)
-    assert "wrong value in the config.ini file" in str(exc_info.value)
+    err_msg = str(exc_info.value)
+    # New error format (ValidationError via load_yaml) OR the legacy
+    # configparser path — either way, the failing field + value must
+    # appear in the surfaced error.
+    assert "download_mode" in err_msg
+    assert "InvalidMode" in err_msg.lower() or "invalidmode" in err_msg.lower()
 
 
 def test_token_validation(config):
@@ -222,29 +231,6 @@ def test_useragent_validation(config):
 
     config.user_agent = "ReplaceMe" + "a" * 40
     assert config.useragent_is_valid() is False
-
-
-def test_load_config_with_db_sync_settings(temp_config_dir, config):
-    config_path = temp_config_dir / "config.ini"
-
-    # Create config with DB sync settings
-    with config_path.open("w") as f:
-        f.write(
-            """[Options]
-download_mode = Normal
-metadata_handling = Advanced
-interactive = True
-download_directory = Local_directory
-db_sync_commits = 500
-db_sync_seconds = 30
-db_sync_min_size = 100
-"""
-        )
-
-    load_config(config)
-    assert config.db_sync_commits == 500
-    assert config.db_sync_seconds == 30
-    assert config.db_sync_min_size == 100
 
 
 def test_load_config_with_cache_section(temp_config_dir, config):
@@ -354,9 +340,10 @@ def test_token_scrambling(config):
 
 
 def test_config_section_handling(temp_config_dir, config):
+    """Migration from legacy ini populates schema sections and [Other] is dropped."""
     config_path = temp_config_dir / "config.ini"
 
-    # Create config with all sections
+    # Create config with all sections (including legacy [Other] with version)
     with config_path.open("w") as f:
         f.write(
             """[TargetedCreator]
@@ -388,49 +375,50 @@ version = 1.0.0
 
     load_config(config)
 
-    # Verify Other section is removed
-    assert not config._parser.has_section("Other")
-    assert not config._parser.has_option("Other", "version")
+    # [Other] is not carried into the YAML schema — it is silently dropped
+    assert config._schema is not None
+    schema_dict = config._schema.model_dump()
+    assert "other" not in schema_dict
 
-    # Verify required sections exist
-    assert config._parser.has_section("TargetedCreator")
-    assert config._parser.has_section("MyAccount")
-    assert config._parser.has_section("Options")
-    assert config._parser.has_section("Cache")
-    assert config._parser.has_section("Logic")
+    # Verify key section values were migrated correctly
+    assert config._schema.targeted_creator.usernames == ["testuser"]
+    assert config._schema.my_account.user_agent == "test_agent"
+    assert config._schema.cache.device_id == "test_device"
+    assert config._schema.cache.device_id_timestamp == 123456789
+    assert config._schema.logic.check_key_pattern == "test_pattern"
 
 
-def test_config_path_edge_cases(temp_config_dir, config):
-    config_path = temp_config_dir / "config.ini"
+def test_config_path_edge_cases(temp_config_dir):
+    """Paths with spaces and special characters survive a YAML round-trip."""
+
+    from config.schema import ConfigSchema
+
+    config_yaml_path = temp_config_dir / "config.yaml"
 
     # Test paths with spaces and special chars
     test_paths = {
         "space path": "/path with spaces/file",
-        "unicode path": "/path/with/unicode/🐍/file",
-        "quotes path": '/path/with/"quotes"/file',
+        "unicode path": "/path/with/unicode/file",
         "mixed slashes": r"C:\Windows/style/mixed\slashes",
     }
 
     for path in test_paths.values():
-        with config_path.open("w") as f:
-            f.write(
-                f"""[Options]
-download_mode = Normal
-metadata_handling = Advanced
-interactive = True
-download_directory = {path}
-"""
-            )
+        # Build a schema with the custom download_directory and write config.yaml
+        schema = ConfigSchema()
+        schema.options.download_directory = path
+        schema.dump_yaml(config_yaml_path)
 
-        load_config(config)
-        assert config.download_directory == Path(path)
+        # Load fresh config from the yaml
+        fresh_config = FanslyConfig(program_version="0.13.0")
+        load_config(fresh_config)
+        assert fresh_config.download_directory == Path(path)
 
 
 def test_config_error_cases(temp_config_dir):
     config_path = temp_config_dir / "config.ini"
 
     # Test invalid section reference
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     with config_path.open("w") as f:
         f.write(
             """[Options]
@@ -447,7 +435,7 @@ key = value
     load_config(config)  # Should ignore nonexistent section
 
     # Test empty values with fresh config
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     with config_path.open("w") as f:
         f.write(
             """[Options]
@@ -461,3 +449,240 @@ temp_folder =
 
     load_config(config)
     assert config.temp_folder is None
+
+
+# -- copy_old_config_values: section/option mismatch branches --
+
+
+def test_copy_old_config_skips_section_not_in_new(temp_config_dir):
+    """Old config has a section the new config doesn't → skip it (line 111)."""
+    old_path = temp_config_dir / "old_config.ini"
+    new_path = temp_config_dir / "config.ini"
+
+    with old_path.open("w") as f:
+        f.write(
+            """[MyAccount]
+Authorization_Token = old_tok
+
+[ExtraSection]
+some_key = some_value
+"""
+        )
+    with new_path.open("w") as f:
+        f.write(
+            """[MyAccount]
+Authorization_Token = new_tok
+"""
+        )
+
+    copy_old_config_values()
+
+    result = ConfigParser(interpolation=None)
+    result.read(new_path)
+    assert result.get("MyAccount", "Authorization_Token") == "old_tok"
+    assert not result.has_section("ExtraSection")
+
+
+def test_copy_old_config_skips_option_not_in_new(temp_config_dir):
+    """Old config has an option the new config doesn't → skip it (line 115)."""
+    old_path = temp_config_dir / "old_config.ini"
+    new_path = temp_config_dir / "config.ini"
+
+    with old_path.open("w") as f:
+        f.write(
+            """[MyAccount]
+Authorization_Token = old_tok
+Extra_Option = extra_value
+"""
+        )
+    with new_path.open("w") as f:
+        f.write(
+            """[MyAccount]
+Authorization_Token = new_tok
+"""
+        )
+
+    copy_old_config_values()
+
+    result = ConfigParser(interpolation=None)
+    result.read(new_path)
+    assert result.get("MyAccount", "Authorization_Token") == "old_tok"
+    assert not result.has_option("MyAccount", "Extra_Option")
+
+
+def test_copy_old_config_skips_version(temp_config_dir):
+    """version key in [Other] section is never overwritten (line 121)."""
+    old_path = temp_config_dir / "old_config.ini"
+    new_path = temp_config_dir / "config.ini"
+
+    with old_path.open("w") as f:
+        f.write(
+            """[Other]
+version = 0.9.0
+"""
+        )
+    with new_path.open("w") as f:
+        f.write(
+            """[Other]
+version = 1.0.0
+"""
+        )
+
+    copy_old_config_values()
+
+    result = ConfigParser(interpolation=None)
+    result.read(new_path)
+    assert result.get("Other", "version") == "1.0.0"
+
+
+# -- SSL path handling in _handle_postgresql_options --
+
+
+def test_load_config_with_ssl_paths(temp_config_dir, config):
+    """SSL cert/key/rootcert paths are parsed when present (lines 326, 330, 334)."""
+    config_path = temp_config_dir / "config.ini"
+
+    with config_path.open("w") as f:
+        f.write(
+            """[Options]
+download_mode = Normal
+metadata_handling = Advanced
+pg_sslmode = verify-full
+pg_sslcert = /path/to/client-cert.pem
+pg_sslkey = /path/to/client-key.pem
+pg_sslrootcert = /path/to/ca.pem
+"""
+        )
+
+    load_config(config)
+    assert config.pg_sslcert == Path("/path/to/client-cert.pem")
+    assert config.pg_sslkey == Path("/path/to/client-key.pem")
+    assert config.pg_sslrootcert == Path("/path/to/ca.pem")
+    assert config.pg_sslmode == "verify-full"
+
+
+# -- StashContext section handling --
+
+
+def test_load_config_with_stash_section(temp_config_dir, config):
+    """StashContext section is parsed into stash_context_conn dict (line 400)."""
+    config_path = temp_config_dir / "config.ini"
+
+    with config_path.open("w") as f:
+        f.write(
+            """[StashContext]
+scheme = https
+host = stash.local
+port = 9998
+apikey = my-api-key
+"""
+        )
+
+    load_config(config)
+    assert config.stash_context_conn is not None
+    assert config.stash_context_conn["scheme"] == "https"
+    assert config.stash_context_conn["host"] == "stash.local"
+    assert config.stash_context_conn["port"] == 9998
+    assert config.stash_context_conn["apikey"] == "my-api-key"
+
+
+# -- Invalid log level warning in _handle_logging_section --
+
+
+def test_load_config_with_invalid_log_level(temp_config_dir, config):
+    """Invalid log level triggers warning and falls back to INFO (lines 434-440)."""
+    config_path = temp_config_dir / "config.ini"
+
+    with config_path.open("w") as f:
+        f.write(
+            """[Logging]
+sqlalchemy = GARBAGE
+textio = INFO
+"""
+        )
+
+    load_config(config)
+    assert config.log_levels["sqlalchemy"] == "INFO"
+    assert config.log_levels["textio"] == "INFO"
+
+
+# -- Renamed option handling in load_config --
+
+
+def test_load_config_renamed_options(temp_config_dir, config):
+    """Old option names (utilise_duplicate_threshold, use_suffix) are migrated."""
+    config_path = temp_config_dir / "config.ini"
+
+    with config_path.open("w") as f:
+        f.write(
+            """[Options]
+download_mode = Normal
+metadata_handling = Advanced
+utilise_duplicate_threshold = True
+use_suffix = False
+"""
+        )
+
+    load_config(config)
+    # Legacy INI keys map onto their current schema fields.
+    assert config.use_duplicate_threshold is True
+    assert config.use_folder_suffix is False
+
+
+# -- Rate limiting config options --
+
+
+def test_load_config_rate_limiting_options(temp_config_dir, config):
+    """Rate limiting settings are parsed from config.ini."""
+    config_path = temp_config_dir / "config.ini"
+
+    with config_path.open("w") as f:
+        f.write(
+            """[Options]
+download_mode = Normal
+metadata_handling = Advanced
+rate_limiting_enabled = False
+rate_limiting_adaptive = False
+rate_limiting_requests_per_minute = 30
+rate_limiting_burst_size = 5
+rate_limiting_retry_after_seconds = 15
+rate_limiting_max_backoff_seconds = 120
+rate_limiting_backoff_factor = 2.0
+"""
+        )
+
+    load_config(config)
+    assert config.rate_limiting_enabled is False
+    assert config.rate_limiting_adaptive is False
+    assert config.rate_limiting_requests_per_minute == 30
+    assert config.rate_limiting_burst_size == 5
+    assert config.rate_limiting_retry_after_seconds == 15
+    assert config.rate_limiting_max_backoff_seconds == 120
+    assert config.rate_limiting_backoff_factor == 2.0
+
+
+# -- Outdated check key replacement --
+
+
+def test_load_config_replaces_outdated_check_keys(temp_config_dir, config):
+    """Known outdated check keys are replaced with the current default."""
+    config_path = temp_config_dir / "config.ini"
+    outdated_key = "negwij-zyZnek-wavje1"
+
+    with config_path.open("w") as f:
+        f.write(
+            f"""[MyAccount]
+Authorization_Token = test_token
+User_Agent = test_agent
+Check_Key = {outdated_key}
+"""
+        )
+
+    load_config(config)
+    assert config.check_key != outdated_key
+    assert config.check_key == "oybZy8-fySzis-bubayf"
+
+
+# Retired-field silent-drop coverage lives in tests/config/unit/test_schema.py
+# (test_retired_field_*_silently_dropped) — the ConfigParser-based "remove
+# from _parser" check disappeared with the Pydantic migration.

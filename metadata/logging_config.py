@@ -1,254 +1,153 @@
-"""Database logging configuration.
+"""Database logging configuration for asyncpg.
 
 This module provides:
-1. SQLAlchemy logging setup
-2. Database operation logging
-3. Performance monitoring
-4. Error tracking
+1. Query performance monitoring via asyncpg's add_query_logger
+2. Error tracking and slow query detection
+3. Operation statistics
 
-Note: All logger configuration is now centralized in config/logging.py.
-This module only provides database monitoring and statistics.
+All logging is handled by the centralized db_logger from config/.
+This module provides the callbacks and statistics counters.
 """
 
-import inspect
-import time
-from pathlib import Path
-from typing import Any
+from __future__ import annotations
 
-from sqlalchemy import event
-from sqlalchemy.engine import Engine
-from sqlalchemy.orm import Session, SessionTransaction
+import inspect
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from config import db_logger
 
 
-def get_transaction_nesting_level(transaction: Any) -> int:
-    level = 0
-    current = transaction
-    while hasattr(current, "parent") and current.parent is not None:
-        level += 1
-        current = current.parent
-    return level
+if TYPE_CHECKING:
+    import asyncpg
 
 
-def get_caller_info() -> str:
-    """Get relevant caller information from the stack.
+_EXCLUDED_PATH_PARTS = frozenset(
+    {
+        ".venv",
+        "venv",
+        "venv_test",
+        "virtualenv",
+        "site-packages",
+        ".tox",
+        "__pypackages__",
+        "node_modules",
+        ".eggs",
+    }
+)
 
-    Skips internal SQLAlchemy calls and common wrapper functions.
-    Returns a string with the most relevant caller info.
-    """
-    repo_root = Path.cwd()  # assume repo root is the current working directory
-    st = inspect.stack()
-    # List of functions we want to skip
-    skip_funcs = {
+_SKIP_FUNCS = frozenset(
+    {
         "async_wrapper",
         "sync_wrapper",
         "_run_sync",
         "__call__",
-        "_execute_context",
-        "greenlet_spawn",
-        "do_orm_execute",
-        "session_transaction",
-        "_transaction",
-        "begin_nested",
-        "begin",
-        "_begin",
         "__aenter__",
         "__enter__",
         "__aexit__",
         "__exit__",
         "close",
-        "commit",
-        "rollback",
-        "prepare",
-        "get_transaction_info",
-        "after_transaction_create",
-        "after_transaction_end",
-        "after_rollback",
-        "after_begin",
+        "query_logger_callback",
+        "_execute",
+        "_do_execute",
+        "execute",
+        "fetch",
+        "fetchrow",
+        "fetchval",
+        "executemany",
     }
-    for frame in st[1:]:
-        # Skip frames from external libraries:
-        filename = frame.filename
-        lower_fname = filename.lower()
-        if (
-            "site-packages" in lower_fname
-            or "virtualenv" in lower_fname
-            or "venv" in lower_fname
-        ):
+)
+
+
+def get_caller_info() -> str:
+    """Return the first stack frame that is application code.
+
+    Application code = inside the repo root AND not inside a vendored
+    directory (``.venv``, ``venv_test``, ``site-packages`` etc.). stdlib
+    lives outside the repo so ``relative_to`` raises ValueError for
+    those frames; vendored code lives inside the repo so we additionally
+    exclude frames whose relative path includes a known virtual-env or
+    package-dir segment. Without both checks, asyncio's event-loop
+    dispatcher (events.py:94) gets attributed to every async query.
+    """
+    repo_root = Path.cwd().resolve()
+    for frame in inspect.stack()[1:]:
+        if frame.function in _SKIP_FUNCS:
             continue
-        if frame.function in skip_funcs:
-            continue
-        # Compute a relative path if possible.
-        filepath = Path(filename)
         try:
-            relative_path = str(filepath.relative_to(repo_root))
+            relative_path = Path(frame.filename).resolve().relative_to(repo_root)
         except ValueError:
-            # Otherwise, return only the basename.
-            relative_path = filepath.name
+            continue  # stdlib, system packages, anywhere outside the repo
+        if _EXCLUDED_PATH_PARTS.intersection(relative_path.parts):
+            continue  # vendored code inside the repo (.venv, site-packages)
         return f"{relative_path}:{frame.lineno} in {frame.function}"
-    # Fallback: list the deepest three frames in the stack.
-    deepest = st[-5:]
-    frames_info = []
-    for frame in deepest:
-        filepath = Path(frame.filename)
-        try:
-            relative_path = str(filepath.relative_to(repo_root))
-        except Exception:
-            relative_path = filepath.name
-        frames_info.append(f"{relative_path}:{frame.lineno} in {frame.function}")
-    return "\n".join(frames_info)
-
-
-def get_parent_chain(transaction: object) -> str:
-    """
-    Walk the transaction's parent chain and return a comma-separated string of parent IDs.
-    If there are no parents, returns 'None'.
-    """
-    chain = []
-    current = transaction
-    # Look for an attribute named "parent" that may hold the parent transaction.
-    while hasattr(current, "parent") and current.parent is not None:
-        # Append the parent's ID (formatted as hexadecimal) to the chain
-        chain.append(hex(id(current.parent)))
-        current = current.parent
-    return ", ".join(chain) if chain else "None"
+    return "<unknown caller>"
 
 
 class DatabaseLogger:
-    """Configure and manage database logging.
+    """asyncpg query monitoring.
 
     Features:
-    1. SQLAlchemy query logging
-    2. Performance monitoring
-    3. Error tracking
-    4. Operation statistics
-
-    Note: All logging is handled by the centralized db_logger.
-    This class only provides monitoring and statistics.
+    1. Query counting and timing via add_query_logger
+    2. Slow query detection (>100ms)
+    3. Error tracking (queries that raised exceptions)
     """
 
     def __init__(self) -> None:
-        """Initialize database logger."""
-        self._stats = {
+        self._stats: dict[str, Any] = {
             "queries": 0,
             "errors": 0,
             "slow_queries": 0,
             "total_time": 0.0,
         }
 
-    def setup_engine_logging(self, engine: Engine | Any) -> None:
-        """Set up logging for SQLAlchemy engine.
+    def setup_connection_logging(self, conn: asyncpg.Connection) -> None:
+        """Register a query logger on an asyncpg connection.
 
-        Args:
-            engine: SQLAlchemy Engine instance (sync or async)
+        Called from ``PostgresEntityStore._init_pg_connection`` for every
+        new connection created by the pool.
+
+        Note: we intentionally do NOT register a Postgres log listener
+        via ``add_log_listener``. asyncpg's ``_on_release`` emits an
+        ``InterfaceWarning`` every first release of a pooled connection
+        that has an active log listener (connection.py:1779), because
+        log listeners are expected to be per-acquire state. We have no
+        stored procedures that emit ``RAISE NOTICE``, so the DEBUG-level
+        Postgres server message capture was low-value relative to the
+        warning noise. ``add_query_logger`` is the supported persistent
+        hook and does not trigger the warning.
         """
-        # For async engines, use the underlying sync engine
-        if hasattr(engine, "sync_engine"):
-            engine = engine.sync_engine
+        conn.add_query_logger(self.query_logger_callback)
 
-        @event.listens_for(engine, "before_cursor_execute")
-        def before_cursor_execute(
-            conn: Any,
-            _cursor: Any,
-            _statement: str,
-            _parameters: tuple[Any, ...],
-            _context: Any,
-            _executemany: bool,
-        ) -> None:
-            conn.info.setdefault("query_start_time", []).append(time.time())
-            self._stats["queries"] += 1
+    def query_logger_callback(self, record: Any) -> None:
+        """asyncpg query logger callback.
 
-        @event.listens_for(engine, "after_cursor_execute")
-        def after_cursor_execute(
-            conn: Any,
-            _cursor: Any,
-            statement: str,
-            _parameters: tuple[Any, ...],
-            _context: Any,
-            _executemany: bool,
-        ) -> None:
-            total = time.time() - conn.info["query_start_time"].pop()
-            self._stats["total_time"] += total
+        ``record`` is a ``LoggedQuery`` with: query, args, timeout,
+        elapsed, exception, conn_addr, conn_params.
+        """
+        self._stats["queries"] += 1
+        self._stats["total_time"] += record.elapsed
 
-            # Log slow queries (>100ms)
-            if total > 0.1:
-                self._stats["slow_queries"] += 1
-                db_logger.warning(f"Slow query ({total:.2f}s): {statement[:100]}...")
-
-        @event.listens_for(engine, "handle_error")
-        def handle_error(context: Any) -> None:
+        if record.exception is not None:
             self._stats["errors"] += 1
-            error = context.original_exception
-            db_logger.error(f"Database error: {error}")
-
-    def setup_session_logging(self, session: Session | Any) -> None:
-        """Set up logging for SQLAlchemy session.
-
-        Args:
-            session: SQLAlchemy Session instance (sync or async)
-        """
-        # For async sessions, use the underlying sync session
-        if hasattr(session, "sync_session"):
-            session = session.sync_session
-
-        @event.listens_for(session, "after_transaction_create")
-        def after_transaction_create(_session: Session, transaction: Any) -> None:
-            level = get_transaction_nesting_level(transaction)
-            caller = get_caller_info()
-            parent_chain = get_parent_chain(transaction)
-            db_logger.debug(
-                f"Transaction started: id={hex(id(transaction))}, level={level}, parent_chain=[{parent_chain}], "
-                f"caller={caller}, _current_fn={transaction._current_fn if hasattr(transaction, '_current_fn') else 'N/A'}"
+            # .opt(exception=...) lets loguru format the full traceback from
+            # the exception's __traceback__ instead of bare str(exception).
+            # Include a query prefix so the log entry identifies which
+            # statement failed (useful when many concurrent queries run).
+            db_logger.opt(exception=record.exception).error(
+                f"Database error on query: {record.query[:200]}"
             )
 
-        @event.listens_for(session, "after_transaction_end")
-        def after_transaction_end(_session: Session, transaction: Any) -> None:
-            # Get transaction info
-            is_active = transaction.is_active
-            level = get_transaction_nesting_level(transaction)
-            parent_chain = get_parent_chain(transaction)
+        if record.elapsed > 0.1:
+            self._stats["slow_queries"] += 1
             caller = get_caller_info()
-            db_logger.debug(
-                f"Transaction ended: id={hex(id(transaction))}, level={level}, parent_chain=[{parent_chain}], "
-                f"active={is_active}, caller={caller}"
+            db_logger.warning(
+                f"Slow query ({record.elapsed:.2f}s): "
+                f"{record.query[:100]}... caller={caller}"
             )
-
-        @event.listens_for(session, "after_rollback")
-        def after_rollback(session: Session) -> None:
-            # Get current transaction info if available
-            transaction = session.get_transaction()
-            if transaction:
-                level = get_transaction_nesting_level(transaction)
-                caller = get_caller_info()
-
-                db_logger.error(
-                    f"Transaction rolled back: id={hex(id(transaction))}, level={level}, "
-                    f"caller={caller}, _current_fn={transaction._current_fn if hasattr(transaction, '_current_fn') else 'N/A'}"
-                )
-            else:
-                db_logger.error("Transaction rolled back (no active transaction)")
-
-        # Add listener for savepoint operations
-        @event.listens_for(session, "after_begin")
-        def after_begin(
-            session: Session,  # noqa: ARG001
-            transaction: SessionTransaction | Any,
-            connection: Any,  # noqa: ARG001
-        ) -> None:
-            if hasattr(transaction, "_current_fn") and transaction._current_fn:
-                caller = get_caller_info()
-                db_logger.debug(
-                    f"Savepoint created: {transaction._current_fn} "
-                    f"(transaction={hex(id(transaction))}, caller={caller})"
-                )
 
     def get_stats(self) -> dict[str, Any]:
-        """Get current statistics.
-
-        Returns:
-            Dictionary of statistics
-        """
+        """Return a copy of current statistics."""
         return self._stats.copy()
 
     def reset_stats(self) -> None:
@@ -261,9 +160,12 @@ class DatabaseLogger:
         }
 
     def cleanup(self) -> None:
-        """Clean up any resources.
-
-        Note: Logging cleanup is now handled by config/logging.py.
-        This method only resets statistics.
-        """
+        """Reset statistics (logging cleanup handled by config/logging.py)."""
         self.reset_stats()
+
+
+def get_db_logger() -> DatabaseLogger:
+    """Get the global DatabaseLogger singleton, initializing if needed."""
+    if not hasattr(get_db_logger, "instance"):
+        get_db_logger.instance = DatabaseLogger()
+    return get_db_logger.instance

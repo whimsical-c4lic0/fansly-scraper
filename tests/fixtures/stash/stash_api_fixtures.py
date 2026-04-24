@@ -21,11 +21,12 @@ from errors import StashCleanupWarning
 
 
 def _mock_capability_response() -> httpx.Response:
-    """Build a minimal valid v0.11 capability detection response.
+    """Build a minimal valid capability detection response.
 
-    During StashClient.initialize(), v0.11 runs a __schema introspection query
-    to detect server capabilities. This provides the minimum response needed
-    for that query to succeed in test environments.
+    During StashClient.initialize(), the client runs a __schema introspection
+    query to detect server capabilities (introduced in stash-graphql-client
+    v0.11; still in use). This provides the minimum response needed for that
+    query to succeed in test environments.
     """
     return httpx.Response(
         200,
@@ -125,7 +126,7 @@ def dump_graphql_calls(calls, label: str = "GraphQL calls") -> None:
             variables = req_body.get("variables", {})
 
             resp_body = call.response.json() if call.response else {}
-            data_keys = list(resp_body.get("data", {}).keys()) if resp_body else []
+            data_keys = list((resp_body.get("data") or {}).keys()) if resp_body else []
 
             print(f"\n  [{i}] {first_line}")
             print(f"      variables: {json.dumps(variables, default=str)[:200]}")
@@ -244,7 +245,7 @@ async def respx_stash_client(
         ```
     """
     with respx.mock:
-        # Serve capability detection response for v0.11 initialization
+        # Serve capability detection response for StashClient initialization
         graphql_route = respx.post("http://localhost:9999/graphql").mock(
             side_effect=[_mock_capability_response()]
         )

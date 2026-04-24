@@ -303,11 +303,11 @@ def test_get_token_from_firefox_db_locked_interactive(
 
 
 @patch("sqlite3.connect")
-@patch("builtins.print")
+@patch("config.browser.textio_logger")
 @patch("traceback.format_exc", return_value="Traceback: some other error")
 def test_get_token_from_firefox_db_other_sqlite_error(
     mock_traceback,
-    mock_print,
+    mock_logger,
     mock_connect,
 ):
     """Test handling other SQLite errors."""
@@ -316,8 +316,7 @@ def test_get_token_from_firefox_db_other_sqlite_error(
     result = get_token_from_firefox_db("test.sqlite")
 
     assert result is None
-    # Verify error is printed
-    mock_print.assert_called_once_with(
+    mock_logger.error.assert_called_once_with(
         "Unexpected Error processing SQLite file:\nTraceback: some other error"
     )
 
@@ -456,6 +455,17 @@ def test_get_auth_token_from_leveldb_interactive_browser_locked(
     assert result == "test-token"
     mock_close_browser.assert_called_once()
     mock_input.assert_called_once()
+
+
+@pytest.mark.skipif(not HAS_PLYVEL, reason="plyvel not installed")
+@patch("plyvel.DB")
+def test_get_auth_token_from_leveldb_generic_exception(mock_db_class):
+    """Generic exception during LevelDB access returns None (lines 338-339)."""
+    mock_db_class.side_effect = RuntimeError("unexpected db error")
+
+    result = get_auth_token_from_leveldb_folder("test/path")
+
+    assert result is None
 
 
 @patch("platform.system")

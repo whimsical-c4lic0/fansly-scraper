@@ -40,12 +40,13 @@ from .models import (
     Hashtag,
     Media,
     MediaLocation,
+    MediaStory,
     MediaStoryState,
     Message,
+    MonitorState,
     PinnedPost,
     Post,
     PostMention,
-    Story,
     TimelineStats,
     Wall,
     get_from_cache_by_type_name,
@@ -68,12 +69,13 @@ _TYPE_REGISTRY: dict[str, type] = {
         Hashtag,
         Media,
         MediaLocation,
+        MediaStory,
         MediaStoryState,
         Message,
+        MonitorState,
         PinnedPost,
         Post,
         PostMention,
-        Story,
         TimelineStats,
         Wall,
     ]
@@ -314,13 +316,20 @@ class PostgresEntityStore:
 
     @staticmethod
     async def _init_pg_connection(conn: asyncpg.Connection) -> None:
-        """Register JSONB codec so asyncpg can encode dict→JSONB on writes."""
+        """Register JSONB codec and query logger on new pool connections.
+
+        Runs once per new connection. Query loggers don't trigger asyncpg's
+        release warning, so they stay in ``init``.
+        """
         await conn.set_type_codec(
             "jsonb",
             encoder=json.dumps,
             decoder=json.loads,
             schema="pg_catalog",
         )
+        from .logging_config import get_db_logger
+
+        conn.add_query_logger(get_db_logger().query_logger_callback)
 
     async def close_thread_resources(self) -> None:
         """Close all per-thread asyncpg pools."""
@@ -717,11 +726,29 @@ class PostgresEntityStore:
                 new_id = await conn.fetchval(sql, *values)
                 obj.id = new_id
             else:
-                # Snowflake ID or non-id PK: INSERT with provided ID
-                sql = (
-                    f"INSERT INTO {table_name} ({', '.join(col_names)}) "
-                    f"VALUES ({', '.join(placeholders)})"
-                )
+                # Snowflake ID or non-id PK: UPSERT with provided ID.
+                # ON CONFLICT DO UPDATE makes the save idempotent when the
+                # identity map and the DB disagree — e.g., cache eviction
+                # from a validation-error leak, or concurrent writes from
+                # another process/task. EXCLUDED.col refers to the row that
+                # WOULD have been inserted.
+                update_cols = [k for k in table_data if k != pk_col]
+                if update_cols:
+                    update_clause = ", ".join(
+                        f"{self._q(k)} = EXCLUDED.{self._q(k)}" for k in update_cols
+                    )
+                    sql = (
+                        f"INSERT INTO {table_name} ({', '.join(col_names)}) "
+                        f"VALUES ({', '.join(placeholders)}) "
+                        f"ON CONFLICT ({self._q(pk_col)}) "
+                        f"DO UPDATE SET {update_clause}"
+                    )
+                else:
+                    sql = (
+                        f"INSERT INTO {table_name} ({', '.join(col_names)}) "
+                        f"VALUES ({', '.join(placeholders)}) "
+                        f"ON CONFLICT ({self._q(pk_col)}) DO NOTHING"
+                    )
                 await conn.execute(sql, *values)
 
     async def _update(self, obj: FanslyObject) -> None:
@@ -918,7 +945,12 @@ class PostgresEntityStore:
                                 f"VALUES ({vals}) ON CONFLICT DO NOTHING",
                                 *row.values(),
                             )
-                except asyncpg.ForeignKeyViolationError as exc:
+                except asyncpg.ForeignKeyViolationError as exc:  # pragma: no cover
+                    # Safety net: if _ensure_junction_fk_targets couldn't
+                    # resolve all FK targets (e.g., multi-FK junction with
+                    # a target model that doesn't implement create_stub),
+                    # the INSERT fails here. Log and continue rather than
+                    # crashing the entire save. (#51)
                     db_logger.warning(
                         "Skipped %s junction sync for %r: %s",
                         meta.assoc_table,
@@ -961,7 +993,7 @@ class PostgresEntityStore:
 
         for col_name, target_table in fk_targets:
             model_cls = _TABLE_TO_MODEL.get(target_table)
-            if model_cls is None:
+            if model_cls is None:  # pragma: no cover
                 continue
 
             # Deduplicate: map target_id → first row that references it
@@ -1270,7 +1302,7 @@ class PostgresEntityStore:
             if not meta.assoc_table:
                 continue
             assoc_def = core_metadata.tables.get(meta.assoc_table)
-            if assoc_def is None:
+            if assoc_def is None:  # pragma: no cover
                 continue
             col_names = [c.name for c in assoc_def.columns]
             if meta.fk_column and meta.fk_column in col_names:

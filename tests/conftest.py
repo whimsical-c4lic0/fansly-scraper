@@ -34,7 +34,6 @@ from loguru import logger
 
 from config import FanslyConfig
 from config.fanslyconfig import FanslyConfig as FanslyConfigClass
-from config.metadatahandling import MetadataHandling
 from config.modes import DownloadMode
 from download.core import DownloadState
 
@@ -46,6 +45,24 @@ from tests.fixtures.utils.test_isolation import snowflake_id
 # ============================================================================
 # Pytest Hooks
 # ============================================================================
+
+
+def pytest_unconfigure(config):
+    """Flush stdout/stderr before xdist worker shutdown.
+
+    Python 3.13 on macOS has a race in _Py_Finalize: if a daemon thread
+    holds the stdout buffer lock when the main thread calls flush_std_files(),
+    the interpreter hits _enter_buffered_busy → SIGABRT.
+
+    Flushing here — after all plugins have cleaned up but before the
+    interpreter shuts down — gives pending writes a window to complete.
+    """
+    import sys
+
+    with suppress(Exception):
+        sys.stdout.flush()
+    with suppress(Exception):
+        sys.stderr.flush()
 
 
 def pytest_collection_modifyitems(config, items):
@@ -146,17 +163,22 @@ def clean_model_data(data_dict):
 
 @pytest_asyncio.fixture(autouse=True)
 async def cleanup_tasks():
-    """Cleanup any remaining async tasks after each test.
+    """Cleanup leaked async tasks after each test.
 
-    This prevents task leakage between tests and ensures clean test isolation.
+    Only cancels tasks that were created during the test — not internal
+    framework tasks (asyncpg pool management, etc.) that may still be
+    needed during fixture teardown.
     """
+    pre_existing = asyncio.all_tasks()
     yield
-    # Clean up any remaining tasks at the end of each test
     for task in asyncio.all_tasks():
-        if not task.done() and task != asyncio.current_task():
+        if (
+            task not in pre_existing
+            and not task.done()
+            and task != asyncio.current_task()
+        ):
             task.cancel()
             with suppress(asyncio.CancelledError, RuntimeError):
-                # RuntimeError: cannot reuse already awaited coroutine
                 await task
 
 
@@ -343,7 +365,7 @@ def mock_config():
     Note: Sets pg_database to a non-existent name to prevent accidental connections
     to the production database.
     """
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     # Override database name to prevent accidental connections to production database
     config.pg_database = "test_mock_should_not_connect"
     return config
@@ -352,7 +374,7 @@ def mock_config():
 @pytest.fixture
 def test_config():
     """Alias for mock_config fixture for backwards compatibility."""
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     # Override database name to prevent accidental connections to production database
     config.pg_database = "test_mock_should_not_connect"
     return config
@@ -403,7 +425,6 @@ def mock_config_file(temp_config_dir, request):
         config_content = """
         [Options]
         download_mode = Normal
-        metadata_handling = Advanced
         interactive = True
         download_directory = Local_directory
         """
@@ -452,7 +473,6 @@ def valid_api_config(mock_config_file):
         [Options]
         interactive = True
         download_mode = Normal
-        metadata_handling = Advanced
         download_directory = Local_directory
         """
         )
@@ -463,12 +483,6 @@ def valid_api_config(mock_config_file):
 def download_modes():
     """Get all available download modes."""
     return list(DownloadMode)
-
-
-@pytest.fixture(scope="session")
-def metadata_handling_modes():
-    """Get all available metadata handling modes."""
-    return list(MetadataHandling)
 
 
 @pytest.fixture

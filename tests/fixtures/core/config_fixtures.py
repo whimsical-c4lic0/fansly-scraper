@@ -6,7 +6,7 @@ of using MagicMock.
 
 Usage:
     def test_something(test_config):
-        assert test_config.program_version == "0.11.0"
+        assert test_config.program_version == "0.13.0"
 
 Note:
     - test_config: Basic config without database setup
@@ -211,17 +211,12 @@ def complete_args():
         no_open_folder=False,
         no_separate_messages=False,
         no_separate_timeline=False,
-        separate_metadata=False,
         separate_previews=False,
         use_duplicate_threshold=False,
         use_pagination_duplication=False,
-        metadata_handling=None,
         timeline_retries=None,
         timeline_delay_seconds=None,
         api_max_retries=None,
-        db_sync_commits=None,
-        db_sync_seconds=None,
-        db_sync_min_size=None,
         pg_host=None,
         pg_port=None,
         pg_database=None,

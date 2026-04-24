@@ -15,13 +15,7 @@ import json
 import os
 import time
 import uuid
-from collections.abc import (
-    AsyncGenerator,
-    Callable,
-    Coroutine,
-    Generator,
-    Sequence,
-)
+from collections.abc import AsyncGenerator, Callable, Coroutine, Generator, Sequence
 from contextlib import asynccontextmanager, contextmanager, suppress
 from datetime import UTC, datetime
 from functools import wraps
@@ -41,7 +35,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.orm import Session, sessionmaker
 
-from config import FanslyConfig
+from config import FanslyConfig, db_logger
 from metadata import (
     Account,
     AccountMedia,
@@ -62,10 +56,10 @@ from tests.fixtures.metadata.metadata_factories import (
     HashtagFactory,
     MediaFactory,
     MediaLocationFactory,
+    MediaStoryFactory,
     MediaStoryStateFactory,
     MessageFactory,
     PostFactory,
-    StoryFactory,
     StubTrackerFactory,
     TimelineStatsFactory,
     WallFactory,
@@ -157,7 +151,7 @@ def uuid_test_db_factory(request: Any) -> Generator[FanslyConfig, None, None]:
         admin_engine.dispose()
 
     # Create config pointing to the new test database
-    config = FanslyConfig(program_version="0.11.0")
+    config = FanslyConfig(program_version="0.13.0")
     config.pg_host = pg_host
     config.pg_port = pg_port
     config.pg_database = test_db_name
@@ -303,7 +297,7 @@ class TestDatabase(Database):
         total = time.time() - conn.info["query_start_time"].pop()
         # Log if query takes more than 100ms
         if total > 0.1:
-            print(f"Long running query ({total:.2f}s): {statement}")
+            db_logger.warning(f"Long running query ({total:.2f}s): {statement}")
 
     def _make_session(self) -> Session:
         """Create a new session with proper typing."""
@@ -532,10 +526,6 @@ async def test_async_session(
 def config(uuid_test_db_factory) -> FanslyConfig:
     """Create a test configuration with isolated PostgreSQL database (UUID-based)."""
     config = uuid_test_db_factory
-    # Database sync settings (deprecated for PostgreSQL but kept for compatibility)
-    config.db_sync_min_size = 50
-    config.db_sync_commits = 1000
-    config.db_sync_seconds = 60
 
     return config
 
@@ -555,10 +545,6 @@ def config_with_database(uuid_test_db_factory) -> FanslyConfig:
         FanslyConfig with _database initialized and ready to use
     """
     config = uuid_test_db_factory
-    # Database sync settings (deprecated for PostgreSQL but kept for compatibility)
-    config.db_sync_min_size = 50
-    config.db_sync_commits = 1000
-    config.db_sync_seconds = 60
 
     # Initialize database with migrations skipped (tables created by test_engine)
     config._database = Database(config, skip_migrations=True)
@@ -622,7 +608,7 @@ def test_database_sync(
             if hasattr(db, "_sync_engine"):
                 db.close()
         except Exception as cleanup_error:
-            print(f"Warning: Error during database cleanup: {cleanup_error}")
+            db_logger.warning(f"Error during database cleanup: {cleanup_error}")
 
 
 @pytest_asyncio.fixture
@@ -648,7 +634,7 @@ async def test_database(
 
         yield db
     except Exception as e:
-        print(f"Warning: Error during database setup: {e}")
+        db_logger.warning(f"Error during database setup: {e}")
         raise
     finally:
         # Cleanup: Only close sync engine if it exists
@@ -657,7 +643,7 @@ async def test_database(
             if hasattr(db, "_sync_engine") and db._sync_engine is not None:
                 db._sync_engine.dispose()
         except Exception as cleanup_error:
-            print(f"Warning: Error during database cleanup: {cleanup_error}")
+            db_logger.warning(f"Error during database cleanup: {cleanup_error}")
 
 
 # cleanup_database removed: UUID-based database isolation makes cleanup redundant.
@@ -901,7 +887,7 @@ def factory_session(test_database_sync: Database):
         AccountMediaFactory,
         AccountMediaBundleFactory,
         HashtagFactory,
-        StoryFactory,
+        MediaStoryFactory,
         WallFactory,
         MediaStoryStateFactory,
         TimelineStatsFactory,
@@ -972,7 +958,7 @@ async def factory_async_session(test_engine: AsyncEngine, session: AsyncSession)
         AccountMediaFactory,
         AccountMediaBundleFactory,
         HashtagFactory,
-        StoryFactory,
+        MediaStoryFactory,
         WallFactory,
         MediaStoryStateFactory,
         TimelineStatsFactory,
