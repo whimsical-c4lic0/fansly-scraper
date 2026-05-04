@@ -15,6 +15,7 @@ import httpx
 from httpx_retries import Retry, RetryTransport
 
 from api.websocket import FanslyWebSocket
+from api.websocket_subprocess import get_websocket_class
 from config.logging import textio_logger as logger
 from helpers.timer import timing_jitter
 from helpers.web import get_flat_qs_dict, split_url
@@ -537,7 +538,7 @@ class FanslyApi:
                 )
                 return self._websocket_client.session_id
             logger.warning("WebSocket connected but no session_id, reconnecting...")
-            await self._websocket_client.stop()
+            await self._websocket_client.stop_thread()
             self._websocket_client = None
 
         # Create new WebSocket client with shared cookie jar. Passing
@@ -547,7 +548,11 @@ class FanslyApi:
         # from the upgrade response back into the same jar (WS → HTTP).
         logger.info("Starting persistent WebSocket connection for anti-detection")
 
-        self._websocket_client = FanslyWebSocket(
+        self._websocket_client = get_websocket_class(
+            use_subprocess=getattr(
+                self.config, "monitoring_websocket_subprocess", False
+            ),
+        )(
             token=self.token,
             user_agent=self.user_agent,
             http_client=self.http_session,
@@ -557,11 +562,16 @@ class FanslyApi:
         )
 
         try:
-            # Start WebSocket in background (connects and authenticates)
-            await self._websocket_client.start_background()
+            # Start WebSocket on its own thread (connects and authenticates).
+            # Insulates ping/pong heartbeat from main-loop pressure.
+            self._websocket_client.start_in_thread()
 
-            # Wait a moment for authentication to complete
-            for _ in range(10):  # Wait up to 1 second
+            # Wait for authentication to complete. In-thread typically
+            # populates session_id within ~700ms (thread spawn + connect +
+            # auth handshake). The subprocess proxy adds Python interpreter
+            # cold-start on top — observed ~1.2s end-to-end on Linux spawn.
+            # 5s budget covers both paths and breaks early once authed.
+            for _ in range(50):
                 if self._websocket_client.session_id:
                     break
                 await asyncio.sleep(0.1)
@@ -574,7 +584,7 @@ class FanslyApi:
             logger.error("Failed to establish WebSocket session: {}", e)
             # Clean up on failure
             if self._websocket_client:
-                await self._websocket_client.stop()
+                await self._websocket_client.stop_thread()
                 self._websocket_client = None
             raise RuntimeError(f"WebSocket session setup failed: {e}")
         else:
@@ -1063,7 +1073,7 @@ class FanslyApi:
         if self._websocket_client is not None:
             logger.info("Closing persistent WebSocket connection")
             try:
-                await self._websocket_client.stop()
+                await self._websocket_client.stop_thread()
             except Exception as e:
                 logger.warning("Error stopping WebSocket: {}", e)
             finally:

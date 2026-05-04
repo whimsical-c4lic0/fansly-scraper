@@ -22,6 +22,7 @@ from .metadata_factories import (
     setup_accounts_and_groups,
 )
 from .metadata_fixtures import (
+    saved_account,
     test_account,
     test_account_media,
     test_attachment,
@@ -34,9 +35,6 @@ from .metadata_fixtures import (
     test_posts,
 )
 
-
-# Alias GroupFactory to avoid collision with Stash GroupFactory
-MetadataGroupFactory = GroupFactory
 
 __all__ = [
     # Factories
@@ -52,13 +50,13 @@ __all__ = [
     "MediaStoryFactory",
     "MediaStoryStateFactory",
     "MessageFactory",
-    "MetadataGroupFactory",
     "MonitorStateFactory",
     "PostFactory",
     "StubTrackerFactory",
     "TimelineStatsFactory",
     "WallFactory",
     "create_groups_from_messages",
+    "saved_account",
     "setup_accounts_and_groups",
     # Fixtures
     "test_account",

@@ -27,7 +27,11 @@ from tests.fixtures import (
     create_gallery_update_result,
     create_graphql_response,
 )
-from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
+from tests.fixtures.stash.stash_api_fixtures import (
+    assert_op,
+    assert_op_with_vars,
+    dump_graphql_calls,
+)
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -239,10 +243,9 @@ class TestGalleryCreation:
         assert len(gallery.performers) == 1
         assert gallery.performers[0] == main_performer
 
-        # Verify findPerformers was called
-        assert len(graphql_route.calls) >= 1
-        req = json.loads(graphql_route.calls[0].request.content)
-        assert "findPerformers" in req["query"]
+        # Verify findPerformers was called twice (name + alias search)
+        assert len(graphql_route.calls) == 2
+        assert_op(graphql_route.calls[0], "findPerformers")
 
 
 class TestGalleryOrchestration:
@@ -349,9 +352,7 @@ class TestGalleryOrchestration:
 
         # Verify exactly 1 call (stash_id lookup succeeded)
         assert len(graphql_route.calls) == 1
-        req0 = json.loads(graphql_route.calls[0].request.content)
-        assert "findGallery" in req0["query"]
-        assert req0["variables"]["id"] == "999"
+        assert_op_with_vars(graphql_route.calls[0], "findGallery", id="999")
 
     @pytest.mark.asyncio
     async def test_gallery_found_by_code(
@@ -440,11 +441,14 @@ class TestGalleryOrchestration:
         assert gallery is not None
         assert gallery.id == "1001"
 
-        assert len(graphql_route.calls) >= 1
-        req0 = json.loads(graphql_route.calls[0].request.content)
-        assert "findGalleries" in req0["query"]
-        assert req0["variables"]["gallery_filter"]["code"]["value"] == post_id
-        assert req0["variables"]["gallery_filter"]["code"]["modifier"] == "EQUALS"
+        # Single call: findGalleries by code → found, short-circuits the rest
+        assert len(graphql_route.calls) == 1
+        assert_op_with_vars(
+            graphql_route.calls[0],
+            "findGalleries",
+            gallery_filter__code__value=post_id,
+            gallery_filter__code__modifier="EQUALS",
+        )
 
     @pytest.mark.asyncio
     async def test_gallery_found_by_title(
@@ -519,21 +523,22 @@ class TestGalleryOrchestration:
         assert len(graphql_route.calls) == 3
 
         # Call 0: code lookup (failed)
-        req0 = json.loads(graphql_route.calls[0].request.content)
-        assert "findGalleries" in req0["query"]
-        assert req0["variables"]["gallery_filter"]["code"]["value"] == post_id
+        assert_op_with_vars(
+            graphql_route.calls[0],
+            "findGalleries",
+            gallery_filter__code__value=post_id,
+        )
 
         # Call 1: title lookup count check (succeeded)
-        req1 = json.loads(graphql_route.calls[1].request.content)
-        assert "findGalleries" in req1["query"]
-        assert (
-            req1["variables"]["gallery_filter"]["title"]["value"] == "Test post content"
+        assert_op_with_vars(
+            graphql_route.calls[1],
+            "findGalleries",
+            gallery_filter__title__value="Test post content",
+            gallery_filter__title__modifier="EQUALS",
         )
-        assert req1["variables"]["gallery_filter"]["title"]["modifier"] == "EQUALS"
 
         # Call 2: title lookup fetch results
-        req2 = json.loads(graphql_route.calls[2].request.content)
-        assert "findGalleries" in req2["query"]
+        assert_op(graphql_route.calls[2], "findGalleries")
 
     @pytest.mark.asyncio
     async def test_gallery_found_by_url(
@@ -627,20 +632,22 @@ class TestGalleryOrchestration:
         )
 
         # Call 0: code lookup (failed)
+        assert_op(graphql_route.calls[0], "findGalleries")
         req0 = json.loads(graphql_route.calls[0].request.content)
-        assert "findGalleries" in req0["query"]
         assert "code" in req0["variables"]["gallery_filter"]
 
         # Call 1: title lookup (failed)
+        assert_op(graphql_route.calls[1], "findGalleries")
         req1 = json.loads(graphql_route.calls[1].request.content)
-        assert "findGalleries" in req1["query"]
         assert "title" in req1["variables"]["gallery_filter"]
 
         # Call 2: url lookup (succeeded)
-        req2 = json.loads(graphql_route.calls[2].request.content)
-        assert "findGalleries" in req2["query"]
-        assert req2["variables"]["gallery_filter"]["url"]["value"] == expected_url
-        assert req2["variables"]["gallery_filter"]["url"]["modifier"] == "INCLUDES"
+        assert_op_with_vars(
+            graphql_route.calls[2],
+            "findGalleries",
+            gallery_filter__url__value=expected_url,
+            gallery_filter__url__modifier="INCLUDES",
+        )
 
     @pytest.mark.asyncio
     async def test_gallery_created_when_not_found(
@@ -701,24 +708,24 @@ class TestGalleryOrchestration:
         assert gallery is not None
         assert gallery.title == "Test post content"
 
-        # At least 4 calls (3 lookups + 1 create)
-        assert len(graphql_route.calls) >= 4, (
-            f"Expected at least 4 GraphQL calls, got {len(graphql_route.calls)}"
+        # 5 calls: code/title/url finds + populate filter-query + galleryCreate
+        assert len(graphql_route.calls) == 5, (
+            f"Expected exactly 5 GraphQL calls, got {len(graphql_route.calls)}"
         )
 
         # Call 0: code lookup
+        assert_op(graphql_route.calls[0], "findGalleries")
         req0 = json.loads(graphql_route.calls[0].request.content)
-        assert "findGalleries" in req0["query"]
         assert "code" in req0["variables"]["gallery_filter"]
 
         # Call 1: title lookup
+        assert_op(graphql_route.calls[1], "findGalleries")
         req1 = json.loads(graphql_route.calls[1].request.content)
-        assert "findGalleries" in req1["query"]
         assert "title" in req1["variables"]["gallery_filter"]
 
         # Call 2: url lookup
+        assert_op(graphql_route.calls[2], "findGalleries")
         req2 = json.loads(graphql_route.calls[2].request.content)
-        assert "findGalleries" in req2["query"]
         assert "url" in req2["variables"]["gallery_filter"]
 
         gallery_create_queries = [

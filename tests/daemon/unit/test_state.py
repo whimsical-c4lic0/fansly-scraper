@@ -30,17 +30,9 @@ from tests.fixtures.utils.test_isolation import snowflake_id
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def config_wired(config, entity_store, fansly_api):
-    """Config wired with a real FanslyApi and backed by the test entity_store.
-
-    Both ``config`` and ``entity_store`` chain through ``uuid_test_db_factory``
-    so they share the same underlying PostgreSQL database.
-    entity_store must be listed before config_wired to ensure FanslyObject._store
-    is set before the state functions call get_store().
-    """
-    config._api = fansly_api
-    return config
+# `config_wired` comes from the canonical fixture
+# (tests/fixtures/core/config_fixtures.py) via the wildcard import in
+# tests/conftest.py. Per Cat L policy: don't redefine here.
 
 
 # ---------------------------------------------------------------------------
@@ -110,3 +102,113 @@ class TestMarkCreatorProcessed:
         # No MonitorState row should be present
         state = await entity_store.get(MonitorState, unknown_id)
         assert state is None
+
+    @pytest.mark.asyncio
+    async def test_account_load_exception_logs_warning_and_returns(
+        self, config_wired, entity_store, monkeypatch, caplog
+    ):
+        """Lines 40-46: store.get(Account) raises → warning log + early return.
+
+        Cache miss + DB exception path: the function must NOT propagate the
+        exception (daemon loop would die), just log + skip this snapshot.
+        """
+        import logging as _logging
+
+        caplog.set_level(_logging.WARNING)
+
+        creator_id = snowflake_id()
+        # Don't save the account — forces store.get_from_cache to miss and
+        # trigger the await store.get(Account) path.
+
+        # Patch the module-level get_store to return a wrapper that raises on get.
+        from daemon.state import get_store as real_get_store
+
+        real_store = real_get_store()
+
+        class _RaisingStore:
+            """Wrap real store; make Account.get raise."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def get_from_cache(self, model, _id):
+                # Cache miss for Account so the await path fires.
+                return None
+
+            async def get(self, model, _id):
+                if model.__name__ == "Account":
+                    raise RuntimeError("simulated account load failure")
+                return await self._real.get(model, _id)
+
+            async def save(self, obj):
+                return await self._real.save(obj)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monkeypatch.setattr("daemon.state.get_store", lambda: _RaisingStore(real_store))
+
+        # Must NOT raise.
+        await mark_creator_processed(creator_id)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "could not load Account" in m
+            and str(creator_id) in m
+            and "simulated account load failure" in m
+            for m in warnings
+        )
+
+    @pytest.mark.asyncio
+    async def test_save_exception_logs_warning_and_returns(
+        self, config_wired, entity_store, monkeypatch, caplog
+    ):
+        """Lines 72-77: store.save(MonitorState) raises → warning + return.
+
+        Account exists, but the MonitorState save fails. The function must
+        catch the exception so the daemon loop stays running.
+        """
+        import logging as _logging
+
+        caplog.set_level(_logging.WARNING)
+
+        # Real account so account-load succeeds.
+        account = AccountFactory.build()
+        await entity_store.save(account)
+
+        from daemon.state import get_store as real_get_store
+
+        real_store = real_get_store()
+
+        class _SaveRaisesStore:
+            """Wrap real store; make MonitorState save raise."""
+
+            def __init__(self, real):
+                self._real = real
+
+            def get_from_cache(self, model, key):
+                return self._real.get_from_cache(model, key)
+
+            async def get(self, model, key):
+                return await self._real.get(model, key)
+
+            async def save(self, obj):
+                if obj.__class__.__name__ == "MonitorState":
+                    raise RuntimeError("simulated save failure")
+                return await self._real.save(obj)
+
+            def __getattr__(self, name):
+                return getattr(self._real, name)
+
+        monkeypatch.setattr(
+            "daemon.state.get_store", lambda: _SaveRaisesStore(real_store)
+        )
+
+        # Must NOT raise.
+        await mark_creator_processed(account.id)
+
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        assert any(
+            "could not save MonitorState" in m and "simulated save failure" in m
+            for m in warnings
+        )

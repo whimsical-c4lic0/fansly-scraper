@@ -6,6 +6,7 @@ a nested folder structure for better maintainability.
 
 Fixture Organization:
 - core/: Configuration and app-level fixtures
+- daemon/: Simulator + collaborator fakes for daemon tests
 - download/: Download state and path fixtures
 - api/: API client fixtures with respx for HTTP mocking
 - metadata/: Database model factories and fixtures
@@ -20,23 +21,40 @@ from typing import Any
 
 # Import from nested modules
 from .api import (
+    FakeSocket,
+    FakeWS,
+    MainIntegrationEnv,
+    auth_response,
     create_mock_json_response,
     dump_fansly_calls,
+    fake_websocket_session,
+    fake_ws,
     fansly_api,
     fansly_api_factory,
     fansly_api_with_respx,
+    fansly_json,
+    main_integration_env,
+    make_fake_ws_factory,
     mock_fansly_account_response,
     mock_fansly_timeline_response,
+    mount_client_account_me_route,
+    mount_empty_creator_pipeline,
+    mount_empty_following_route,
     respx_fansly_api,
+    run_main_and_cleanup,
+    ws_message,
 )
 from .core import (
     FanslyConfigFactory,
+    bypass_load_config,
     complete_args,
-    config_parser,
-    mock_config_file,
-    temp_config_dir,
-    test_config,
-    valid_api_config,
+    config_wired,
+    fast_timing,
+    minimal_argv,
+)
+from .daemon import (
+    RecordingSimulator,
+    StubSimulator,
 )
 from .database import (
     config,
@@ -47,6 +65,7 @@ from .database import (
     factory_session,
     json_conversation_data,
     mock_account,
+    pg_template_db,
     session,
     session_factory,
     session_sync,
@@ -68,13 +87,7 @@ from .database import (
 )
 from .download import (
     DownloadStateFactory,
-    download_state,
-    mock_download_dir,
-    mock_metadata_dir,
-    mock_process_media_bundles,
-    mock_process_media_download,
-    mock_temp_dir,
-    test_downloads_dir,
+    GlobalStateFactory,
 )
 from .metadata import (
     AccountFactory,
@@ -89,13 +102,13 @@ from .metadata import (
     MediaStoryFactory,
     MediaStoryStateFactory,
     MessageFactory,
-    MetadataGroupFactory,
     MonitorStateFactory,
     PostFactory,
     StubTrackerFactory,
     TimelineStatsFactory,
     WallFactory,
     create_groups_from_messages,
+    saved_account,
     setup_accounts_and_groups,
     test_attachment,
     test_group,
@@ -104,7 +117,6 @@ from .metadata import (
     test_posts,
 )
 
-# Note: Stash GroupFactory imported separately to avoid name collision
 # Removed: mock_performer, mock_studio, mock_scene from stash_api_fixtures;
 # (MagicMock duplicates - use real mock_performer/mock_studio/mock_scene from stash_type_factories);
 # Removed: mock_client, mock_session, mock_transport from stash_api_fixtures;
@@ -128,6 +140,8 @@ from .stash import (
     TagFactory,
     VideoFileFactory,
     account_mixin,
+    assert_op,
+    assert_op_with_vars,
     batch_mixin,
     content_mixin,
     create_find_galleries_result,
@@ -147,6 +161,7 @@ from .stash import (
     create_studio_dict,
     create_tag_create_result,
     create_tag_dict,
+    dump_graphql_calls,
     enable_scene_creation,
     fansly_network_studio,
     gallery_mixin,
@@ -173,14 +188,19 @@ from .stash import (
     tag_mixin,
     test_state,
 )
-from .stash import GroupFactory as StashGroupFactory
 from .utils import (
+    SyncExecutor,
+    cleanup_fansly_websockets,
     cleanup_global_config_state,
     cleanup_http_sessions,
+    cleanup_jspybridge,
     cleanup_loguru_handlers,
     cleanup_mock_patches,
+    cleanup_rate_limiter_displays,
     cleanup_rich_progress_state,
     cleanup_unawaited_coroutines,
+    get_unique_test_id,
+    get_worker_id,
     snowflake_id,
 )
 
@@ -193,37 +213,46 @@ mod_core_factories = [
 ]
 
 mod_core_fixtures = [
+    "bypass_load_config",
     "complete_args",
-    "config_parser",
-    "mock_config_file",
-    "temp_config_dir",
-    "test_config",
-    "valid_api_config",
+    "config_wired",
+    "fast_timing",
+    "minimal_argv",
+]
+
+mod_daemon_fakes = [
+    "RecordingSimulator",
+    "StubSimulator",
 ]
 
 mod_download_factories = [
     "DownloadStateFactory",
-]
-
-mod_download_fixtures = [
-    "download_state",
-    "mock_download_dir",
-    "mock_metadata_dir",
-    "mock_process_media_bundles",
-    "mock_process_media_download",
-    "mock_temp_dir",
-    "test_downloads_dir",
+    "GlobalStateFactory",
 ]
 
 mod_api_fixtures = [
+    "FakeSocket",
+    "FakeWS",
+    "MainIntegrationEnv",
+    "auth_response",
     "create_mock_json_response",
     "dump_fansly_calls",
+    "fake_websocket_session",
+    "fake_ws",
     "fansly_api",
     "fansly_api_factory",
     "fansly_api_with_respx",
+    "fansly_json",
+    "main_integration_env",
+    "make_fake_ws_factory",
     "mock_fansly_account_response",
     "mock_fansly_timeline_response",
+    "mount_client_account_me_route",
+    "mount_empty_creator_pipeline",
+    "mount_empty_following_route",
     "respx_fansly_api",
+    "run_main_and_cleanup",
+    "ws_message",
 ]
 
 mod_metadata_factories = [
@@ -237,8 +266,8 @@ mod_metadata_factories = [
     "MediaLocationFactory",
     "MediaStoryFactory",
     "MediaStoryStateFactory",
+    "GroupFactory",
     "MessageFactory",
-    "MetadataGroupFactory",
     "MonitorStateFactory",
     "PostFactory",
     "StubTrackerFactory",
@@ -249,6 +278,7 @@ mod_metadata_factories = [
 ]
 
 mod_metadata_fixtures = [
+    "saved_account",
     "test_account",
     "test_media",
     "test_group",
@@ -272,7 +302,6 @@ mod_stash_type_factories = [
     "ImageFileFactory",
     "VideoFileFactory",
     "JobFactory",
-    "StashGroupFactory",
     # Fixtures that return REAL objects (not MagicMock)
     "mock_performer",  # From stash_type_factories - returns PerformerFactory()
     "mock_studio",  # From stash_type_factories - returns StudioFactory()
@@ -327,6 +356,7 @@ mod_stash_mixin_fixtures = [
 ]
 
 mod_database_fixtures = [
+    "pg_template_db",
     "uuid_test_db_factory",
     "test_data_dir",
     "timeline_data",
@@ -362,6 +392,9 @@ mod_stash_processing_fixtures = [
 ]
 
 mod_stash_api_fixtures = [
+    "assert_op",
+    "assert_op_with_vars",
+    "dump_graphql_calls",
     "stash_context",
     "stash_client",
     "respx_stash_client",
@@ -390,6 +423,16 @@ mod_cleanup_fixtures = [
     "cleanup_global_config_state",
     "cleanup_unawaited_coroutines",
     "cleanup_mock_patches",
+    "cleanup_jspybridge",
+    "cleanup_rate_limiter_displays",
+    "cleanup_fansly_websockets",
+]
+
+mod_utils_helpers = [
+    "SyncExecutor",
+    "get_unique_test_id",
+    "get_worker_id",
+    "snowflake_id",
 ]
 
 mod_init = [
@@ -404,8 +447,8 @@ mod_init = [
 __all__ = [  # noqa: PLE0604
     *mod_core_factories,
     *mod_core_fixtures,
+    *mod_daemon_fakes,
     *mod_download_factories,
-    *mod_download_fixtures,
     *mod_api_fixtures,
     *mod_metadata_factories,
     *mod_metadata_fixtures,
@@ -417,6 +460,7 @@ __all__ = [  # noqa: PLE0604
     *mod_stash_api_fixtures,
     *mod_stash_integration_fixtures,
     *mod_cleanup_fixtures,
+    *mod_utils_helpers,
     *mod_init,
 ]
 

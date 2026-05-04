@@ -15,6 +15,7 @@ render multi-colored segments from a ``phase_styles`` field on the task.
 """
 
 import asyncio
+import atexit
 import contextlib
 import os
 import tempfile
@@ -592,6 +593,27 @@ class ProgressManager:
 _progress_manager = ProgressManager()
 
 
+@atexit.register
+def _shutdown_progress_live() -> None:
+    """Stop Rich's Live refresh thread cleanly before interpreter teardown.
+
+    ``Live.start()`` spawns a daemon thread that periodically writes ANSI
+    cursor sequences to stdout. If the process exits while a session is
+    still open (KeyboardInterrupt mid-download, pytest-xdist worker
+    shutdown after a test left a session open, etc.),
+    ``_Py_Finalize.flush_std_files`` runs while the daemon thread is
+    mid-buffered-write — triggering CPython's ``_enter_buffered_busy``
+    fatal error and aborting the process with SIGABRT. ``atexit`` fires
+    before ``_Py_Finalize``, so calling ``Live.stop()`` here joins the
+    refresh thread cleanly first.
+    """
+    with contextlib.suppress(Exception), _progress_manager._lock:
+        if _progress_manager.live is not None:
+            _progress_manager.live.stop()
+            _progress_manager.live = None
+            _progress_manager._session_count = 0
+
+
 def get_progress_manager() -> ProgressManager:
     """Get the global progress manager instance.
 
@@ -696,7 +718,9 @@ def create_rich_handler(
 
 
 def _do_watch_progress(
-    progress_file: Path, handler: Callable[[str, str | None], None]
+    progress_file: Path,
+    handler: Callable[[str, str | None], None],
+    stop_event: threading.Event | None = None,
 ) -> None:
     """Function to run in a separate thread to read progress events from a file.
 
@@ -706,12 +730,17 @@ def _do_watch_progress(
     Args:
         progress_file: Path to the progress file written by FFmpeg
         handler: Callback function receiving (key, value) pairs
+        stop_event: Optional Event; when set, the read loop exits cleanly.
+            Without it, a killed FFmpeg leaves this daemon thread spinning
+            indefinitely on time.sleep(0.05), which can race _Py_Finalize.
     """
     try:
         # Wait for file to be created (FFmpeg creates it on start)
         timeout = 10
         start_time = time.time()
         while not progress_file.exists():
+            if stop_event is not None and stop_event.is_set():
+                return
             if time.time() - start_time > timeout:
                 return
             time.sleep(0.1)
@@ -719,6 +748,8 @@ def _do_watch_progress(
         # Read progress events from file
         with progress_file.open(encoding="utf-8") as f:
             while True:
+                if stop_event is not None and stop_event.is_set():
+                    break
                 line = f.readline()
                 if not line:
                     # No more data, check if FFmpeg is still running
@@ -767,16 +798,21 @@ def _watch_progress(
     try:
         os.close(fd)  # Close the file descriptor, FFmpeg will open it
 
-        # Start monitoring thread
+        # Start monitoring thread with cooperative-cancellation event so a
+        # killed FFmpeg (no "progress=end" line) doesn't strand the daemon.
+        stop_event = threading.Event()
         monitor_thread = threading.Thread(
-            target=_do_watch_progress, args=(progress_file, handler), daemon=True
+            target=_do_watch_progress,
+            args=(progress_file, handler, stop_event),
+            daemon=True,
         )
         monitor_thread.start()
 
         try:
             yield progress_file
         finally:
-            # Wait for monitoring thread to finish (with timeout)
+            # Signal the watcher to exit, then wait briefly.
+            stop_event.set()
             monitor_thread.join(timeout=2.0)
     finally:
         # Clean up temp file

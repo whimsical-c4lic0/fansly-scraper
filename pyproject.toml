@@ -1,6 +1,6 @@
 [project]
 name = "fansly-scraper"
-version = "0.13.1"
+version = "0.13.2"
 description = "Easy-to-use fansly.com content scraping tool. Enjoy your Fansly content offline anytime, anywhere in the highest possible content resolution! Fully customizable to download in bulk or single: photos, videos & audio from the timeline, messages, collection & single posts."
 authors = [
     {name ="prof79"},
@@ -51,7 +51,7 @@ httpx-retries = ">=0.4.3"
 ffmpeg-python = ">=0.2.0"
 jsbeautifier = ">=1.15.4"
 javascript = ">=1!1.2.6"
-stash-graphql-client = ">=0.12.0"
+stash-graphql-client = ">=0.12.4"
 av = "^17.0.0"
 ruamel-yaml = "^0.19.1"
 filelock = "^3.29.0"
@@ -308,6 +308,11 @@ addopts = [
     "--cov-report=term-missing",
     "--cov-report=html:htmlcov",
     "--cov-config=pyproject.toml",
+    # Honor ``@pytest.mark.xdist_group(name=...)`` so tests that share a
+    # fragile resource (currently: the ``message_media_generator`` fixture's
+    # find-or-create-on-shared-Docker-Stash race) all run on the same xdist
+    # worker. Tests without the marker still load-balance normally.
+    "--dist=loadgroup",
 ]
 timeout = 60
 timeout_func_only = true
@@ -334,6 +339,8 @@ markers = [
     "performance: marks tests as performance tests",
     "full_workflow: marks tests that run the complete workflow",
     "comprehensive: marks tests that check for comprehensive coverage",
+    "empty_db: opt out of the pg_template_db fast path; get a bare empty database (Alembic walk tests)",
+    "xdist_group(name): pin a test to a worker group (used with --dist=loadgroup) so tests sharing fragile state run serially on one worker",
 ]
 
 [tool.coverage.run]
@@ -382,7 +389,6 @@ exclude_also = [
     "raise NotImplementedError",
     "if 0:",
     "if False:",
-    "if TESTING:"
 ]
 ignore_errors = true
 skip_empty = true

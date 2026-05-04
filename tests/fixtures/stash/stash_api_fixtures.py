@@ -1,9 +1,12 @@
 """Test configuration and fixtures for Stash tests."""
 
+import asyncio
 import contextlib
 import json
 import logging
 import os
+import sys
+import time
 import warnings
 from collections.abc import AsyncGenerator, AsyncIterator
 from unittest.mock import patch
@@ -84,6 +87,135 @@ def _mock_capability_response() -> httpx.Response:
     )
 
 
+def _extract_query(call) -> str:
+    """Pull the GraphQL query string out of either call shape (respx or dict)."""
+    if isinstance(call, dict):
+        return call.get("query", "") or ""
+    body = json.loads(call.request.content) if call.request.content else {}
+    return body.get("query", "") or ""
+
+
+def _extract_variables(call) -> dict:
+    """Pull the GraphQL variables out of either call shape (respx or dict)."""
+    if isinstance(call, dict):
+        return call.get("variables") or {}
+    body = json.loads(call.request.content) if call.request.content else {}
+    return body.get("variables") or {}
+
+
+_MISSING = object()
+
+
+def _get_nested(data: dict, path: list[str]):
+    """Walk nested dict by key list. Returns sentinel _MISSING on miss."""
+    cur = data
+    for key in path:
+        if not isinstance(cur, dict) or key not in cur:
+            return _MISSING
+        cur = cur[key]
+    return cur
+
+
+def assert_op(call, op_name: str) -> None:
+    """Assert that a GraphQL call invokes a named operation.
+
+    Works with both respx route.calls[i] (unit tests) and capture_graphql_calls
+    list entries (integration tests). The assertion is a substring check on the
+    query string, matching how operations appear in GraphQL queries (e.g.
+    ``query FindGalleries`` or ``mutation { studioCreate(...) }``).
+
+    Args:
+        call: A single call from ``respx_route.calls[i]`` or
+            ``capture_graphql_calls(...)`` list.
+        op_name: Operation name to find in the query (case-sensitive).
+
+    Example:
+        assert_op(calls[0], "findGalleries")
+        assert_op(graphql_route.calls[3], "studioCreate")
+    """
+    query = _extract_query(call)
+    assert op_name in query, (
+        f"Expected operation {op_name!r} in query, got: {query[:120]!r}"
+    )
+
+
+def assert_op_with_vars(
+    call,
+    op_name: str,
+    paths: dict[tuple[str, ...], object] | None = None,
+    **expected_vars,
+) -> None:
+    """Assert op_name AND that every expected variable matches.
+
+    Variables are matched as a partial subset — only the fields you specify
+    are checked. Two ways to specify paths:
+
+    1. **Kwargs with ``__`` separators (ergonomic, 95% case).** Use
+       Django-style ``__`` to descend into nested dicts:
+       ``gallery_filter__code__value="12345"`` matches
+       ``variables["gallery_filter"]["code"]["value"] == "12345"``.
+
+    2. **``paths=`` dict with tuple keys (escape hatch).** Use this when a
+       segment of the path contains ``__`` itself (GraphQL ``__typename``
+       being the canonical example) or any other character that can't
+       appear in a Python identifier:
+       ``paths={("input", "__typename"): "ImageFile"}``.
+
+    The helper walks ``request.variables`` (the JSON-RPC ``variables`` dict
+    on the wire). Stash input types do not currently include
+    ``__typename`` in variables — but SGC surfaces ``__typename`` heavily
+    in query field-selections and response shapes, so the escape hatch
+    exists to keep this helper compatible with any future schema that
+    *does* round-trip ``__typename`` through inputs.
+
+    Works with both respx route.calls (unit tests) and capture_graphql_calls
+    list entries (integration tests).
+
+    Args:
+        call: A single call entry (see ``assert_op``).
+        op_name: GraphQL operation name (substring match against query).
+        paths: Optional dict mapping tuple-paths to expected values. Use
+            for any path segment that can't be expressed as a Python
+            identifier or contains ``__``.
+        **expected_vars: Path-to-value pairs. Path uses ``__`` separators.
+
+    Example (kwarg form):
+        assert_op_with_vars(
+            calls[0], "findGalleries",
+            gallery_filter__code__value=str(message.id),
+            gallery_filter__code__modifier="EQUALS",
+        )
+
+    Example (escape hatch for ``__typename``):
+        assert_op_with_vars(
+            calls[0], "SomeMutation",
+            paths={("input", "__typename"): "ImageFile"},
+            input__id="123",
+        )
+    """
+    assert_op(call, op_name)
+    actual_vars = _extract_variables(call)
+
+    pairs: list[tuple[list[str], object]] = []
+    for path_str, expected in expected_vars.items():
+        pairs.append((path_str.split("__"), expected))
+    if paths:
+        for path_tuple, expected in paths.items():
+            pairs.append((list(path_tuple), expected))
+
+    for path, expected in pairs:
+        actual = _get_nested(actual_vars, path)
+        assert actual is not _MISSING, (
+            f"variables path {'.'.join(path)!r} not found in call. "
+            f"Got variables: {actual_vars}"
+        )
+        assert actual == expected, (
+            f"variables.{'.'.join(path)}: "
+            f"expected {expected!r} ({type(expected).__name__}), "
+            f"got {actual!r} ({type(actual).__name__})"
+        )
+
+
 def dump_graphql_calls(calls, label: str = "GraphQL calls") -> None:
     """Print request/response details for each GraphQL call.
 
@@ -102,9 +234,9 @@ def dump_graphql_calls(calls, label: str = "GraphQL calls") -> None:
         calls: respx route.calls, respx.calls list, or capture_graphql_calls list
         label: Header label for the output
     """
-    print(f"\n{'=' * 70}")
-    print(f"  {label} ({len(calls)} total)")
-    print(f"{'=' * 70}")
+    print(f"\n{'=' * 70}", file=sys.stderr)
+    print(f"  {label} ({len(calls)} total)", file=sys.stderr)
+    print(f"{'=' * 70}", file=sys.stderr)
     for i, call in enumerate(calls):
         if isinstance(call, dict):
             # capture_graphql_calls format: {"query", "variables", "result", "exception"}
@@ -113,11 +245,14 @@ def dump_graphql_calls(calls, label: str = "GraphQL calls") -> None:
             variables = call.get("variables") or {}
             data_keys = list(call["result"].keys()) if call.get("result") else []
 
-            print(f"\n  [{i}] {first_line}")
-            print(f"      variables: {json.dumps(variables, default=str)[:200]}")
-            print(f"      response data keys: {data_keys}")
+            print(f"\n  [{i}] {first_line}", file=sys.stderr)
+            print(
+                f"      variables: {json.dumps(variables, default=str)[:200]}",
+                file=sys.stderr,
+            )
+            print(f"      response data keys: {data_keys}", file=sys.stderr)
             if call.get("exception"):
-                print(f"      EXCEPTION: {call['exception']}")
+                print(f"      EXCEPTION: {call['exception']}", file=sys.stderr)
         else:
             # respx call format: call.request / call.response
             req_body = json.loads(call.request.content) if call.request.content else {}
@@ -128,16 +263,21 @@ def dump_graphql_calls(calls, label: str = "GraphQL calls") -> None:
             resp_body = call.response.json() if call.response else {}
             data_keys = list((resp_body.get("data") or {}).keys()) if resp_body else []
 
-            print(f"\n  [{i}] {first_line}")
-            print(f"      variables: {json.dumps(variables, default=str)[:200]}")
-            print(f"      response data keys: {data_keys}")
+            print(f"\n  [{i}] {first_line}", file=sys.stderr)
+            print(
+                f"      variables: {json.dumps(variables, default=str)[:200]}",
+                file=sys.stderr,
+            )
+            print(f"      response data keys: {data_keys}", file=sys.stderr)
             if resp_body.get("errors"):
-                print(f"      ERRORS: {resp_body['errors']}")
-    print(f"\n{'=' * 70}\n")
+                print(f"      ERRORS: {resp_body['errors']}", file=sys.stderr)
+    print(f"\n{'=' * 70}\n", file=sys.stderr)
 
 
 # Export all fixtures for wildcard import
 __all__ = [
+    "assert_op",
+    "assert_op_with_vars",
     "dump_graphql_calls",
     "enable_scene_creation",
     "respx_stash_client",
@@ -232,11 +372,14 @@ async def respx_stash_client(
         ```python
         @pytest.mark.asyncio
         async def test_find_studio(respx_stash_client):
-            # Set up mock response
+            # Set up mock response — per-test routes must use side_effect=[]
+            # per CLAUDE.md (return_value defeats retry-budget accounting).
             respx.post("http://localhost:9999/graphql").mock(
-                return_value=httpx.Response(200, json={
-                    "data": {"findStudio": {"id": "123", "name": "Test"}}
-                })
+                side_effect=[
+                    httpx.Response(200, json={
+                        "data": {"findStudio": {"id": "123", "name": "Test"}}
+                    })
+                ]
             )
 
             # Now the client will use your mocked response
@@ -255,6 +398,9 @@ async def respx_stash_client(
 
         # Reset all routes and global call history so tests start clean
         respx.reset()
+        # Intentional `return_value` — fixture-level blanket default responder
+        # for any GraphQL call a test does not explicitly route. Per-test
+        # routes added on top of this MUST use `side_effect=[...]`.
         respx.post("http://localhost:9999/graphql").mock(
             return_value=httpx.Response(200, json={"data": {}})
         )
@@ -583,11 +729,95 @@ async def stash_cleanup_tracker():
                     stacklevel=3,
                 )
 
+            # Bounded read-back: wait until Stash confirms each deleted
+            # object is no longer queryable. The delete mutations above
+            # return immediately but Stash's docker write may not be
+            # visible to the next test's lookups for some time. Polling
+            # find{Type}(id=...) until null prevents the cross-worker race
+            # where consecutive tests on the same xdist_group worker hit
+            # stale rows from the previous test's cleanup.
+            with contextlib.suppress(Exception):
+                await _wait_for_deletions_visible(client, created_objects)
+
             print(f"\n{'=' * 60}")
             print("CLEANUP TRACKER: Finally block completed")
             print(f"{'=' * 60}\n")
 
     return cleanup_context
+
+
+# Map plural cleanup-bucket key → singular GraphQL query name.
+_DELETION_TYPE_MAP = {
+    "galleries": "Gallery",
+    "scenes": "Scene",
+    "performers": "Performer",
+    "studios": "Studio",
+    "tags": "Tag",
+}
+
+
+async def _wait_for_deletions_visible(
+    client: StashClient,
+    created_objects: dict[str, list],
+    *,
+    max_wait_seconds: float = 2.0,
+    poll_interval: float = 0.1,
+) -> None:
+    """Poll Stash until every deleted ID returns null from find{Type}(id=...).
+
+    This closes the cross-worker write-visibility race: stash_cleanup_tracker
+    issues delete mutations that Stash acknowledges synchronously, but the
+    docker SQLite write may not be flushed when the next test starts a
+    lookup. Without waiting, the next test's find queries can return stale
+    rows and cache hits that mask real assertions.
+
+    Args:
+        client: Real StashClient connected to docker Stash.
+        created_objects: The same {type → [ids]} dict the cleanup loop
+            iterated; keys must include "galleries", "scenes", etc.
+        max_wait_seconds: Total seconds to keep polling for visibility.
+            Named to avoid the ASYNC109 "timeout-parameter" rule — this is
+            a polling-bound, not an asyncio.timeout-cancellation deadline.
+        poll_interval: Seconds between poll iterations.
+    """
+    pending: dict[str, set[str]] = {
+        cap: set(created_objects.get(plural, []) or [])
+        for plural, cap in _DELETION_TYPE_MAP.items()
+        if created_objects.get(plural)
+    }
+    if not pending:
+        return
+
+    deadline = time.monotonic() + max_wait_seconds
+
+    async def _check_one(cap: str, obj_id: str) -> tuple[str, str, bool]:
+        """Return (cap, id, still_exists). Query failures count as 'gone'."""
+        try:
+            result = await client.execute(
+                f"query Find{cap}($id: ID!) {{ find{cap}(id: $id) {{ id }} }}",
+                {"id": obj_id},
+            )
+            return cap, obj_id, result.get(f"find{cap}") is not None
+        except Exception:
+            # Query itself failed — treat as gone, best-effort.
+            return cap, obj_id, False
+
+    while pending and time.monotonic() < deadline:
+        # One round trip per (type, id) pair; gather them in parallel.
+        checks = [
+            _check_one(cap, obj_id) for cap, ids in pending.items() for obj_id in ids
+        ]
+        results = await asyncio.gather(*checks)
+
+        # Rebuild pending with only IDs that still exist.
+        new_pending: dict[str, set[str]] = {}
+        for cap, obj_id, still_exists in results:
+            if still_exists:
+                new_pending.setdefault(cap, set()).add(obj_id)
+        pending = new_pending
+
+        if pending:
+            await asyncio.sleep(poll_interval)
 
 
 @pytest.fixture

@@ -13,33 +13,71 @@ Organization:
 """
 
 import asyncio
+import faulthandler
 import gc
-import json
 import logging
 import os
 import shutil
+import sys
 import tempfile
+import threading
+import traceback
 from configparser import ConfigParser
 from contextlib import contextmanager, suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import perf_counter, sleep, time
 
-# Removed: from unittest.mock import MagicMock
-# Now using real factories from tests.fixtures instead of MagicMock
-import psutil
-import pytest
-import pytest_asyncio
-from loguru import logger
 
-from config import FanslyConfig
-from config.fanslyconfig import FanslyConfig as FanslyConfigClass
-from config.modes import DownloadMode
-from download.core import DownloadState
+# ---------------------------------------------------------------------------
+# Pre-import side effects (must run before project imports — see comments)
+# ---------------------------------------------------------------------------
 
-# Import all factories and fixtures using wildcard
-from tests.fixtures import *  # noqa: F403
-from tests.fixtures.utils.test_isolation import snowflake_id
+# Run BEFORE any project import that might transitively evaluate loguru
+# sink configuration. ``config/logging.py::init_logging_config`` reads
+# ``TESTING`` to decide ``enqueue=False`` (synchronous, safe) vs the
+# default ``enqueue=True`` (spawns a background worker thread per sink).
+#
+# In production ``enqueue=True`` lets log emission happen off the main
+# thread, but during pytest-xdist worker teardown the main thread enters
+# ``_Py_Finalize → flush_std_files`` while a loguru worker thread can
+# still be mid-``_bufferedwriter_flush_unlocked`` — that race trips
+# ``_enter_buffered_busy`` and the worker dies with SIGABRT (sometimes
+# SIGSEGV/SIGBUS depending on which buffer is corrupted at finalization).
+#
+# ``setdefault`` preserves an explicit ``TESTING=0 pytest ...`` override
+# for anyone deliberately exercising the production path.
+os.environ.setdefault("TESTING", "1")
+
+# Dump Python tracebacks of every thread on SIGSEGV/SIGFPE/SIGABRT/SIGBUS/
+# SIGILL before the process dies. Without this, xdist subprocess crashes
+# from C extensions (asyncpg, Pillow, leveldb, etc.) leave only the C
+# stack in the ``.ips`` report — no signal back to the Python code that
+# triggered them. Writes to the original stderr fd so it survives even
+# when pytest's capture is teardown-broken.
+faulthandler.enable(file=sys.stderr, all_threads=True)
+
+# Project + third-party imports follow. The E402 noqa is intentional:
+# the side-effect block above MUST run before these imports, because some
+# of them (config.*, anything that touches loguru) evaluate the
+# ``TESTING`` env at runtime via paths that can be triggered at
+# fixture-collection time.
+import psutil  # noqa: E402
+import pytest  # noqa: E402
+import pytest_asyncio  # noqa: E402
+from loguru import logger  # noqa: E402
+
+from config import FanslyConfig  # noqa: E402
+from config.fanslyconfig import FanslyConfig as FanslyConfigClass  # noqa: E402
+from config.modes import DownloadMode  # noqa: E402
+from download.core import DownloadState  # noqa: E402
+
+# Import all factories and fixtures using wildcard.
+# This pulls in the cleanup_* autouse fixtures from
+# tests/fixtures/utils/cleanup_fixtures.py — they fire on every test.
+from tests.fixtures import *  # noqa: F403,E402
+from tests.fixtures import DownloadStateFactory, FanslyConfigFactory  # noqa: E402
+from tests.fixtures.utils.test_isolation import snowflake_id  # noqa: E402
 
 
 # ============================================================================
@@ -47,21 +85,112 @@ from tests.fixtures.utils.test_isolation import snowflake_id
 # ============================================================================
 
 
+# Known-vendored thread fingerprints — bottom-of-stack file path substrings.
+# Only includes leaks we have NO fix path for (pure third-party plugins
+# whose threads can't be torn down from a fixture). Anything we've actively
+# fixed (JSPyBridge via _shutdown_js_bridge, fansly-ws via call_soon_threadsafe,
+# _do_watch_progress via stop_event, etc.) is INTENTIONALLY EXCLUDED so a
+# regression that bypasses our fix triggers the dump — silent on success,
+# loud when our fix breaks.
+_VENDORED_THREAD_PATHS: tuple[str, ...] = (
+    "/site-packages/pytest_rerunfailures",  # rerunfailures TCP server + per-worker connections
+)
+
+
 def pytest_unconfigure(config):
-    """Flush stdout/stderr before xdist worker shutdown.
+    """Flush stdout/stderr + dump UNFAMILIAR live-thread frames before xdist worker shutdown.
 
     Python 3.13 on macOS has a race in _Py_Finalize: if a daemon thread
     holds the stdout buffer lock when the main thread calls flush_std_files(),
     the interpreter hits _enter_buffered_busy → SIGABRT.
 
-    Flushing here — after all plugins have cleaned up but before the
-    interpreter shuts down — gives pending writes a window to complete.
-    """
-    import sys
+    The faulthandler ``all_threads=True`` we install at conftest import
+    time CANNOT show those daemon threads' Python frames in the abort path,
+    because by the time faulthandler fires (inside ``fatal_error`` inside
+    ``_Py_Finalize``), the daemon threads have already been detached via
+    ``PyThread_hang_thread`` — removed from ``interp->threads.head`` so
+    ``_Py_DumpTracebackThreads`` can't enumerate them.
 
+    This hook runs *before* finalize starts, while every live thread is
+    still in the interpreter's thread state list. We use ``sys._current_frames()``
+    (which works regardless of GIL state) to capture each thread's Python
+    stack and emit it to stderr. If a daemon thread is mid-``builtin_print``
+    or mid-FFmpeg-progress-readline, that's where the racing call site shows.
+
+    Threads from known-vendored sources (``_VENDORED_THREAD_PATHS``) are
+    counted but not dumped — pytest_rerunfailures' run_server + per-worker
+    run_connection threads are unfixable from a fixture and would be pure
+    noise. The dump fires only when an UNFAMILIAR live thread is found,
+    so any regression that re-introduces a fansly-ws / JSPyBridge events.loop /
+    _do_watch_progress / loguru-enqueue / RateLimiterDisplay / etc. leak is
+    loud, while the known-clean state is silent. JSPyBridge is intentionally
+    NOT vendored — we have a working fix (_shutdown_js_bridge), so a leak
+    return means the fix broke or got bypassed, which we want to know.
+    """
     with suppress(Exception):
         sys.stdout.flush()
     with suppress(Exception):
+        sys.stderr.flush()
+
+    with suppress(Exception):
+        main_id = threading.main_thread().ident
+        live = [t for t in threading.enumerate() if t.ident != main_id]
+        if not live:
+            return
+
+        frames = sys._current_frames()
+
+        # Classify each thread by walking ALL frames in its stack for a
+        # vendored-path match. We can't use just the deepest frame because
+        # that's always ``threading.py:_bootstrap`` for thread-spawned code.
+        # We can't use just the top frame either because the thread's parked
+        # call site (e.g. ``socket.py:accept``) is below the vendored frame.
+        # The vendored marker (e.g. pytest_rerunfailures.py:466 ``run_server``)
+        # sits in the middle of the stack — scan every frame for it.
+        unfamiliar: list[tuple[threading.Thread, object]] = []
+        vendored_count = 0
+        for thread in live:
+            frame = frames.get(thread.ident)
+            is_vendored = False
+            if frame is not None:
+                walker = frame
+                while walker is not None:
+                    if any(
+                        token in walker.f_code.co_filename
+                        for token in _VENDORED_THREAD_PATHS
+                    ):
+                        is_vendored = True
+                        break
+                    walker = walker.f_back
+            if is_vendored:
+                vendored_count += 1
+            else:
+                unfamiliar.append((thread, frame))
+
+        # Steady-state silent path: only known-vendored threads alive → no output.
+        if not unfamiliar:
+            return
+
+        print(
+            f"\n=== pytest_unconfigure: {len(unfamiliar)} unfamiliar non-main thread(s) "
+            f"alive at shutdown ({vendored_count} vendored ignored) "
+            f"— dumping Python frames before _Py_Finalize ===",
+            file=sys.stderr,
+        )
+        for thread, frame in unfamiliar:
+            print(
+                f"\n--- thread name={thread.name!r} ident={thread.ident} "
+                f"daemon={thread.daemon} alive={thread.is_alive()} ---",
+                file=sys.stderr,
+            )
+            if frame is None:
+                print("  (no Python frame — pure C-extension thread)", file=sys.stderr)
+            else:
+                traceback.print_stack(frame, file=sys.stderr)
+        print(
+            "=== end pytest_unconfigure thread dump ===\n",
+            file=sys.stderr,
+        )
         sys.stderr.flush()
 
 
@@ -126,6 +255,20 @@ def pytest_collection_modifyitems(config, items):
                     )
                 )
 
+            # Pin all ``message_media_generator`` consumers to a single
+            # xdist worker. The fixture picks images out of the shared
+            # Docker Stash pool; under multi-worker concurrency, two
+            # workers can race on the same image row — one creates a
+            # gallery + links it, the other reads the link, then the
+            # first worker's cleanup deletes the gallery before the
+            # second worker's ``imageUpdate`` can fire, and Stash rejects
+            # the now-stale gallery_id. Single Docker container, no per-
+            # worker isolation possible, so serial execution for this
+            # cluster is the only realistic mitigation. ``--dist=loadgroup``
+            # in ``pyproject.toml`` honors this marker.
+            if "message_media_generator" in item.fixturenames:
+                item.add_marker(pytest.mark.xdist_group(name="docker_stash_shared"))
+
 
 # ============================================================================
 # Helper Functions
@@ -182,6 +325,14 @@ async def cleanup_tasks():
                 await task
 
 
+# NOTE: cleanup_rich_progress_state, cleanup_loguru_handlers,
+# cleanup_global_config_state, cleanup_http_sessions, cleanup_mock_patches,
+# and cleanup_unawaited_coroutines all live in
+# ``tests/fixtures/utils/cleanup_fixtures.py`` (per CLAUDE.md fixture
+# location policy) and are wired into this conftest via the
+# ``from tests.fixtures import *`` wildcard at the top.
+
+
 @pytest.fixture(autouse=True)
 def setup_test_logging():
     """Set up logging for tests and clean up after.
@@ -236,60 +387,6 @@ def setup_test_logging():
 # ============================================================================
 # Test Data Fixtures
 # ============================================================================
-
-
-@pytest.fixture
-def json_timeline_data():
-    """Load timeline test data from JSON file.
-
-    Returns:
-        dict: Timeline API response data
-    """
-    fixtures_dir = Path(__file__).parent / "fixtures" / "json_data"
-    timeline_file = fixtures_dir / "timeline_response.json"
-
-    if not timeline_file.exists():
-        return {
-            "response": [],
-            "aggregationData": {},
-        }
-
-    with timeline_file.open() as f:
-        return json.load(f)
-
-
-@pytest.fixture
-def json_messages_group_data():
-    """Load messages group test data from JSON file.
-
-    Returns:
-        dict: Messages API response data
-    """
-    fixtures_dir = Path(__file__).parent / "fixtures" / "json_data"
-    messages_file = fixtures_dir / "messages_group_response.json"
-
-    if not messages_file.exists():
-        return {"response": [], "aggregationData": {}}
-
-    with messages_file.open() as f:
-        return json.load(f)
-
-
-@pytest.fixture
-def json_conversation_data():
-    """Load conversation test data from JSON file.
-
-    Returns:
-        dict: Conversation API response data
-    """
-    fixtures_dir = Path(__file__).parent / "fixtures" / "json_data"
-    conversation_file = fixtures_dir / "conversation_response.json"
-
-    if not conversation_file.exists():
-        return {"response": [], "aggregationData": {}}
-
-    with conversation_file.open() as f:
-        return json.load(f)
 
 
 # ============================================================================
@@ -504,8 +601,6 @@ def mock_download_config():
     Note: Now uses FanslyConfigFactory instead of MagicMock.
     For tests that need database access, use the 'config' fixture instead.
     """
-    from tests.fixtures import FanslyConfigFactory
-
     return FanslyConfigFactory(
         download_path=Path("/test/download/path"),
         program_version="0.0.0-test",
@@ -529,8 +624,6 @@ def mock_download_state():
 
     Note: Now uses DownloadStateFactory instead of MagicMock.
     """
-    from tests.fixtures import DownloadStateFactory
-
     creator_id = snowflake_id()
     return DownloadStateFactory(
         creator_id=creator_id,
@@ -648,9 +741,6 @@ def performance_tracker(performance_log_dir, request):
 __all__ = [
     "clean_model_data",
     "cleanup_tasks",
-    "json_conversation_data",
-    "json_messages_group_data",
-    "json_timeline_data",
     "mock_download_state",
     "performance_log_dir",
     "performance_threshold",

@@ -13,7 +13,11 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
 from stash_graphql_client import ServerCapabilities, StashContext
-from stash_graphql_client.errors import StashUnmappedFieldWarning, StashVersionError
+from stash_graphql_client.errors import (
+    StashCapabilityError,
+    StashUnmappedFieldWarning,
+    StashVersionError,
+)
 from stash_graphql_client.store import StashEntityStore
 from stash_graphql_client.types import (
     Gallery,
@@ -26,7 +30,7 @@ from stash_graphql_client.types import (
 )
 
 from metadata import Account, Database
-from pathio import set_create_directory_for_download
+from pathio import get_stash_path, set_create_directory_for_download
 from textio import print_error, print_info, print_warning
 
 from ..logging import debug_print
@@ -168,7 +172,7 @@ class StashProcessingBase(StashProcessingProtocol):
             logger.debug("No base_path set, skipping creator media preload")
             return
 
-        path_filter = str(self.state.base_path).rstrip("/")
+        path_filter = get_stash_path(self.state.base_path, self.config).rstrip("/")
         logger.info(f"Preloading creator media from: {path_filter}")
 
         self._scene_code_index.clear()
@@ -332,7 +336,7 @@ class StashProcessingBase(StashProcessingProtocol):
         }
         try:
             job_id = await self.context.client.metadata_scan(
-                paths=[str(self.state.base_path)],
+                paths=[get_stash_path(self.state.base_path, self.config)],
                 flags=flags,
             )
             print_info(f"Metadata scan job ID: {job_id}")
@@ -343,7 +347,10 @@ class StashProcessingBase(StashProcessingProtocol):
                     finished_job = await self.context.client.wait_for_job(job_id)
                 except Exception:
                     finished_job = False
-        except RuntimeError as e:
+        except (RuntimeError, ValueError) as e:
+            # ValueError catches the lib's own failure shape:
+            # stash_graphql_client's ``metadata_scan`` raises
+            # ``ValueError("Failed to start metadata scan: ...")``
             raise RuntimeError(f"Failed to process metadata: {e}") from e
 
     async def start_creator_processing(self) -> None:
@@ -368,6 +375,14 @@ class StashProcessingBase(StashProcessingProtocol):
         except StashVersionError as e:
             print_error(f"Stash server too old: {e}")
             print_warning("Minimum required: Stash v0.30.0 (appSchema 75)")
+            return
+        except StashCapabilityError as e:
+            # SGC 0.12.2+ raises this distinct from StashVersionError when a
+            # per-feature appSchema gate fails at use time. get_client() itself
+            # only does floor-version checking today, so this catch is defensive
+            # against future SGC versions that may surface capability checks
+            # earlier in the connect path.
+            print_error(f"Stash server missing required capability: {e}")
             return
         except RuntimeError as e:
             print_error(f"Failed to initialize Stash client: {e}")

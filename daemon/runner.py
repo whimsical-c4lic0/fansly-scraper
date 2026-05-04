@@ -40,6 +40,7 @@ import httpx
 from loguru import logger
 
 from api.websocket import FanslyWebSocket
+from api.websocket_subprocess import get_websocket_class
 from config.fanslyconfig import FanslyConfig
 from config.logging import websocket_logger as ws_logger
 from daemon.dashboard import (
@@ -151,11 +152,26 @@ def _make_ws(config: FanslyConfig) -> FanslyWebSocket:
         config: FanslyConfig instance with token and user_agent set.
 
     Returns:
-        A new FanslyWebSocket ready for ``start_background()``.
+        A new FanslyWebSocket ready for ``start_in_thread()``.
     """
-    return FanslyWebSocket(
+    return get_websocket_class(
+        use_subprocess=getattr(config, "monitoring_websocket_subprocess", False),
+    )(
         token=config.token or "",
         user_agent=config.user_agent or "",
+    )
+
+
+def _make_simulator(config: FanslyConfig) -> ActivitySimulator:
+    """Construct an ActivitySimulator from config monitoring values."""
+    return ActivitySimulator(
+        active_min=config.monitoring_active_duration_minutes,
+        idle_min=config.monitoring_idle_duration_minutes,
+        hidden_min=config.monitoring_hidden_duration_minutes,
+        timeline_poll_active_seconds=config.monitoring_timeline_poll_active_seconds,
+        timeline_poll_idle_seconds=config.monitoring_timeline_poll_idle_seconds,
+        story_poll_active_seconds=config.monitoring_story_poll_active_seconds,
+        story_poll_idle_seconds=config.monitoring_story_poll_idle_seconds,
     )
 
 
@@ -276,7 +292,9 @@ async def _handle_full_creator_item(
         await download_timeline(config, state)
         await download_stories(config, state, mark_viewed=False)
         await download_messages(config, state)
-        await download_wall(config, state)
+        if state.walls:
+            for wall_id in sorted(state.walls):
+                await download_wall(config, state, wall_id)
     except Exception as exc:
         logger.opt(exception=exc).error(
             "daemon.runner: FullCreatorDownload failed for {} - {}",
@@ -408,7 +426,19 @@ async def _handle_timeline_only_item(
         config: FanslyConfig instance.
         item: Work item specifying the creator whose timeline to download.
     """
-    state = DownloadState(creator_id=item.creator_id, creator_name="")
+    # Resolve creator_name from the local store first; an empty string
+    # would slip past the ``state.creator_name is None`` check in
+    # ``_get_account_response`` and produce ``/account?usernames=`` with
+    # no value. Mirrors _handle_full_creator_item:260.
+    creator_name = await _resolve_creator_name(item.creator_id)
+    if creator_name is None:
+        logger.warning(
+            "daemon.runner: skipping DownloadTimelineOnly - unknown creator {}",
+            item.creator_id,
+        )
+        return
+
+    state = DownloadState(creator_id=item.creator_id, creator_name=creator_name)
     try:
         await get_creator_account_info(config, state)
         await download_timeline(config, state)
@@ -758,7 +788,16 @@ async def _worker_loop(
 
             # Post-processing only runs on clean handler success (try/else).
             if isinstance(item, (FullCreatorDownload, DownloadTimelineOnly)):
-                if use_following:
+                # Refresh user_names only on FullCreatorDownload — that path
+                # originates from a confirmed-subscription WS event
+                # (svc=15/type=5/status=3) where a new creator may have just
+                # appeared in the following set. DownloadTimelineOnly comes
+                # from the /timeline/home poll, whose creators are already in
+                # the following set by construction; refreshing per item there
+                # fans out to ~30 account fetches per poll hit. The 5-min
+                # _following_refresh_loop + active-state/unhide refresh_event
+                # triggers cover the catch-up window.
+                if use_following and isinstance(item, FullCreatorDownload):
                     await _refresh_following(config)
                 await mark_creator_processed(item.creator_id)
 
@@ -781,6 +820,11 @@ async def _refresh_following(config: FanslyConfig) -> None:
     """
     try:
         state = DownloadState()
+        # Resolve client account first so state.creator_id is set;
+        # get_following_accounts requires it (otherwise raises
+        # RuntimeError("client ID not set") and the refresh silently
+        # no-ops). Mirrors fansly_downloader_ng.py:353-361.
+        await get_creator_account_info(config, state)
         new_names = await get_following_accounts(config, state)
         if new_names:
             config.user_names = new_names
@@ -907,8 +951,8 @@ async def _simulator_tick_loop(
         if transition == "unhide":
             refresh_event.set()
             try:
-                await ws.stop()
-                await ws.start_background()
+                await ws.stop_thread()
+                ws.start_in_thread()
                 dashboard.set_ws_state(True)
                 ws_logger.info("daemon.runner: WebSocket reconnected after unhide")
             except Exception as exc:
@@ -993,6 +1037,12 @@ def _make_ws_handler(
                     "_NOOP_DESCRIPTIONS in daemon/handlers.py",
                     service_id,
                     event_type,
+                )
+                ws_logger.trace(
+                    "daemon.runner: unknown event (svc={} type={}) payload - {}",
+                    service_id,
+                    event_type,
+                    inner,
                 )
             # Handled events that return None (filtered by their handler
             # OR an explicit no-op routed via _NOOP_DESCRIPTIONS) have
@@ -1084,7 +1134,7 @@ async def run_daemon(
         baseline_consumed = bootstrap.baseline_consumed
     else:
         queue = asyncio.Queue()
-        simulator = ActivitySimulator()
+        simulator = _make_simulator(config)
         baseline_consumed = set()
 
     budget = ErrorBudget(
@@ -1153,7 +1203,7 @@ async def _run_daemon_body(
             _make_ws_handler(simulator, queue, budget),
         )
         try:
-            await ws.start_background()
+            ws.start_in_thread()
             dashboard.set_ws_state(True)
             ws_logger.info("daemon.runner: WebSocket started")
         except Exception as exc:
@@ -1268,7 +1318,7 @@ async def _run_daemon_body(
             await asyncio.gather(worker_task, return_exceptions=True)
 
         try:
-            await ws.stop()
+            await ws.stop_thread()
         except Exception as exc:
             ws_logger.warning("daemon.runner: error stopping WebSocket - {}", exc)
 

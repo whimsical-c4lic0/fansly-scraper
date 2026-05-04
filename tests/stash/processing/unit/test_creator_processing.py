@@ -13,6 +13,7 @@ Key improvements:
 import asyncio
 import contextlib
 import json
+import logging
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -30,7 +31,12 @@ from tests.fixtures import (
     create_studio_dict,
 )
 from tests.fixtures.metadata.metadata_factories import AccountFactory
-from tests.fixtures.stash.stash_type_factories import JobFactory
+from tests.fixtures.stash.stash_api_fixtures import (
+    assert_op,
+    assert_op_with_vars,
+    dump_graphql_calls,
+)
+from tests.fixtures.stash.stash_type_factories import JobFactory, PerformerFactory
 
 
 # ============================================================================
@@ -86,7 +92,10 @@ class TestCreatorProcessing:
         await processor.context.get_client()
 
         # Call process_creator (no session= parameter)
-        account, performer = await processor.process_creator()
+        try:
+            account, performer = await processor.process_creator()
+        finally:
+            dump_graphql_calls(graphql_route.calls, "test_process_creator")
 
         # Verify Account came from real database
         assert account.id == real_account.id
@@ -98,30 +107,22 @@ class TestCreatorProcessing:
 
         # Verify respx was hit - check the HTTP call was made
         assert graphql_route.called
-        assert graphql_route.call_count >= 1
+        assert graphql_route.call_count == 1
 
-        # Inspect the GraphQL request to verify correct query and variables
+        # Inspect the GraphQL request to verify method/URL stayed correct
         request = graphql_route.calls[0].request
         assert request.method == "POST"
         assert "graphql" in str(request.url)
 
-        # Parse the GraphQL request body
-        request_body = json.loads(request.content)
-
-        # Verify it's a FindPerformers query
-        assert "findPerformers" in request_body.get("query", "")
-
-        # Verify the variables match what we expect
-        variables = request_body.get("variables", {})
-
+        # Verify findPerformers with name search (EQUALS) on displayName
         # New library: find_performer uses performer_filter with name/alias searches
         # Note: Library uses per_page=1 for find_one (not -1), don't assert on implementation details
-
-        # First call should be name search with EQUALS modifier
-        performer_filter = variables.get("performer_filter", {})
-        name_filter = performer_filter.get("name", {})
-        assert name_filter.get("value") == "Test User"  # displayName from Account
-        assert name_filter.get("modifier") == "EQUALS"
+        assert_op_with_vars(
+            graphql_route.calls[0],
+            "findPerformers",
+            performer_filter__name__value="Test User",  # displayName from Account
+            performer_filter__name__modifier="EQUALS",
+        )
 
     @pytest.mark.asyncio
     async def test_process_creator_no_account_raises_error(
@@ -222,12 +223,10 @@ class TestCreatorProcessing:
         assert graphql_route.call_count == 4
 
         # Verify first call was findPerformers
-        first_request = json.loads(graphql_route.calls[0].request.content)
-        assert "findPerformers" in first_request.get("query", "")
+        assert_op(graphql_route.calls[0], "findPerformers")
 
         # Verify fourth call was performerCreate
-        fourth_request = json.loads(graphql_route.calls[3].request.content)
-        assert "performerCreate" in fourth_request.get("query", "")
+        assert_op(graphql_route.calls[3], "performerCreate")
 
     @pytest.mark.asyncio
     async def test_find_existing_studio(self, entity_store, respx_stash_processor):
@@ -243,7 +242,6 @@ class TestCreatorProcessing:
 
         # Create performer for process_creator_studio
         # Note: Performer ID must be string(int) format until assigned by Stash
-        from tests.fixtures.stash.stash_type_factories import PerformerFactory
 
         performer = PerformerFactory.build(id="123", name="Test User")
 
@@ -296,39 +294,43 @@ class TestCreatorProcessing:
 
         # Call process_creator_studio directly with performer
         # (_find_existing_studio just wraps this with performer=None)
-        studio = await processor.process_creator_studio(
-            account=real_account,
-        )
+        try:
+            studio = await processor.process_creator_studio(
+                account=real_account,
+            )
+        finally:
+            dump_graphql_calls(graphql_route.calls, "test_find_existing_studio")
 
         # Verify studio came from GraphQL HTTP
         assert studio is not None
         assert studio.name == "test_user (Fansly)"
 
-        # Verify respx was hit multiple times (cache checks + Fansly network + studioCreate)
-        assert graphql_route.call_count >= 2
+        # Verify respx was hit exactly 3 times (Fansly network find + creator find + studioCreate)
+        assert graphql_route.call_count == 3
 
     @pytest.mark.asyncio
     async def test_start_creator_processing_no_stash_context(
-        self, entity_store, respx_stash_processor
+        self, entity_store, respx_stash_processor, caplog
     ):
         """Test start_creator_processing when stash_context_conn is not configured."""
+        caplog.set_level(logging.WARNING)
         processor = respx_stash_processor
         # Remove stash context
         processor.config.stash_context_conn = None
 
-        with patch("stash.processing.base.print_warning") as mock_print_warning:
-            # Call start_creator_processing
-            await processor.start_creator_processing()
+        await processor.start_creator_processing()
 
-            # Verify warning was printed
-            mock_print_warning.assert_called_once()
-            assert "not configured" in str(mock_print_warning.call_args)
+        # Verify the "not configured" warning was emitted via print_warning → loguru.
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        not_configured = [m for m in warnings if "not configured" in m]
+        assert len(not_configured) == 1
 
     @pytest.mark.asyncio
     async def test_start_creator_processing_stash_version_error(
-        self, entity_store, respx_stash_processor
+        self, entity_store, respx_stash_processor, caplog
     ):
         """Test start_creator_processing when Stash server is too old (lines 379-382)."""
+        caplog.set_level(logging.WARNING)
         processor = respx_stash_processor
         processor.config.stash_context_conn = {
             "scheme": "http",
@@ -337,27 +339,26 @@ class TestCreatorProcessing:
             "apikey": "",
         }
 
-        with (
-            patch.object(
-                processor.context,
-                "get_client",
-                new_callable=AsyncMock,
-                side_effect=StashVersionError("Server too old"),
-            ),
-            patch("stash.processing.base.print_error") as mock_error,
-            patch("stash.processing.base.print_warning") as mock_warning,
+        with patch.object(
+            processor.context,
+            "get_client",
+            new_callable=AsyncMock,
+            side_effect=StashVersionError("Server too old"),
         ):
             await processor.start_creator_processing()
 
-            mock_error.assert_called_once()
-            assert "too old" in str(mock_error.call_args)
-            mock_warning.assert_called_once()
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+        too_old_errors = [m for m in errors if "too old" in m]
+        assert len(too_old_errors) == 1
+        assert len(warnings) == 1
 
     @pytest.mark.asyncio
     async def test_start_creator_processing_runtime_error(
-        self, entity_store, respx_stash_processor
+        self, entity_store, respx_stash_processor, caplog
     ):
         """Test start_creator_processing when client init fails (lines 383-385)."""
+        caplog.set_level(logging.ERROR)
         processor = respx_stash_processor
         processor.config.stash_context_conn = {
             "scheme": "http",
@@ -366,19 +367,17 @@ class TestCreatorProcessing:
             "apikey": "",
         }
 
-        with (
-            patch.object(
-                processor.context,
-                "get_client",
-                new_callable=AsyncMock,
-                side_effect=RuntimeError("Connection refused"),
-            ),
-            patch("stash.processing.base.print_error") as mock_error,
+        with patch.object(
+            processor.context,
+            "get_client",
+            new_callable=AsyncMock,
+            side_effect=RuntimeError("Connection refused"),
         ):
             await processor.start_creator_processing()
 
-            mock_error.assert_called_once()
-            assert "Failed to initialize" in str(mock_error.call_args)
+        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+        init_errors = [m for m in errors if "Failed to initialize" in m]
+        assert len(init_errors) == 1
 
     @pytest.mark.asyncio
     async def test_start_creator_processing_with_stash_context(
@@ -496,17 +495,14 @@ class TestCreatorProcessing:
         # Call 0: connect_async
         # Calls 1-3: _preload_stash_entities (findPerformers, findTags, findStudios)
         # Call 4: metadataScan (scan_creator_folder)
-        call4_body = json.loads(graphql_route.calls[4].request.content)
-        assert "metadataScan" in call4_body.get("query", "")
+        assert_op(graphql_route.calls[4], "metadataScan")
 
         # Call 5: findJob (scan_creator_folder)
-        call5_body = json.loads(graphql_route.calls[5].request.content)
-        assert "findJob" in call5_body.get("query", "")
+        assert_op(graphql_route.calls[5], "findJob")
 
         # Calls 6-7: _preload_creator_media (findScenes, findImages)
         # Call 8: findPerformers (process_creator)
-        call8_body = json.loads(graphql_route.calls[8].request.content)
-        assert "findPerformers" in call8_body.get("query", "")
+        assert_op(graphql_route.calls[8], "findPerformers")
 
         # Verify orchestration: background task was created
         assert processor._background_task is not None
@@ -574,65 +570,94 @@ class TestCreatorProcessing:
         # Verify respx was hit 4 times (connect_async + metadataScan + 2x findJob)
         assert graphql_route.call_count == 4
 
-        # Verify first call was metadataScan
+        # Verify first call was metadataScan with the correct paths
+        assert_op(graphql_route.calls[1], "metadataScan")
         first_request = json.loads(graphql_route.calls[1].request.content)
-        assert "metadataScan" in first_request.get("query", "")
-        # Verify paths were sent
-        variables = first_request.get("variables", {})
-        input_data = variables.get("input", {})
+        input_data = first_request.get("variables", {}).get("input", {})
         assert str(processor.state.base_path) in input_data.get("paths", [])
 
-        # Verify second and third calls were findJob
-        second_request = json.loads(graphql_route.calls[2].request.content)
-        assert "findJob" in second_request.get("query", "")
-        assert second_request["variables"]["input"]["id"] == "job_123"
-
-        third_request = json.loads(graphql_route.calls[3].request.content)
-        assert "findJob" in third_request.get("query", "")
-        assert third_request["variables"]["input"]["id"] == "job_123"
+        # Verify second and third calls were findJob with the same job_id
+        assert_op_with_vars(graphql_route.calls[2], "findJob", input__id="job_123")
+        assert_op_with_vars(graphql_route.calls[3], "findJob", input__id="job_123")
 
     @pytest.mark.asyncio
     async def test_scan_creator_folder_metadata_scan_error(
         self, respx_stash_processor, tmp_path
     ):
-        """Test scan_creator_folder raises ValueError when metadataScan fails."""
+        """scan_creator_folder re-raises GraphQL failures as RuntimeError.
+
+        The lib's ``metadata_scan`` raises ``ValueError("Failed to start
+        metadata scan: ...")`` on transport/GraphQL errors (see
+        ``stash_graphql_client/client/mixins/metadata.py:201-203``). The
+        production except at ``stash/processing/base.py:346`` catches both
+        ``RuntimeError`` and ``ValueError`` and re-raises as the documented
+        ``RuntimeError("Failed to process metadata: ...")`` with the
+        original exception chained via ``raise ... from e``.
+        """
         processor = respx_stash_processor
-        # Setup
         processor.state.base_path = tmp_path / "creator_folder"
         processor.state.base_path.mkdir(parents=True, exist_ok=True)
 
-        # Mock GraphQL HTTP error response for metadataScan
+        # scan_creator_folder() first fetches ConfigurationDefaults (to get scan
+        # defaults), then issues the MetadataScan mutation. Both will hit this
+        # error response, and the code falls back to hardcoded defaults before
+        # raising on the scan itself. So exactly 2 GraphQL calls are expected.
         graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            return_value=httpx.Response(
-                200,
-                json={
-                    "data": {"metadataScan": None},
-                    "errors": [{"message": "Test error"}],
-                },
-            )
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json={
+                        "data": {"metadataScan": None},
+                        "errors": [{"message": "Test error"}],
+                    },
+                )
+            ]
+            * 2
         )
 
-        # Initialize client
         await processor.context.get_client()
 
-        # Expect ValueError with specific message (actual error type from code)
-        with pytest.raises(
-            ValueError, match=r"Failed to start metadata scan"
-        ) as excinfo:
-            await processor.scan_creator_folder()
+        try:
+            with pytest.raises(
+                RuntimeError, match=r"Failed to process metadata"
+            ) as excinfo:
+                await processor.scan_creator_folder()
+        finally:
+            dump_graphql_calls(
+                graphql_route.calls, "test_scan_creator_folder_metadata_scan_error"
+            )
 
-        # Verify error message includes both failure message and original error
+        # Outer message wraps the lib's ValueError via ``raise ... from e``.
+        assert "Failed to process metadata" in str(excinfo.value)
         assert "Failed to start metadata scan" in str(excinfo.value)
         assert "Test error" in str(excinfo.value)
+        # Cause is preserved as the lib's ValueError.
+        assert isinstance(excinfo.value.__cause__, ValueError)
+        assert "Failed to start metadata scan" in str(excinfo.value.__cause__)
 
-        # Verify respx was hit
-        assert graphql_route.called
+        # Exact count + per-call request + response verification.
+        assert len(graphql_route.calls) == 2, (
+            f"Expected exactly 2 GraphQL calls "
+            f"(ConfigurationDefaults + MetadataScan), got {len(graphql_route.calls)}"
+        )
+        assert_op(graphql_route.calls[0], "ConfigurationDefaults")
+        resp0 = graphql_route.calls[0].response.json()
+        assert resp0["errors"][0]["message"] == "Test error"
+
+        assert_op_with_vars(
+            graphql_route.calls[1],
+            "MetadataScan",
+            input__paths=[str(processor.state.base_path)],
+        )
+        resp1 = graphql_route.calls[1].response.json()
+        assert resp1["errors"][0]["message"] == "Test error"
 
     @pytest.mark.asyncio
     async def test_scan_creator_folder_no_base_path(
-        self, respx_stash_processor, tmp_path
+        self, respx_stash_processor, tmp_path, caplog
     ):
         """Test scan_creator_folder creates and uses download_path when base_path is None."""
+        caplog.set_level(logging.INFO)
         processor = respx_stash_processor
         # Setup: No base_path
         processor.state.base_path = None
@@ -669,36 +694,38 @@ class TestCreatorProcessing:
         # Initialize client
         await processor.context.get_client()
 
-        # Mock path creation utility (OK to patch utility functions)
-        with (
-            patch("stash.processing.base.print_info") as mock_print_info,
-            patch(
-                "stash.processing.base.set_create_directory_for_download"
-            ) as mock_set_path,
-        ):
+        # set_create_directory_for_download is a leaf utility that creates an
+        # actual directory on disk; patching it lets the test stay hermetic.
+        with patch(
+            "stash.processing.base.set_create_directory_for_download"
+        ) as mock_set_path:
             mock_set_path.return_value = created_path
 
             # Call scan_creator_folder
             await processor.scan_creator_folder()
 
-            # === PERMANENT GraphQL call sequence assertions ===
-            assert len(graphql_route.calls) == 3, (
-                f"Expected exactly 3 GraphQL calls, got {len(graphql_route.calls)}"
-            )
+        # === PERMANENT GraphQL call sequence assertions ===
+        assert len(graphql_route.calls) == 3, (
+            f"Expected exactly 3 GraphQL calls, got {len(graphql_route.calls)}"
+        )
 
-            # Call 2: metadataScan mutation with created path
-            call2_body = json.loads(graphql_route.calls[1].request.content)
-            assert "metadataScan" in call2_body.get("query", "")
-            assert str(created_path) in call2_body["variables"]["input"]["paths"]
+        # Call 2: metadataScan mutation with created path
+        assert_op(graphql_route.calls[1], "metadataScan")
+        call2_body = json.loads(graphql_route.calls[1].request.content)
+        assert str(created_path) in call2_body["variables"]["input"]["paths"]
 
-            # Verify path creation and state updates
-            mock_print_info.assert_any_call(
-                "No download path set, attempting to create one..."
-            )
-            mock_set_path.assert_called_once_with(processor.config, processor.state)
-            assert processor.state.download_path == created_path
-            # After fix: base_path should be updated to download_path
-            assert processor.state.base_path == created_path
+        # Verify the "No download path set" info log was emitted via print_info → loguru.
+        info_messages = [
+            r.getMessage() for r in caplog.records if r.levelname == "INFO"
+        ]
+        assert any(
+            "No download path set, attempting to create one..." in m
+            for m in info_messages
+        )
+        mock_set_path.assert_called_once_with(processor.config, processor.state)
+        assert processor.state.download_path == created_path
+        # After fix: base_path should be updated to download_path
+        assert processor.state.base_path == created_path
 
     @pytest.mark.asyncio
     async def test_scan_creator_folder_wait_for_job_exception_handling(

@@ -13,6 +13,7 @@ import asyncio
 from datetime import UTC, datetime
 
 import pytest
+import pytest_asyncio
 from stash_graphql_client import StashContext
 
 from config.fanslyconfig import FanslyConfig
@@ -26,6 +27,7 @@ from stash.processing.mixins.gallery import GalleryProcessingMixin
 from stash.processing.mixins.media import MediaProcessingMixin
 from stash.processing.mixins.studio import StudioProcessingMixin
 from stash.processing.mixins.tag import TagProcessingMixin
+from tests.fixtures.metadata.metadata_factories import PostFactory
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -130,7 +132,7 @@ class TestTagMixin(TestMixinBase):
 # ============================================================================
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def account_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for account mixin test class."""
     mixin = TestAccountMixin(config, test_state, stash_context, test_database_sync)
@@ -138,7 +140,7 @@ async def account_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def batch_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for batch mixin test class."""
     mixin = TestBatchMixin(config, test_state, stash_context, test_database_sync)
@@ -146,7 +148,7 @@ async def batch_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def content_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for content mixin test class."""
     mixin = TestContentMixin(config, test_state, stash_context, test_database_sync)
@@ -154,7 +156,7 @@ async def content_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def gallery_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for gallery mixin test class."""
     mixin = TestGalleryMixin(config, test_state, stash_context, test_database_sync)
@@ -162,7 +164,7 @@ async def gallery_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def media_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for media mixin test class with initialized client and database."""
     mixin = TestMediaMixin(
@@ -175,7 +177,7 @@ async def media_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def studio_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for studio mixin test class."""
     mixin = TestStudioMixin(config, test_state, stash_context, test_database_sync)
@@ -183,7 +185,7 @@ async def studio_mixin(config, test_state, stash_context, test_database_sync):
     return mixin
 
 
-@pytest.fixture
+@pytest_asyncio.fixture
 async def tag_mixin(config, test_state, stash_context, test_database_sync):
     """Fixture for TagProcessingMixin instance."""
     mixin = TestTagMixin(config, test_state, stash_context, test_database_sync)
@@ -202,8 +204,6 @@ def mock_item():
     Returns:
         Post: Real Post object (detached from database)
     """
-    from tests.fixtures.metadata.metadata_factories import PostFactory
-
     # Create real Post object (detached from database)
     acct_id = snowflake_id()
     item = PostFactory.build(

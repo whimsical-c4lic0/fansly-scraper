@@ -16,12 +16,15 @@ Usage:
 
     @respx.mock
     async def test_api_call(fansly_api_with_respx):
-        # Mock the edge (HTTP response)
+        # Mock the edge (HTTP response) — ALWAYS side_effect=[] per CLAUDE.md,
+        # never return_value (which would defeat retry-budget accounting).
         respx.get("https://apiv3.fansly.com/api/v1/account").mock(
-            return_value=httpx.Response(
-                200,
-                json={"success": True, "response": {"id": "123"}}
-            )
+            side_effect=[
+                httpx.Response(
+                    200,
+                    json={"success": True, "response": {"id": "123"}},
+                )
+            ]
         )
 
         # Test with real API instance
@@ -37,6 +40,8 @@ import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
+
 
 @pytest.fixture
 def fansly_api_with_respx():
@@ -51,9 +56,9 @@ def fansly_api_with_respx():
     Example:
         @respx.mock
         async def test_timeline(fansly_api_with_respx):
-            # Mock the HTTP response
+            # Mock the HTTP response — per-test routes must use side_effect=[].
             respx.get("https://apiv3.fansly.com/api/v1/timeline").mock(
-                return_value=httpx.Response(200, json={"response": []})
+                side_effect=[httpx.Response(200, json={"response": []})]
             )
 
             # Use real API
@@ -61,7 +66,6 @@ def fansly_api_with_respx():
             assert timeline == []
     """
     # Lazy import to avoid circular dependency
-    from api.fansly import FanslyApi
 
     api = FanslyApi(
         token="test_token",  # noqa: S106 # Test fixture token
@@ -85,7 +89,6 @@ def fansly_api():
         FanslyApi: Real API instance
     """
     # Lazy import to avoid circular dependency
-    from api.fansly import FanslyApi
 
     api = FanslyApi(
         token="test_token",  # noqa: S106 # Test fixture token
@@ -120,9 +123,6 @@ def fansly_api_factory():
         on_device_updated=None,
     ):
         """Create a FanslyApi instance with specified parameters."""
-        # Lazy import to avoid circular dependency
-        from api.fansly import FanslyApi
-
         if device_id_timestamp is None:
             device_id_timestamp = int(datetime.now(UTC).timestamp() * 1000)
 
@@ -161,9 +161,9 @@ def create_mock_json_response(
             {"success": True, "response": {"id": "123"}}
         )
 
-        # Use with respx
+        # Use with respx — per-test routes must use side_effect=[] per CLAUDE.md.
         respx.get("https://api.example.com/test").mock(
-            return_value=response
+            side_effect=[response]
         )
     """
     if json_data is None:
@@ -190,7 +190,7 @@ def mock_fansly_account_response():
         @respx.mock
         def test_account(fansly_api, mock_fansly_account_response):
             respx.get("https://apiv3.fansly.com/api/v1/account/123").mock(
-                return_value=httpx.Response(200, json=mock_fansly_account_response)
+                side_effect=[httpx.Response(200, json=mock_fansly_account_response)]
             )
     """
     return {
@@ -222,7 +222,7 @@ def mock_fansly_timeline_response():
         @respx.mock
         def test_timeline(fansly_api, mock_fansly_timeline_response):
             respx.get("https://apiv3.fansly.com/api/v1/timeline").mock(
-                return_value=httpx.Response(200, json=mock_fansly_timeline_response)
+                side_effect=[httpx.Response(200, json=mock_fansly_timeline_response)]
             )
     """
     return {
@@ -269,6 +269,10 @@ def respx_fansly_api(
     """
     mock_config._api = fansly_api
     with respx.mock:
+        # Intentional `return_value` — this is a fixture-level blanket CORS
+        # preflight that must respond to every OPTIONS request throughout the
+        # test. `side_effect=[Response(200)]` would exhaust after one call.
+        # Per-test GET/POST routes still must use `side_effect=[...]`.
         respx.route(method="OPTIONS").mock(return_value=httpx.Response(200))
         yield
 
@@ -285,6 +289,18 @@ def dump_fansly_calls(calls, label: str = "Fansly API calls") -> None:
         finally:
             dump_fansly_calls(route.calls)
 
+    Handles three response states per call:
+
+    - **Response present** (normal case): prints status code.
+    - **No response** (``side_effect=[<Exception>]`` raised before producing a
+      response): prints ``"NO RESPONSE (exception raised)"``. Without this
+      branch, accessing ``call.response`` would raise ``ValueError`` from
+      respx and the dump itself would crash inside the test's ``finally:`` —
+      masking the real failure with a fixture-side error.
+    - **Bad call object** (defensive): any other AttributeError/ValueError
+      from ``call.request``/``call.response`` is caught + reported so the
+      dumper never raises during teardown.
+
     Args:
         calls: respx route.calls or respx.calls list
         label: Header label for the output
@@ -293,9 +309,22 @@ def dump_fansly_calls(calls, label: str = "Fansly API calls") -> None:
     print(f"  {label} ({len(calls)} total)")
     print(f"{'=' * 70}")
     for i, call in enumerate(calls):
-        req = call.request
-        resp = call.response
-        status = resp.status_code if resp else "NO RESPONSE"
+        try:
+            req = call.request
+        except Exception as exc:  # pragma: no cover  (defensive — shouldn't happen)
+            print(f"\n  [{i}] <unable to access call.request: {exc!r}>")
+            continue
+
+        # ``call.response`` raises ValueError when respx's side_effect was an
+        # Exception class/instance (no Response was produced). Use the
+        # ``has_response`` / ``optional_response`` API to handle that
+        # gracefully.
+        if getattr(call, "has_response", True):
+            resp = call.optional_response
+            status = resp.status_code if resp is not None else "NO RESPONSE"
+        else:
+            status = "NO RESPONSE (exception raised)"
+
         print(f"\n  [{i}] {req.method} {req.url}")
         if req.content:
             print(f"      body: {req.content[:200]}")

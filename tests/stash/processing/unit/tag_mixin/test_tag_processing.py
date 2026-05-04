@@ -9,11 +9,18 @@ import respx
 
 from tests.fixtures import (
     HashtagFactory,
+    SceneFactory,
     TagFactory,
+    create_find_scenes_result,
     create_find_tags_result,
     create_graphql_response,
     create_tag_create_result,
     create_tag_dict,
+)
+from tests.fixtures.stash.stash_api_fixtures import (
+    assert_op,
+    assert_op_with_vars,
+    dump_graphql_calls,
 )
 
 
@@ -31,7 +38,7 @@ async def test_process_hashtags_to_tags_empty(respx_stash_processor):
     """Test processing an empty list of hashtags."""
     # Note: respx_stash_processor already has respx.mock wrapper
     respx.post("http://localhost:9999/graphql").mock(
-        return_value=httpx.Response(200, json={"data": {}})
+        side_effect=[httpx.Response(200, json={"data": {}})]
     )
 
     hashtags = []
@@ -61,10 +68,12 @@ async def test_process_hashtags_to_tags_single(respx_stash_processor):
     # Mock GraphQL responses
     find_tags_result = create_find_tags_result(count=1, tags=[tag_dict])
     respx.post("http://localhost:9999/graphql").mock(
-        return_value=httpx.Response(
-            200,
-            json=create_graphql_response("findTags", find_tags_result),
-        )
+        side_effect=[
+            httpx.Response(
+                200,
+                json=create_graphql_response("findTags", find_tags_result),
+            )
+        ]
     )
 
     # Test processing hashtag
@@ -162,17 +171,18 @@ async def test_process_hashtags_to_tags_multiple(respx_stash_processor):
 async def test_add_preview_tag_not_found(respx_stash_processor):
     """Test add_preview_tag when Trailer tag doesn't exist."""
     # Create Scene using factory
-    from tests.fixtures import SceneFactory
 
     scene = SceneFactory.build(id="300", title="Test Scene", tags=[])
 
     # Mock empty findTags response
     empty_result = create_find_tags_result(count=0, tags=[])
     respx.post("http://localhost:9999/graphql").mock(
-        return_value=httpx.Response(
-            200,
-            json=create_graphql_response("findTags", empty_result),
-        )
+        side_effect=[
+            httpx.Response(
+                200,
+                json=create_graphql_response("findTags", empty_result),
+            )
+        ]
     )
 
     # Test with scene
@@ -186,7 +196,6 @@ async def test_add_preview_tag_not_found(respx_stash_processor):
 async def test_add_preview_tag_found_adds_tag(respx_stash_processor):
     """Test add_preview_tag when Trailer tag exists and is added."""
     # Create Scene using factory
-    from tests.fixtures import SceneFactory
 
     scene = SceneFactory.build(id="300", title="Test Scene", tags=[])
 
@@ -194,20 +203,47 @@ async def test_add_preview_tag_found_adds_tag(respx_stash_processor):
     trailer_tag_dict = create_tag_dict(id="400", name="Trailer")
     result = create_find_tags_result(count=1, tags=[trailer_tag_dict])
 
-    respx.post("http://localhost:9999/graphql").mock(
-        return_value=httpx.Response(
-            200,
-            json=create_graphql_response("findTags", result),
-        )
+    # _add_preview_tag makes exactly 2 GraphQL calls:
+    #   1. findTags — look up the Trailer tag by name
+    #   2. findScenes — dedup check: are there scenes that already have the tag?
+    empty_scenes = create_find_scenes_result(count=0, scenes=[])
+    graphql_route = respx.post("http://localhost:9999/graphql").mock(
+        side_effect=[
+            httpx.Response(200, json=create_graphql_response("findTags", result)),
+            httpx.Response(
+                200, json=create_graphql_response("findScenes", empty_scenes)
+            ),
+        ]
     )
 
-    # Test with scene
-    await respx_stash_processor._add_preview_tag(scene)
+    try:
+        await respx_stash_processor._add_preview_tag(scene)
+    finally:
+        dump_graphql_calls(graphql_route.calls, "test_add_preview_tag_found_adds_tag")
 
     # Verify the tag was added to scene
     assert len(scene.tags) == 1
     assert scene.tags[0].id == "400"
     assert scene.tags[0].name == "Trailer"
+
+    # Exact count + per-call request + response verification.
+    assert len(graphql_route.calls) == 2, (
+        f"Expected exactly 2 calls (findTags + findScenes), "
+        f"got {len(graphql_route.calls)}"
+    )
+    # Call 0: findTags filtering on "Trailer"
+    assert_op_with_vars(
+        graphql_route.calls[0],
+        "findTags",
+        tag_filter__name__value="Trailer",
+    )
+    resp0 = graphql_route.calls[0].response.json()
+    assert resp0["data"]["findTags"]["count"] == 1
+    assert resp0["data"]["findTags"]["tags"][0]["name"] == "Trailer"
+    # Call 1: findScenes dedup check (tags.value includes the found tag id)
+    assert_op(graphql_route.calls[1], "findScenes")
+    resp1 = graphql_route.calls[1].response.json()
+    assert resp1["data"]["findScenes"]["count"] == 0
 
 
 @pytest.mark.asyncio
@@ -217,7 +253,6 @@ async def test_add_preview_tag_already_has_tag(respx_stash_processor):
     trailer_tag = TagFactory.build(id="400", name="Trailer")
 
     # Create Scene with Trailer tag already added
-    from tests.fixtures import SceneFactory
 
     scene = SceneFactory.build(
         id="300",
@@ -230,10 +265,12 @@ async def test_add_preview_tag_already_has_tag(respx_stash_processor):
     result = create_find_tags_result(count=1, tags=[trailer_tag_dict])
 
     respx.post("http://localhost:9999/graphql").mock(
-        return_value=httpx.Response(
-            200,
-            json=create_graphql_response("findTags", result),
-        )
+        side_effect=[
+            httpx.Response(
+                200,
+                json=create_graphql_response("findTags", result),
+            )
+        ]
     )
 
     # Test with scene

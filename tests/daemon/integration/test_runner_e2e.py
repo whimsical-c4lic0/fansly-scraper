@@ -14,23 +14,20 @@ the download logic itself.  Coverage for those functions is owned by
 from __future__ import annotations
 
 import asyncio
-import json
-from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 from unittest.mock import AsyncMock, PropertyMock, patch
 
 import httpx
 import pytest
-import pytest_asyncio
 import respx
 from loguru import logger
 
 from daemon.runner import run_daemon
 from daemon.simulator import ActivitySimulator
 from metadata.models import MonitorState
+from tests.fixtures.api import FakeWS, make_fake_ws_factory
 from tests.fixtures.api.api_fixtures import dump_fansly_calls
-from tests.fixtures.metadata.metadata_factories import AccountFactory
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -44,73 +41,6 @@ TIMELINE_NEW_BASE_URL = "https://apiv3.fansly.com/api/v1/timelinenew/"
 
 
 # ---------------------------------------------------------------------------
-# FakeWS — minimal WebSocket stub
-# ---------------------------------------------------------------------------
-
-
-class FakeWS:
-    """Minimal WebSocket stub for injection via ``ws_factory``.
-
-    Provides ``register_handler``, ``start_background``, ``stop``, and
-    ``fire``.  No network connection is established.
-    """
-
-    MSG_SERVICE_EVENT = 10000
-
-    def __init__(self) -> None:
-        self.started = False
-        self.stopped = False
-        self._handlers: dict[int, Callable] = {}
-
-    def register_handler(self, message_type: int, handler: Callable) -> None:
-        """Record the handler for the given message type."""
-        self._handlers[message_type] = handler
-
-    async def start_background(self) -> None:
-        """Simulate background start without network."""
-        self.started = True
-
-    async def stop(self) -> None:
-        """Simulate stop."""
-        self.stopped = True
-
-    async def fire(
-        self, service_id: int, event_type: int, inner: dict[str, Any]
-    ) -> None:
-        """Fire a MSG_SERVICE_EVENT with the given service/event/payload.
-
-        Constructs the envelope dict that _handle_message passes to the
-        registered handler after type-10000 dispatch.
-        """
-        envelope = {
-            "serviceId": service_id,
-            "event": json.dumps({"type": event_type, **inner}),
-        }
-        handler = self._handlers.get(self.MSG_SERVICE_EVENT)
-        if handler is not None:
-            if asyncio.iscoroutinefunction(handler):
-                await handler(envelope)
-            else:
-                handler(envelope)
-
-
-def _fake_ws_factory(fake_ws: FakeWS) -> Callable:
-    """Return a ws_factory callable that always yields *fake_ws*.
-
-    Args:
-        fake_ws: The FakeWS instance to return from the factory.
-
-    Returns:
-        A callable with signature ``(config) -> FakeWS``.
-    """
-
-    def _factory(config: Any) -> FakeWS:
-        return fake_ws
-
-    return _factory
-
-
-# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -121,23 +51,10 @@ def fake_ws() -> FakeWS:
     return FakeWS()
 
 
-@pytest_asyncio.fixture
-async def saved_account(entity_store):
-    """Create and persist a test Account to satisfy FK constraints."""
-    account = AccountFactory.build()
-    await entity_store.save(account)
-    return account
-
-
-@pytest.fixture
-def config_wired(config, entity_store, fansly_api):
-    """Config wired with a real FanslyApi and entity_store singleton set.
-
-    ``entity_store`` is listed in the signature so the store singleton is
-    initialised before any polling/filter functions call ``get_store()``.
-    """
-    config._api = fansly_api
-    return config
+# `saved_account` and `config_wired` come from the canonical fixtures
+# (tests/fixtures/metadata/metadata_fixtures.py and tests/fixtures/core/
+# config_fixtures.py respectively) via the wildcard import in tests/conftest.py.
+# Per Cat L policy: don't redefine here.
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +131,7 @@ class TestRunDaemonE2E:
             task = asyncio.create_task(
                 run_daemon(
                     config_wired,
-                    ws_factory=_fake_ws_factory(fake_ws),
+                    ws_factory=make_fake_ws_factory(fake_ws),
                     stop_event=stop_event,
                 )
             )
