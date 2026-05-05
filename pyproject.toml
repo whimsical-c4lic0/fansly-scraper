@@ -1,6 +1,6 @@
 [project]
 name = "fansly-scraper"
-version = "0.13.2"
+version = "0.13.3"
 description = "Easy-to-use fansly.com content scraping tool. Enjoy your Fansly content offline anytime, anywhere in the highest possible content resolution! Fully customizable to download in bulk or single: photos, videos & audio from the timeline, messages, collection & single posts."
 authors = [
     {name ="prof79"},
@@ -51,10 +51,10 @@ httpx-retries = ">=0.4.3"
 ffmpeg-python = ">=0.2.0"
 jsbeautifier = ">=1.15.4"
 javascript = ">=1!1.2.6"
-stash-graphql-client = ">=0.12.4"
-av = "^17.0.0"
-ruamel-yaml = "^0.19.1"
-filelock = "^3.29.0"
+stash-graphql-client = ">=0.12.5"
+av = ">=17.0.0,<18.0.0"
+ruamel-yaml = ">=0.19.1,<0.20.0"
+filelock = ">=3.29.0,<4.0.0"
 
 
 [tool.poetry.group.browser-auth]
@@ -74,8 +74,8 @@ pylint = ">=3.3.3"
 pre-commit = ">=4.0.1"
 bandit = {extras = ["toml"], version = ">=1.8.0"}
 ruff = ">=0.14.2"
-mkdocs = "^1.6.1"
-pymdown-extensions = "^10.21.2"
+mkdocs = ">=1.6.1,<2.0.0"
+pymdown-extensions = ">=10.21.2,<11.0.0"
 
 [tool.poetry.group.typing]
 optional = true
@@ -99,12 +99,12 @@ pytest-timeout = ">=2.3.1"
 pytest-randomly = ">=3.16.0"
 pytest-mock = ">=3.14.0"
 pytest-xdist = ">=3.6.1"
-coverage = {extras = ["toml"], version = ">=7.8"}
+coverage = {extras = ["toml"], version = ">=7.8,<8.0"}
 psutil = ">=7.0.0"
 pytest-loguru = ">=0.4.0"
 factory-boy = ">=3.3.3"
 pytest-rerunfailures = ">=16.1"
-respx = "^0.22.0"
+respx = ">=0.22.0,<1.0.0"
 
 
 [tool.bandit]
@@ -241,7 +241,6 @@ max-complexity = 14
 ]
 "metadata/*.py" = [
     "N815",     # mixedCase variable names match Fansly API response format
-    "PLC0415",  # imports inside functions to avoid circular dependencies
 ]
 "tests/fixtures/*.py" = [
     "N815",    # test factories mirror metadata models with camelCase fields
@@ -261,31 +260,9 @@ max-complexity = 14
 ]
 "stash/**/*.py" = [
     "TID252",   # relative imports are standard in this package structure
-    "PLC0415",  # imports inside functions to avoid circular dependencies
 ]
 "tests/stash/**/*.py" = [
     "TID252",   # relative imports for test fixtures
-]
-"config/*.py" = [
-    "PLC0415",  # imports inside functions to avoid circular dependencies
-]
-"download/*.py" = [
-    "PLC0415",  # imports inside functions to avoid circular dependencies
-]
-"api/*.py" = [
-    "PLC0415",  # conditional imports and circular import avoidance
-]
-"helpers/*.py" = [
-    "PLC0415",  # conditional imports and circular import avoidance
-]
-"fileio/*.py" = [
-    "PLC0415",  # imports inside functions to avoid circular dependencies
-]
-"scripts/*.py" = [
-    "PLC0415",  # script-specific lazy imports
-]
-"fansly_downloader_ng.py" = [
-    "PLC0415",  # lazy imports for optional dependencies and circular imports
 ]
 "**/conftest.py" = ["F401", "F811"]
 

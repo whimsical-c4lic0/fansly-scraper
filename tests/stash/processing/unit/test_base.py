@@ -2,16 +2,10 @@
 
 from datetime import UTC, datetime
 
-import httpx
 import pytest
 import respx
 
 from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
-from tests.fixtures.stash.stash_graphql_fixtures import (
-    create_graphql_response,
-    create_performer_dict,
-    create_tag_dict,
-)
 from tests.fixtures.stash.stash_type_factories import (
     ImageFactory,
     ImageFileFactory,
@@ -78,7 +72,7 @@ class TestSceneIndexing:
         respx_stash_processor._index_scene_files(scene)
 
         assert "987654" in respx_stash_processor._scene_code_index
-        assert respx_stash_processor._scene_code_index["987654"] == [scene]
+        assert respx_stash_processor._scene_code_index["987654"] == ["100"]
 
     def test_index_scene_with_preview_id_marker(self, respx_stash_processor):
         """Scene files with _preview_id_ marker are indexed (line 230)."""
@@ -100,24 +94,26 @@ class TestSceneIndexing:
 
         assert len(respx_stash_processor._scene_code_index) == 0
 
-    def test_find_scenes_deduplicates(self, respx_stash_processor):
+    @pytest.mark.asyncio
+    async def test_find_scenes_deduplicates(self, respx_stash_processor):
         """find_scenes_by_media_codes deduplicates by ID (lines 258-264)."""
         video1 = VideoFileFactory(
             path="/downloads/creator/2024_01_15_at_12_00_00_UTC_id_555.mp4"
         )
         scene = SceneFactory(id="200", files=[video1])
+        respx_stash_processor.store.add(scene)
 
-        # Index the same scene twice (e.g., matched by both _id_ and _preview_id_)
-        respx_stash_processor._scene_code_index["555"].append(scene)
-        respx_stash_processor._scene_code_index["555"].append(scene)
+        respx_stash_processor._scene_code_index["555"].append(scene.id)
+        respx_stash_processor._scene_code_index["555"].append(scene.id)
 
-        result = respx_stash_processor.find_scenes_by_media_codes(["555"])
+        result = await respx_stash_processor.find_scenes_by_media_codes(["555"])
 
         assert len(result["555"]) == 1  # Deduplicated by ID
 
-    def test_find_scenes_no_match(self, respx_stash_processor):
+    @pytest.mark.asyncio
+    async def test_find_scenes_no_match(self, respx_stash_processor):
         """find_scenes_by_media_codes returns empty for unmatched codes (line 257)."""
-        result = respx_stash_processor.find_scenes_by_media_codes(["nonexistent"])
+        result = await respx_stash_processor.find_scenes_by_media_codes(["nonexistent"])
         assert result == {}
 
 
@@ -134,7 +130,7 @@ class TestImageIndexing:
         respx_stash_processor._index_image_files(image)
 
         assert "333444" in respx_stash_processor._image_code_index
-        assert respx_stash_processor._image_code_index["333444"] == [image]
+        assert respx_stash_processor._image_code_index["333444"] == ["300"]
 
     def test_index_image_no_visual_files_skips(self, respx_stash_processor):
         """Image without visual_files is skipped (line 239-240)."""
@@ -145,23 +141,26 @@ class TestImageIndexing:
 
         assert len(respx_stash_processor._image_code_index) == 0
 
-    def test_find_images_deduplicates(self, respx_stash_processor):
+    @pytest.mark.asyncio
+    async def test_find_images_deduplicates(self, respx_stash_processor):
         """find_images_by_media_codes deduplicates by ID (lines 275-281)."""
         img_file = ImageFileFactory(
             path="/downloads/creator/2024_01_15_at_12_00_00_UTC_id_666.jpg"
         )
         image = ImageFactory(id="400", visual_files=[img_file])
+        respx_stash_processor.store.add(image)
 
-        respx_stash_processor._image_code_index["666"].append(image)
-        respx_stash_processor._image_code_index["666"].append(image)
+        respx_stash_processor._image_code_index["666"].append(image.id)
+        respx_stash_processor._image_code_index["666"].append(image.id)
 
-        result = respx_stash_processor.find_images_by_media_codes(["666"])
+        result = await respx_stash_processor.find_images_by_media_codes(["666"])
 
         assert len(result["666"]) == 1
 
-    def test_find_images_no_match(self, respx_stash_processor):
+    @pytest.mark.asyncio
+    async def test_find_images_no_match(self, respx_stash_processor):
         """find_images_by_media_codes returns empty for unmatched codes."""
-        result = respx_stash_processor.find_images_by_media_codes(["nope"])
+        result = await respx_stash_processor.find_images_by_media_codes(["nope"])
         assert result == {}
 
 
@@ -184,61 +183,22 @@ class TestPreloadEntities:
     """Test _preload_stash_entities and _preload_creator_media."""
 
     @pytest.mark.asyncio
-    async def test_preload_entities_with_data(self, respx_stash_processor):
-        """_preload_stash_entities iterates yielded entities (line 146)."""
-        performer = create_performer_dict(id="5703", name="Performer One")
-        tag = create_tag_dict(id="102", name="Tag One")
-        studio_dict = {"id": "10402", "name": "Studio One", "urls": []}
+    async def test_preload_entities_makes_no_network_calls(self, respx_stash_processor):
+        """_preload_stash_entities only configures TTLs — no GraphQL fetch.
 
-        route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findPerformers", {"count": 1, "performers": [performer]}
-                    ),
-                ),
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findTags", {"count": 1, "tags": [tag]}
-                    ),
-                ),
-                httpx.Response(
-                    200,
-                    json=create_graphql_response(
-                        "findStudios", {"count": 1, "studios": [studio_dict]}
-                    ),
-                ),
-            ]
-        )
+        Mixin call sites use the ``store.filter() → store.find_one()``
+        pattern, which lazy-populates the cache as entities are looked up.
+        """
+        route = respx.post("http://localhost:9999/graphql").mock(side_effect=[])
 
         try:
             await respx_stash_processor._preload_stash_entities()
         finally:
-            dump_graphql_calls(route.calls, "test_preload_entities_with_data")
+            dump_graphql_calls(
+                route.calls, "test_preload_entities_makes_no_network_calls"
+            )
 
-        assert route.call_count == 3
-
-    @pytest.mark.asyncio
-    async def test_preload_entities_exception(self, respx_stash_processor):
-        """_preload_stash_entities catches exceptions (lines 153-154)."""
-        route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[
-                httpx.Response(
-                    200,
-                    json={
-                        "errors": [{"message": "server error"}],
-                        "data": None,
-                    },
-                ),
-            ]
-        )
-
-        try:
-            await respx_stash_processor._preload_stash_entities()
-        finally:
-            dump_graphql_calls(route.calls, "test_preload_entities_exception")
+        assert route.call_count == 0
 
     @pytest.mark.asyncio
     async def test_preload_no_base_path(self, respx_stash_processor):

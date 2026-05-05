@@ -7,7 +7,15 @@ import traceback
 from typing import TYPE_CHECKING
 
 from stash_graphql_client import StashContext
-from stash_graphql_client.types import Gallery, GalleryChapter, Image, Performer, Scene
+from stash_graphql_client.types import (
+    Gallery,
+    GalleryChapter,
+    Image,
+    ImageFile,
+    Performer,
+    Scene,
+    VideoFile,
+)
 
 from helpers.rich_progress import get_progress_manager
 from metadata import Account, Database
@@ -172,14 +180,25 @@ class StashProcessing(
             self._studio = None
             self._scene_code_index.clear()
             self._image_code_index.clear()
-            for entity_type in (Gallery, GalleryChapter, Scene, Image):
+            for entity_type in (
+                Gallery,
+                GalleryChapter,
+                Scene,
+                Image,
+                VideoFile,
+                ImageFile,
+            ):
                 self.store.invalidate_type(entity_type)
-            logger.debug("Invalidated per-creator entity caches and media code indexes")
 
             performer_name = (
                 performer.name if isinstance(performer, Performer) else repr(performer)
             )
-            print_info(f"Finished Stash processing for {performer_name}")
+            stats = self.store.cache_stats()
+            by_type = ", ".join(f"{k}={v}" for k, v in sorted(stats.by_type.items()))
+            print_info(
+                f"Finished Stash processing for {performer_name} "
+                f"(cache: {stats.total_entries} entries — {by_type})"
+            )
 
 
 # Export main class

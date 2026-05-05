@@ -69,8 +69,8 @@ class StashProcessingBase(StashProcessingProtocol):
     _performer: Performer | None
     _studio: Studio | None
     _stash_parent_task: str | None
-    _scene_code_index: dict[str, list[Scene]]
-    _image_code_index: dict[str, list[Image]]
+    _scene_code_index: dict[str, list[str]]
+    _image_code_index: dict[str, list[str]]
 
     def __init__(
         self,
@@ -109,8 +109,8 @@ class StashProcessingBase(StashProcessingProtocol):
         self._stash_parent_task: str | None = None
 
         # Media code indexes — filename pattern: {date}_at_{time}_UTC_id_{media_id}.{ext}
-        self._scene_code_index: dict[str, list[Scene]] = defaultdict(list)
-        self._image_code_index: dict[str, list[Image]] = defaultdict(list)
+        self._scene_code_index: dict[str, list[str]] = defaultdict(list)
+        self._image_code_index: dict[str, list[str]] = defaultdict(list)
 
     @property
     def store(self) -> StashEntityStore:
@@ -127,36 +127,19 @@ class StashProcessingBase(StashProcessingProtocol):
         return self.context.capabilities
 
     async def _preload_stash_entities(self) -> None:
-        """Preload shared entities (Tags, Performers, Studios) into identity map.
+        """Configure cache TTLs for Stash entity types.
 
-        Sets TTL to None (no expiration) since the script is the sole writer
-        to Stash during processing. These entities are shared across creators
-        and persist for the entire run. Per-creator entities (Gallery, Image,
-        Scene) also get TTL=None but are invalidated per-creator.
+        Pins TTL to None (no expiration) since the script is the sole writer
+        to Stash during processing — cached entities stay valid for the run.
+        Mixin call sites use the ``store.filter(...) → store.find_one(...)``
+        pattern, so the cache populates lazily as entities are actually
+        looked up; no upfront fetch is needed.
+
+        Per-creator entities (Gallery, Image, Scene) also get TTL=None but
+        are invalidated per-creator (see processing/__init__.py).
         """
-        logger.info("Preloading shared Stash entities into identity map...")
-
-        try:
-            # find_iter() avoids the 1000-result limit on find()
-            for entity_type in (Performer, Tag, Studio):
-                self.store.set_ttl(entity_type, None)
-                count = 0
-                async for _ in self.store.find_iter(entity_type, query_batch=500):
-                    count += 1
-                logger.info(f"Preloaded {count} {entity_type.__name__}s")
-
-            # Per-creator entities — never expire, but invalidated per-creator
-            for entity_type in (Gallery, Image, Scene):
-                self.store.set_ttl(entity_type, None)
-
-        except Exception as e:
-            logger.warning(f"Failed to preload entities (continuing anyway): {e}")
-
-        stats = self.store.cache_stats()
-        logger.info(
-            f"Cache after shared preload: {stats.total_entries} entries "
-            f"({', '.join(f'{k}: {v}' for k, v in sorted(stats.by_type.items()))})"
-        )
+        for entity_type in (Performer, Tag, Studio, Gallery, Image, Scene):
+            self.store.set_ttl(entity_type, None)
 
     async def _preload_creator_media(self) -> None:
         """Preload Galleries, Images, and Scenes for current creator into identity map.
@@ -213,7 +196,7 @@ class StashProcessingBase(StashProcessingProtocol):
         )
 
     def _index_scene_files(self, scene: Scene) -> None:
-        """Index a scene's files by media code for O(1) lookups."""
+        """Index a scene's files by media code."""
         if not is_set(scene.files) or not scene.files:
             return
         for f in scene.files:
@@ -226,10 +209,10 @@ class StashProcessingBase(StashProcessingProtocol):
                         after_marker = f.path.split(marker)[-1]
                         media_code = after_marker.split(".")[0]
                         if media_code:
-                            self._scene_code_index[media_code].append(scene)
+                            self._scene_code_index[media_code].append(scene.id)
 
     def _index_image_files(self, image: Image) -> None:
-        """Index an image's visual files by media code for O(1) lookups."""
+        """Index an image's visual files by media code."""
         if not is_set(image.visual_files) or not image.visual_files:
             return
         for f in image.visual_files:
@@ -239,41 +222,55 @@ class StashProcessingBase(StashProcessingProtocol):
                         after_marker = f.path.split(marker)[-1]
                         media_code = after_marker.split(".")[0]
                         if media_code:
-                            self._image_code_index[media_code].append(image)
+                            self._image_code_index[media_code].append(image.id)
 
-    def find_scenes_by_media_codes(
+    async def find_scenes_by_media_codes(
         self, media_codes: list[str]
     ) -> dict[str, list[Scene]]:
-        """Find scenes by media codes using the pre-built index. O(1) per lookup."""
-        result: dict[str, list[Scene]] = {}
+        """Find scenes by media code."""
+        all_ids: set[str] = set()
+        code_to_ids: dict[str, list[str]] = {}
         for code in media_codes:
-            candidates = self._scene_code_index.get(code, [])
-            if candidates:
-                seen_ids: set[str] = set()
-                unique = [
-                    s
-                    for s in candidates
-                    if s.id not in seen_ids and not seen_ids.add(s.id)
-                ]
-                result[code] = unique
-        return result
+            ids = self._scene_code_index.get(code, [])
+            if not ids:
+                continue
+            unique_ids = list(dict.fromkeys(ids))
+            code_to_ids[code] = unique_ids
+            all_ids.update(unique_ids)
 
-    def find_images_by_media_codes(
+        if not all_ids:
+            return {}
+
+        scenes = await self.store.get_many(Scene, list(all_ids))
+        by_id: dict[str, Scene] = {s.id: s for s in scenes if s is not None}
+        return {
+            code: [by_id[i] for i in ids if i in by_id]
+            for code, ids in code_to_ids.items()
+        }
+
+    async def find_images_by_media_codes(
         self, media_codes: list[str]
     ) -> dict[str, list[Image]]:
-        """Find images by media codes using the pre-built index. O(1) per lookup."""
-        result: dict[str, list[Image]] = {}
+        """Find images by media code."""
+        all_ids: set[str] = set()
+        code_to_ids: dict[str, list[str]] = {}
         for code in media_codes:
-            candidates = self._image_code_index.get(code, [])
-            if candidates:
-                seen_ids: set[str] = set()
-                unique = [
-                    i
-                    for i in candidates
-                    if i.id not in seen_ids and not seen_ids.add(i.id)
-                ]
-                result[code] = unique
-        return result
+            ids = self._image_code_index.get(code, [])
+            if not ids:
+                continue
+            unique_ids = list(dict.fromkeys(ids))
+            code_to_ids[code] = unique_ids
+            all_ids.update(unique_ids)
+
+        if not all_ids:
+            return {}
+
+        images = await self.store.get_many(Image, list(all_ids))
+        by_id: dict[str, Image] = {i.id: i for i in images if i is not None}
+        return {
+            code: [by_id[i] for i in ids if i in by_id]
+            for code, ids in code_to_ids.items()
+        }
 
     @classmethod
     def from_config(
