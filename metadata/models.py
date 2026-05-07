@@ -1112,7 +1112,10 @@ class PinnedPost(FanslyRecord):
             if isinstance(data.get("createdAt"), (int, float)):
                 data = {**data, "createdAt": _parse_timestamp(data["createdAt"])}
             if "pos" in data and not isinstance(data["pos"], int):
-                data = {**data, "pos": int(data["pos"])}
+                data = {
+                    **data,
+                    "pos": int(data["pos"]) if data["pos"] is not None else 0,
+                }
         return data
 
 
