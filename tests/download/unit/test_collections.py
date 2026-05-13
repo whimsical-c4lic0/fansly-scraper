@@ -29,6 +29,7 @@ import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
 from download.collections import download_collections
 from download.downloadstate import DownloadState
 from download.types import DownloadType
@@ -102,7 +103,7 @@ class TestDownloadCollections:
         am_entry = _account_media_payload(media_id, am_id, acct_id)
 
         orders_route = respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media/orders/"
+            url__startswith=f"{FanslyApi.BASE_URL}account/media/orders/"
         ).mock(
             side_effect=[
                 httpx.Response(
@@ -126,7 +127,7 @@ class TestDownloadCollections:
         )
         # fetch_and_process_media → /api/v1/account/media?ids=<am_id>
         media_route = respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media"
+            url__startswith=f"{FanslyApi.BASE_URL}account/media"
         ).mock(
             side_effect=[
                 httpx.Response(200, json={"success": True, "response": [am_entry]})
@@ -139,7 +140,10 @@ class TestDownloadCollections:
         cdn_mock = AsyncMock(return_value=None)
         monkeypatch.setattr("download.common.download_media", cdn_mock)
         monkeypatch.setattr("download.media.download_media", cdn_mock)
-        _noop = lambda _: None  # noqa: E731
+
+        async def _noop(_):
+            return None
+
         monkeypatch.setattr("download.common.input_enter_continue", _noop)
         monkeypatch.setattr("download.media.input_enter_continue", _noop)
         monkeypatch.setattr("download.collections.input_enter_continue", _noop)
@@ -195,9 +199,7 @@ class TestDownloadCollections:
         mock_config.download_directory = tmp_path
         mock_config.interactive = False
 
-        respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media/orders/"
-        ).mock(
+        respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media/orders/").mock(
             side_effect=[
                 httpx.Response(
                     200,
@@ -214,14 +216,17 @@ class TestDownloadCollections:
         )
         # Even with empty media_ids, fetch_and_process_media may issue
         # a no-op HTTP call; mount the route to absorb it gracefully.
-        respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+        respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
             side_effect=[httpx.Response(200, json={"success": True, "response": []})]
         )
 
         cdn_mock = AsyncMock(return_value=None)
         monkeypatch.setattr("download.common.download_media", cdn_mock)
         monkeypatch.setattr("download.media.download_media", cdn_mock)
-        _noop = lambda _: None  # noqa: E731
+
+        async def _noop(_):
+            return None
+
         monkeypatch.setattr("download.common.input_enter_continue", _noop)
 
         state = DownloadState(creator_name="empty_collection_user")
@@ -254,13 +259,13 @@ class TestDownloadCollections:
         mock_config.interactive = False
 
         orders_route = respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media/orders/"
+            url__startswith=f"{FanslyApi.BASE_URL}account/media/orders/"
         ).mock(side_effect=[httpx.Response(403, text="Forbidden")])
 
         # input_enter_continue is invoked on the failure path; no-op it.
         prompt_calls: list[bool] = []
 
-        def _record_prompt(interactive: bool) -> None:
+        async def _record_prompt(interactive: bool) -> None:
             prompt_calls.append(interactive)
 
         monkeypatch.setattr("download.collections.input_enter_continue", _record_prompt)
@@ -300,9 +305,7 @@ class TestDownloadCollections:
         mock_config.download_directory = tmp_path
         mock_config.interactive = False
 
-        respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media/orders/"
-        ).mock(
+        respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media/orders/").mock(
             side_effect=[
                 httpx.Response(
                     200,
@@ -317,14 +320,17 @@ class TestDownloadCollections:
                 )
             ],
         )
-        respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+        respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
             side_effect=[httpx.Response(200, json={"success": True, "response": []})]
         )
 
         cdn_mock = AsyncMock(return_value=None)
         monkeypatch.setattr("download.common.download_media", cdn_mock)
         monkeypatch.setattr("download.media.download_media", cdn_mock)
-        _noop = lambda _: None  # noqa: E731
+
+        async def _noop(_):
+            return None
+
         monkeypatch.setattr("download.common.input_enter_continue", _noop)
 
         state = DownloadState(creator_name="no_dup_user")

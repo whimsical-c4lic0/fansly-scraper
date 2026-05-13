@@ -26,6 +26,7 @@ import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
 from download.downloadstate import DownloadState
 from download.messages import download_messages, download_messages_for_group
 from download.types import DownloadType
@@ -161,7 +162,7 @@ async def test_download_messages_success_full_real_pipeline(
 
     # Two message pages: first has a message, second is empty → IndexError
     # break at ``_download_group_message_loop:183`` (cursor advance).
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -178,7 +179,7 @@ async def test_download_messages_success_full_real_pipeline(
             )
         ]
     )
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -198,7 +199,7 @@ async def test_download_messages_success_full_real_pipeline(
             httpx.Response(200, json=_messages_response()),
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -214,7 +215,10 @@ async def test_download_messages_success_full_real_pipeline(
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
     monkeypatch.setattr("download.messages.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -253,7 +257,7 @@ async def test_download_messages_no_group_for_creator_warns_and_exits(
 
     # The response has a group, but it contains a different user —
     # production code iterates members, never finds creator_id, returns.
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -271,7 +275,9 @@ async def test_download_messages_no_group_for_creator_warns_and_exits(
         ]
     )
 
-    _noop = lambda _: None  # noqa: E731
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
 
@@ -290,14 +296,16 @@ async def test_download_messages_groups_api_non_200_logs_and_returns(
     config.download_directory = tmp_path
     config.interactive = False
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[httpx.Response(403, text="Forbidden")]
     )
 
     state = DownloadState()
     state.creator_id = snowflake_id()
 
-    _noop = lambda _: None  # noqa: E731
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
 
@@ -319,7 +327,7 @@ async def test_download_messages_message_page_non_200_logs_and_returns(
     creator_id = snowflake_id()
     group_id = snowflake_id()
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -336,7 +344,7 @@ async def test_download_messages_message_page_non_200_logs_and_returns(
             )
         ]
     )
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[httpx.Response(403, text="Forbidden")]
     )
 
@@ -345,7 +353,10 @@ async def test_download_messages_message_page_non_200_logs_and_returns(
     state.creator_name = f"mfail_{creator_id}"
 
     monkeypatch.setattr("download.messages.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
 
@@ -373,7 +384,7 @@ async def test_download_messages_for_group_with_creator_info_preset(
     state.creator_id = creator_id
     state.creator_name = f"dg_{creator_id}"
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -390,7 +401,7 @@ async def test_download_messages_for_group_with_creator_info_preset(
             )
         ]
     )
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[httpx.Response(200, json=_messages_response())]
     )
 
@@ -398,7 +409,10 @@ async def test_download_messages_for_group_with_creator_info_preset(
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
     monkeypatch.setattr("download.messages.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -423,7 +437,7 @@ async def test_download_messages_for_group_groups_api_non_200_returns_early(
 
     # 500 is in httpx_retries' status_forcelist — provide enough responses
     # to exhaust retries.
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[httpx.Response(500, text="server boom")] * 5
     )
 
@@ -448,7 +462,7 @@ async def test_download_messages_for_group_missing_group_warns_and_returns(
     creator_id = snowflake_id()
     known_group_id = snowflake_id()
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -491,7 +505,7 @@ async def test_download_messages_for_group_infers_creator_from_group_users(
     creator_id = snowflake_id()
     group_id = snowflake_id()
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -508,7 +522,7 @@ async def test_download_messages_for_group_infers_creator_from_group_users(
             )
         ]
     )
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[httpx.Response(200, json=_messages_response())]
     )
 
@@ -558,7 +572,7 @@ async def test_download_messages_for_group_infers_creator_id_but_no_account_cach
     )
     await entity_store.save(account)
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -578,7 +592,7 @@ async def test_download_messages_for_group_infers_creator_id_but_no_account_cach
     )
     # 403 on /message → loop exits at line 149-156 BEFORE reaching
     # set_create_directory_for_download (which would crash on creator_name=None).
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[httpx.Response(403, text="Forbidden")]
     )
 
@@ -587,7 +601,10 @@ async def test_download_messages_for_group_infers_creator_id_but_no_account_cach
     assert state.creator_name is None
 
     monkeypatch.setattr("download.messages.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
 
@@ -614,7 +631,7 @@ async def test_download_messages_for_group_cannot_identify_creator_warns(
 
     group_id = snowflake_id()
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -675,7 +692,7 @@ async def test_download_messages_skipped_downloads_summary(
     state.creator_id = creator_id
     state.creator_name = f"skip_{creator_id}"
 
-    respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+    respx.get(f"{FanslyApi.BASE_URL}messaging/groups").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -692,7 +709,7 @@ async def test_download_messages_skipped_downloads_summary(
             )
         ]
     )
-    respx.get("https://apiv3.fansly.com/api/v1/message").mock(
+    respx.get(f"{FanslyApi.BASE_URL}message").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -715,7 +732,7 @@ async def test_download_messages_skipped_downloads_summary(
             httpx.Response(200, json=_messages_response()),
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -742,7 +759,10 @@ async def test_download_messages_skipped_downloads_summary(
     monkeypatch.setattr("download.common.download_media", _count_as_duplicate)
     monkeypatch.setattr("download.media.download_media", _count_as_duplicate)
     monkeypatch.setattr("download.messages.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.messages.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)

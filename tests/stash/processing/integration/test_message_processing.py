@@ -23,7 +23,11 @@ from tests.fixtures.metadata.metadata_factories import (
     MediaFactory,
     MessageFactory,
 )
-from tests.fixtures.stash.stash_api_fixtures import assert_op, assert_op_with_vars
+from tests.fixtures.stash.stash_api_fixtures import (
+    assert_op,
+    assert_op_with_vars,
+    dump_graphql_calls,
+)
 from tests.fixtures.stash.stash_integration_fixtures import capture_graphql_calls
 
 
@@ -223,37 +227,41 @@ async def test_process_message_with_media(
                 created_galleries.append(obj.id)
             return result
 
-        with (
-            patch.object(
-                real_stash_processor,
-                "_collect_media_from_attachments",
-                side_effect=spy_collect_media,
-            ),
-            patch.object(
-                real_stash_processor,
-                "_process_media_batch_by_mimetype",
-                side_effect=spy_process_by_mimetype,
-            ),
-            patch.object(
-                real_stash_processor,
-                "_process_batch_internal",
-                side_effect=spy_process_batch,
-            ),
-            patch.object(
-                real_stash_processor.context.store, "save", side_effect=spy_save
-            ),
-            capture_graphql_calls(real_stash_processor.context.client) as calls,
-        ):
-            await real_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="message",
-                items=[message],
-                url_pattern_func=lambda m: (
-                    f"https://fansly.com/messages/{m.groupId}/{m.id}"
+        calls: list = []
+        try:
+            with (
+                patch.object(
+                    real_stash_processor,
+                    "_collect_media_from_attachments",
+                    side_effect=spy_collect_media,
                 ),
-            )
+                patch.object(
+                    real_stash_processor,
+                    "_process_media_batch_by_mimetype",
+                    side_effect=spy_process_by_mimetype,
+                ),
+                patch.object(
+                    real_stash_processor,
+                    "_process_batch_internal",
+                    side_effect=spy_process_batch,
+                ),
+                patch.object(
+                    real_stash_processor.context.store, "save", side_effect=spy_save
+                ),
+                capture_graphql_calls(real_stash_processor.context.client) as calls,
+            ):
+                await real_stash_processor._process_items_with_gallery(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                    item_type="message",
+                    items=[message],
+                    url_pattern_func=lambda m: (
+                        f"https://fansly.com/messages/{m.groupId}/{m.id}"
+                    ),
+                )
+        finally:
+            dump_graphql_calls(calls, "test_process_message_with_media")
 
         # Manual cleanup from spies
         for sid in created_studios:
@@ -485,22 +493,26 @@ async def test_process_message_with_bundle(
                 created_galleries.append(obj.id)
             return result
 
-        with (
-            patch.object(
-                real_stash_processor.context.store, "save", side_effect=spy_save
-            ),
-            capture_graphql_calls(real_stash_processor.context.client) as calls,
-        ):
-            await real_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="message",
-                items=[message],
-                url_pattern_func=lambda m: (
-                    f"https://fansly.com/messages/{m.groupId}/{m.id}"
+        calls: list = []
+        try:
+            with (
+                patch.object(
+                    real_stash_processor.context.store, "save", side_effect=spy_save
                 ),
-            )
+                capture_graphql_calls(real_stash_processor.context.client) as calls,
+            ):
+                await real_stash_processor._process_items_with_gallery(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                    item_type="message",
+                    items=[message],
+                    url_pattern_func=lambda m: (
+                        f"https://fansly.com/messages/{m.groupId}/{m.id}"
+                    ),
+                )
+        finally:
+            dump_graphql_calls(calls, "test_process_message_with_bundle")
 
         # Manual cleanup from spies
         for sid in created_studios:
@@ -640,22 +652,26 @@ async def test_process_message_with_variants(
                 created_galleries.append(obj.id)
             return result
 
-        with (
-            patch.object(
-                real_stash_processor.context.store, "save", side_effect=spy_save
-            ),
-            capture_graphql_calls(real_stash_processor.context.client) as calls,
-        ):
-            await real_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="message",
-                items=[message],
-                url_pattern_func=lambda m: (
-                    f"https://fansly.com/messages/{m.groupId}/{m.id}"
+        calls: list = []
+        try:
+            with (
+                patch.object(
+                    real_stash_processor.context.store, "save", side_effect=spy_save
                 ),
-            )
+                capture_graphql_calls(real_stash_processor.context.client) as calls,
+            ):
+                await real_stash_processor._process_items_with_gallery(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                    item_type="message",
+                    items=[message],
+                    url_pattern_func=lambda m: (
+                        f"https://fansly.com/messages/{m.groupId}/{m.id}"
+                    ),
+                )
+        finally:
+            dump_graphql_calls(calls, "test_process_message_with_variants")
 
         # Manual cleanup from spies
         for sid in created_studios:
@@ -814,22 +830,26 @@ async def test_process_message_batch(
                 created_galleries.append(obj.id)
             return result
 
-        with (
-            patch.object(
-                real_stash_processor.context.store, "save", side_effect=spy_save
-            ),
-            capture_graphql_calls(real_stash_processor.context.client) as calls,
-        ):
-            await real_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="message",
-                items=messages,
-                url_pattern_func=lambda m: (
-                    f"https://fansly.com/messages/{m.groupId}/{m.id}"
+        calls: list = []
+        try:
+            with (
+                patch.object(
+                    real_stash_processor.context.store, "save", side_effect=spy_save
                 ),
-            )
+                capture_graphql_calls(real_stash_processor.context.client) as calls,
+            ):
+                await real_stash_processor._process_items_with_gallery(
+                    account=account,
+                    performer=performer,
+                    studio=studio,
+                    item_type="message",
+                    items=messages,
+                    url_pattern_func=lambda m: (
+                        f"https://fansly.com/messages/{m.groupId}/{m.id}"
+                    ),
+                )
+        finally:
+            dump_graphql_calls(calls, "test_process_message_batch")
 
         # Manual cleanup from spies
         for sid in created_studios:
@@ -844,25 +864,48 @@ async def test_process_message_batch(
             f"Expected at least 14 GraphQL calls (3 messages x ~5 ops each), got {len(calls)}"
         )
 
-        # Verify first message gallery operations
-        assert_op_with_vars(
-            calls[0],
-            "findGalleries",
-            gallery_filter__code__value=str(messages[0].id),
-        )
-        assert_op(calls[1], "findGalleries")
-        assert "title" in calls[1]["variables"]["gallery_filter"]
+        # Batch processing interleaves the 3 messages' lookups in the global
+        # calls list, so positional assertions on calls[0..4] are nondeterministic.
+        # Search structurally for messages[0]'s expected operations instead.
+        msg0_id = str(messages[0].id)
+        msg0_content = messages[0].content
+        msg0_url = f"https://fansly.com/messages/{group.id}/{messages[0].id}"
 
-        assert_op(calls[2], "findGalleries")
-        assert "url" in calls[2]["variables"]["gallery_filter"]
+        def _filter_value(call, key):
+            return (
+                call.get("variables", {})
+                .get("gallery_filter", {})
+                .get(key, {})
+                .get("value")
+            )
 
-        # Call 3: findGalleries (populate() filter-query for performers relationship)
-        # SGC v0.12 inlines values; no variables field
-        assert_op(calls[3], "findGalleries")
-        assert "performers" in calls[3]["query"]
+        assert any(
+            "findGalleries" in c["query"] and _filter_value(c, "code") == msg0_id
+            for c in calls
+        ), f"Expected findGalleries by code for messages[0].id={msg0_id}"
 
-        # Call 4: galleryCreate
-        assert_op(calls[4], "galleryCreate")
+        assert any(
+            "findGalleries" in c["query"] and _filter_value(c, "title") == msg0_content
+            for c in calls
+        ), "Expected findGalleries by title for messages[0].content"
+
+        assert any(
+            "findGalleries" in c["query"] and _filter_value(c, "url") == msg0_url
+            for c in calls
+        ), f"Expected findGalleries by url for messages[0] ({msg0_url})"
+
+        # populate() filter-query for performers relationship — SGC v0.12
+        # inlines values into the query string (no variables).
+        assert any(
+            "findGalleries" in c["query"] and "performers" in c["query"] for c in calls
+        ), "Expected findGalleries populate filter for performers"
+
+        # galleryCreate for messages[0]
+        assert any(
+            "galleryCreate" in c["query"]
+            and c.get("variables", {}).get("input", {}).get("code") == msg0_id
+            for c in calls
+        ), f"Expected galleryCreate for messages[0].id={msg0_id}"
 
         gallery_creates = [c for c in calls if "galleryCreate" in c["query"]]
         assert 1 <= len(gallery_creates) <= 3, (
@@ -945,18 +988,23 @@ async def test_process_message_error_handling(
 
         # Act - Process and expect graceful error handling
         no_exception_raised = True
+        calls: list = []
         try:
-            await real_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="message",
-                items=[message],
-                url_pattern_func=lambda m: (
-                    f"https://fansly.com/messages/{m.groupId}/{m.id}"
-                ),
-            )
-        except Exception:
-            no_exception_raised = False
+            with capture_graphql_calls(real_stash_processor.context.client) as calls:
+                try:
+                    await real_stash_processor._process_items_with_gallery(
+                        account=account,
+                        performer=performer,
+                        studio=studio,
+                        item_type="message",
+                        items=[message],
+                        url_pattern_func=lambda m: (
+                            f"https://fansly.com/messages/{m.groupId}/{m.id}"
+                        ),
+                    )
+                except Exception:
+                    no_exception_raised = False
+        finally:
+            dump_graphql_calls(calls, "test_process_message_error_handling")
 
         assert no_exception_raised, "Processing should handle errors gracefully"

@@ -1,9 +1,9 @@
 """Configuration Validation"""
 
 # import re
+import asyncio
 import importlib.util
 from pathlib import Path
-from time import sleep
 
 import httpx
 
@@ -13,6 +13,7 @@ from errors import ConfigError
 from helpers.browser import open_get_started_url
 from helpers.web import guess_user_agent
 from pathio.pathio import ask_correct_dir
+from textio.prompts import aconfirm, aprompt_text
 from textio.textio import input_enter_continue
 
 from .config import (
@@ -23,7 +24,7 @@ from .config import (
 from .fanslyconfig import FanslyConfig
 
 
-def validate_creator_names(config: FanslyConfig) -> bool:
+async def validate_creator_names(config: FanslyConfig) -> bool:
     """Validates the input value for `config_username` in `config.ini`.
 
     :param FanslyConfig config: The configuration object to validate.
@@ -42,7 +43,7 @@ def validate_creator_names(config: FanslyConfig) -> bool:
     list_changed = False
 
     for user in names:
-        validated_name = validate_adjust_creator_name(user, config.interactive)
+        validated_name = await validate_adjust_creator_name(user, config.interactive)
 
         # Remove invalid names from set
         if validated_name is None:
@@ -71,7 +72,9 @@ def validate_creator_names(config: FanslyConfig) -> bool:
     return True
 
 
-def validate_adjust_creator_name(name: str, interactive: bool = False) -> str | None:
+async def validate_adjust_creator_name(
+    name: str, interactive: bool = False
+) -> str | None:
     """Validates the name of a Fansly creator.
 
     :param name: The creator name to validate and potentially correct.
@@ -122,14 +125,15 @@ def validate_adjust_creator_name(name: str, interactive: bool = False) -> str | 
                 f"\n{19 * ' '}of the Fansly creator you want to download content from."
             )
 
-            name = input(f"\n{19 * ' '}► Enter a valid username: ")
-            name = name.strip().removeprefix("@")
+            name = (
+                await aprompt_text(f"\n{19 * ' '}► Enter a valid username: ")
+            ).removeprefix("@")
 
         else:
             return None
 
 
-def validate_adjust_token(config: FanslyConfig) -> None:
+async def validate_adjust_token(config: FanslyConfig) -> None:
     """Validates the Fansly authorization token in the config
     and analyzes installed browsers to automatically find tokens.
 
@@ -193,22 +197,24 @@ def validate_adjust_token(config: FanslyConfig) -> None:
                 leveldb_folders = find_leveldb_folders(browser_path)
 
                 for folder in leveldb_folders:
-                    browser_fansly_token = get_auth_token_from_leveldb_folder(
+                    browser_fansly_token = await get_auth_token_from_leveldb_folder(
                         folder, interactive=config.interactive
                     )
 
                     if browser_fansly_token:
-                        fansly_account = config.get_api().get_client_user_name(
+                        fansly_account = await config.get_api().get_client_user_name(
                             browser_fansly_token
                         )
                         break  # exit the inner loop if a valid processed_token is found
 
             # if firefox, process sqlite db instead
             else:
-                browser_fansly_token = get_token_from_firefox_profile(browser_path)
+                browser_fansly_token = await get_token_from_firefox_profile(
+                    browser_path
+                )
 
                 if browser_fansly_token:
-                    fansly_account = config.get_api().get_client_user_name(
+                    fansly_account = await config.get_api().get_client_user_name(
                         browser_fansly_token
                     )
 
@@ -217,37 +223,19 @@ def validate_adjust_token(config: FanslyConfig) -> None:
                 browser_name = parse_browser_from_string(browser_path)
 
                 if config.interactive:
-                    # Save token to configuration?
                     textio_logger.info(
                         f"Do you want to link the account '{fansly_account}' to Fansly Downloader? (found in: {browser_name})"
                     )
-
-                    while True:
-                        user_input_acc_verify = (
-                            input(f"{19 * ' '}► Type either 'Yes' or 'No': ")
-                            .strip()
-                            .lower()
-                        )
-
-                        if user_input_acc_verify.startswith(("y", "n")):
-                            break  # break user input verification
-
-                        textio_logger.error(
-                            f"Please enter either 'Yes' or 'No', to decide if you want to link to '{fansly_account}'."
-                        )
-
+                    user_confirmed = await aconfirm(f"{19 * ' '}► Link this account?")
                 else:
-                    # Forcefully link account in interactive mode.
+                    # Forcefully link account in non-interactive mode.
                     textio_logger.warning(
-                        f"Interactive mode is automtatically linking the account '{fansly_account}' to Fansly Downloader. (found in: {browser_name})"
+                        f"Non-interactive mode is automatically linking the account '{fansly_account}' to Fansly Downloader. (found in: {browser_name})"
                     )
-                    user_input_acc_verify = "y"
+                    user_confirmed = True
 
                 # based on user input; write account username & auth token to config.ini
-                if (
-                    user_input_acc_verify.startswith("y")
-                    and browser_fansly_token is not None
-                ):
+                if user_confirmed and browser_fansly_token is not None:
                     config.token = browser_fansly_token
                     config.token_from_browser_name = browser_name
 
@@ -345,7 +333,7 @@ def validate_adjust_user_agent(config: FanslyConfig) -> None:
         )
 
 
-def validate_adjust_check_key(config: FanslyConfig) -> None:
+async def validate_adjust_check_key(config: FanslyConfig) -> None:
     """Validates the input value for `check_key` in `config.ini`.
 
     :param FanslyConfig config: The configuration to validate and correct.
@@ -380,31 +368,19 @@ def validate_adjust_check_key(config: FanslyConfig) -> None:
     )
 
     if config.interactive:
-        key_confirmation = (
-            input(f"\n{20 * ' '}► Is this key correct (y/n)? ").strip().lower()
-        )
-
-        if key_confirmation.startswith("n"):
+        if not await aconfirm(f"\n{20 * ' '}► Is this key correct?"):
             done = False
-
             while not done:
-                new_key = input(f"\n{20 * ' '}► New key: ").strip()
-
-                new_key_confirmation = (
-                    input(
-                        f"\n{20 * ' '}► Does this look reasonable `{new_key}` (y/n)? "
-                    )
-                    .strip()
-                    .lower()
-                )
-
-                if new_key_confirmation.startswith("y"):
+                new_key = await aprompt_text(f"\n{20 * ' '}► New key: ")
+                if await aconfirm(
+                    f"\n{20 * ' '}► Does this look reasonable `{new_key}`?"
+                ):
                     done = True
                     config.check_key = new_key
                     save_config_or_raise(config)
 
     else:
-        input_enter_continue(config.interactive)
+        await input_enter_continue(config.interactive)
 
 
 def validate_log_levels(config: FanslyConfig) -> None:
@@ -437,7 +413,7 @@ def validate_log_levels(config: FanslyConfig) -> None:
     save_config_or_raise(config)
 
 
-def validate_adjust_download_directory(config: FanslyConfig) -> None:
+async def validate_adjust_download_directory(config: FanslyConfig) -> None:
     """Validates the `download_directory` and `temp_folder` values from `config.ini`
     and corrects them if possible.
 
@@ -485,15 +461,15 @@ def validate_adjust_download_directory(config: FanslyConfig) -> None:
             f"\n{20 * ' '}Tab key offers directory completion; ~ expands to your home folder."
         )
 
-        sleep(10)  # give user time to realise instructions were given
+        await asyncio.sleep(10)  # give user time to realise instructions were given
 
-        config.download_directory = ask_correct_dir()
+        config.download_directory = await ask_correct_dir()
 
         # save the config permanently
         save_config_or_raise(config)
 
 
-def validate_adjust_download_mode(
+async def validate_adjust_download_mode(
     config: FanslyConfig, download_mode_set: bool
 ) -> None:
     """Validates the `download_mode` value from `config.ini`
@@ -510,13 +486,7 @@ def validate_adjust_download_mode(
     if config.interactive and not download_mode_set:
         done = False
         while not done:
-            key_confirmation = (
-                input(f"\n{20 * ' '}► Would you like to change it (y/n)? ")
-                .strip()
-                .lower()
-            )
-
-            if key_confirmation.startswith("y"):
+            if await aconfirm(f"\n{20 * ' '}► Would you like to change it?"):
                 available_modes = [
                     mode.capitalize()
                     for mode in DownloadMode
@@ -525,9 +495,9 @@ def validate_adjust_download_mode(
                 textio_logger.info(
                     f"Available download modes are: {', '.join(available_modes)}."
                 )
-                new_download_mode = input(
+                new_download_mode = await aprompt_text(
                     f"\n{20 * ' '}► Enter the desired download mode: "
-                ).strip()
+                )
                 try:
                     config.download_mode = DownloadMode(new_download_mode.upper())
                     textio_logger.info(
@@ -542,26 +512,26 @@ def validate_adjust_download_mode(
                 done = True
 
 
-def validate_adjust_config(config: FanslyConfig, download_mode_set: bool) -> None:
+async def validate_adjust_config(config: FanslyConfig, download_mode_set: bool) -> None:
     """Validates all input values from `config.ini`
     and corrects them if possible.
 
     :param FanslyConfig config: The configuration to validate and correct.
     :param bool download_mode_set: Indicates whether a download mode as been set using args
     """
-    if not validate_creator_names(config):
+    if not await validate_creator_names(config):
         raise ConfigError("Configuration error - no valid creator name specified.")
 
-    validate_adjust_token(config)
+    await validate_adjust_token(config)
 
     validate_adjust_user_agent(config)
 
-    validate_adjust_check_key(config)
+    await validate_adjust_check_key(config)
 
     # validate_adjust_session_id(config)
 
-    validate_adjust_download_directory(config)
+    await validate_adjust_download_directory(config)
 
-    validate_adjust_download_mode(
+    await validate_adjust_download_mode(
         config, download_mode_set
     )  # don't prompt if download mode has specifically been set with args

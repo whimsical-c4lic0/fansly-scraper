@@ -1,26 +1,4 @@
-"""Daemon creator-filter utilities.
-
-Provides the function used by the monitoring daemon loop to decide whether
-to process a creator on a given tick:
-
-``should_process_creator`` -- fetches up to MAX_FILTER_PAGES timeline pages for
-the creator, filters out pinned posts, and returns True when the most recent
-non-pinned post's ``createdAt`` is strictly newer than the effective baseline.
-Pinned posts are excluded because their ``createdAt`` reflects the original
-publish time, not a recent activity signal.
-
-Returns True conservatively on API failure or first run (no state row).
-Returns False when: the timeline is empty, all pages within MAX_FILTER_PAGES
-are pinned, or the most recent non-pinned post's timestamp is at or before
-the effective baseline.
-
-The effective baseline is ``session_baseline`` when supplied by the caller
-(e.g. a CLI --full-pass override), otherwise ``MonitorState.lastCheckedAt``.
-
-State persistence after processing (``mark_creator_processed``) lives in
-``daemon/state.py`` per the planning doc's Optimization 3 section, which
-distinguishes filter DECISIONS from state PERSISTENCE.
-"""
+"""Daemon creator-filter utilities."""
 
 from __future__ import annotations
 
@@ -180,7 +158,7 @@ async def should_process_creator(
     # -- Paginate until non-pinned found or cap reached -----------------------
     for _page in range(MAX_FILTER_PAGES):
         try:
-            response = config._api.get_timeline(creator_id, cursor)
+            response = await config._api.get_timeline(creator_id, cursor)
             data = config._api.get_json_response_contents(response)
             posts: list[dict] = data.get("posts", [])
         except Exception as exc:

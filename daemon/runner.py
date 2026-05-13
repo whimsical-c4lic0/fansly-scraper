@@ -32,6 +32,7 @@ import asyncio
 import contextlib
 import json
 import signal
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, ClassVar
@@ -40,7 +41,7 @@ import httpx
 from loguru import logger
 
 from api.websocket import FanslyWebSocket
-from api.websocket_subprocess import get_websocket_class
+from api.websocket_protocol import MSG_SERVICE_EVENT, format_event_label, service_name
 from config.fanslyconfig import FanslyConfig
 from config.logging import websocket_logger as ws_logger
 from daemon.dashboard import (
@@ -68,6 +69,7 @@ from daemon.handlers import (
 from daemon.polling import poll_home_timeline, poll_story_states
 from daemon.simulator import ActivitySimulator
 from daemon.state import mark_creator_processed
+from download.livestream_chat import route_ws_chat_message
 
 
 if TYPE_CHECKING:
@@ -154,9 +156,7 @@ def _make_ws(config: FanslyConfig) -> FanslyWebSocket:
     Returns:
         A new FanslyWebSocket ready for ``start_in_thread()``.
     """
-    return get_websocket_class(
-        use_subprocess=getattr(config, "monitoring_websocket_subprocess", False),
-    )(
+    return FanslyWebSocket(
         token=config.token or "",
         user_agent=config.user_agent or "",
     )
@@ -235,6 +235,19 @@ async def _handle_messages_item(
         config: FanslyConfig instance.
         item: Work item specifying which DM group to download.
     """
+    # Scope-filter against -u creators (fixes #94): WS message events fire
+    # for every DM sender on the account regardless of -u, so without this
+    # check the daemon downloads messages/previews from creators the user
+    # didn't ask for.
+    if item.sender_id is not None and not await _is_creator_in_scope(
+        config, item.sender_id
+    ):
+        logger.debug(
+            "daemon.runner: message sender {} out of scope — skipping",
+            item.sender_id,
+        )
+        return
+
     logger.info(
         "daemon.runner: downloading messages for group {} (sender={})",
         item.group_id,
@@ -273,6 +286,16 @@ async def _handle_full_creator_item(
         config: FanslyConfig instance.
         item: Work item specifying the creator to download.
     """
+    # Scope-filter against -u creators (fixes #94): subscription-confirmed
+    # / PPV-purchased WS broadcasts trigger FullCreatorDownload for the
+    # creator who minted the event — even if the user passed -u <other>.
+    if not await _is_creator_in_scope(config, item.creator_id):
+        logger.debug(
+            "daemon.runner: FullCreatorDownload creator {} out of scope — skipping",
+            item.creator_id,
+        )
+        return
+
     creator_name = await _resolve_creator_name(item.creator_id)
     if creator_name is None:
         logger.warning(
@@ -441,6 +464,10 @@ async def _handle_timeline_only_item(
     state = DownloadState(creator_id=item.creator_id, creator_name=creator_name)
     try:
         await get_creator_account_info(config, state)
+        # Daemon was woken by the home feed; the stats-cache shortcut must
+        # not preempt the per-creator fetch.
+        state.creator_content_unchanged = False
+        state.fetched_timeline_duplication = False
         await download_timeline(config, state)
     except Exception as exc:
         logger.opt(exception=exc).error(
@@ -529,7 +556,7 @@ async def _process_timeline_candidate(
     baseline_consumed: set[int],
     queue: asyncio.Queue[WorkItem],
     budget: ErrorBudget,
-) -> None:
+) -> bool:
     """Evaluate one creator from the timeline poll and enqueue if needed.
 
     Checks scope, applies should_process_creator, and enqueues a
@@ -543,10 +570,15 @@ async def _process_timeline_candidate(
         baseline_consumed: Set of creator IDs already past their first check.
         queue: Work queue to push DownloadTimelineOnly items onto.
         budget: ErrorBudget to call on_success after a successful evaluation.
+
+    Returns:
+        True if a DownloadTimelineOnly WorkItem was enqueued for this creator,
+        False when the candidate was out-of-scope or ``should_process_creator``
+        returned False.
     """
     if not await _is_creator_in_scope(config, creator_id):
         logger.debug("daemon.runner: creator {} out of scope — skipping", creator_id)
-        return
+        return False
 
     baseline = session_baseline if creator_id not in baseline_consumed else None
     baseline_consumed.add(creator_id)
@@ -569,6 +601,8 @@ async def _process_timeline_candidate(
     if should:
         await queue.put(DownloadTimelineOnly(creator_id=creator_id))
         budget.on_success()
+        return True
+    return False
 
 
 async def _timeline_poll_loop(
@@ -586,9 +620,9 @@ async def _timeline_poll_loop(
 
     Skips the poll when the simulator is in the hidden state
     (simulator.should_poll is False). Calls simulator.on_new_content() when
-    the poll returns at least one creator with new posts. Triggers a following
-    list refresh (via refresh_event) when on_new_content() signals a transition
-    from idle/hidden to active.
+    at least one candidate is enqueued. Triggers a following list refresh
+    (via refresh_event) when on_new_content() signals a transition from
+    idle/hidden to active.
 
     Args:
         config: FanslyConfig instance.
@@ -637,12 +671,10 @@ async def _timeline_poll_loop(
             continue
 
         if new_creator_ids:
-            transitioned = simulator.on_new_content()
-            if transitioned:
-                refresh_event.set()
+            queued_any = False
             for creator_id in new_creator_ids:
                 prefetched = posts_by_creator.get(creator_id, [])
-                await _process_timeline_candidate(
+                if await _process_timeline_candidate(
                     config,
                     creator_id,
                     prefetched,
@@ -650,7 +682,17 @@ async def _timeline_poll_loop(
                     baseline_consumed,
                     queue,
                     budget,
-                )
+                ):
+                    queued_any = True
+
+            if queued_any:
+                transitioned = simulator.on_new_content()
+                if transitioned:
+                    logger.info(
+                        "daemon.runner: activity state -> active"
+                        " (new_content/home_timeline)"
+                    )
+                    refresh_event.set()
 
 
 async def _story_poll_loop(
@@ -715,6 +757,9 @@ async def _story_poll_loop(
         if creator_ids:
             transitioned = simulator.on_new_content()
             if transitioned:
+                logger.info(
+                    "daemon.runner: activity state -> active (new_content/story_poll)"
+                )
                 refresh_event.set()
             for creator_id in creator_ids:
                 if not await _is_creator_in_scope(config, creator_id):
@@ -886,6 +931,8 @@ async def _following_refresh_loop(
         dashboard.mark_active(TASK_FOLLOWING, "Following refresh: fetching...")
         try:
             state = DownloadState()
+            # Populate state.creator_id; get_following_accounts requires it.
+            await get_creator_account_info(config, state)
             new_names = await get_following_accounts(config, state)
             if new_names:
                 config.user_names = new_names
@@ -908,24 +955,39 @@ async def _simulator_tick_loop(
     stop_event: asyncio.Event,
     ws: Any,
     refresh_event: asyncio.Event,
+    budget: ErrorBudget,
     dashboard: DaemonDashboard | NullDashboard,
+    heartbeat_interval_minutes: int = 15,
 ) -> None:
     """Periodically advance the ActivitySimulator state machine.
 
     Logs state transitions so operators can observe daemon activity cadence.
-    On an ``"unhide"`` transition, attempts to reassert the WebSocket
-    connection before polling resumes, and triggers a following list refresh.
+    On an ``"unhide"`` transition, resets the ErrorBudget clock (the hidden
+    phase is intentional downtime, not an error gap), attempts to reassert the
+    WebSocket connection before polling resumes, and triggers a following list
+    refresh.
+
+    Emits a periodic heartbeat log at the configured interval regardless of
+    state so operators can confirm the daemon is alive during long hidden
+    windows.
 
     Args:
         simulator: ActivitySimulator to tick.
         stop_event: Set to stop the loop.
         ws: FanslyWebSocket instance (or compatible stub) for reconnection.
         refresh_event: Event to set on unhide to trigger following refresh.
+        budget: ErrorBudget to reset on unhide (prevents false unrecoverable
+            exits after a long hidden phase with no API calls).
         dashboard: Dashboard to drive the countdown bar and status line.
+        heartbeat_interval_minutes: Minutes between "WS alive" DEBUG heartbeat
+            log lines. Loaded from config.monitoring_heartbeat_interval_minutes.
     """
     # Seed the state line with the initial simulator state so the operator
     # doesn't see "initializing" for 30s until the first tick.
     dashboard.set_simulator_state(simulator.state)
+
+    _heartbeat_at: float = 0.0
+    _heartbeat_interval: float = heartbeat_interval_minutes * 60.0
 
     while not stop_event.is_set():
         await dashboard.wait_with_countdown(
@@ -938,6 +1000,25 @@ async def _simulator_tick_loop(
         if stop_event.is_set():
             break
 
+        # Periodic heartbeat — confirms the daemon is alive in any state.
+        now = time.monotonic()
+        if now - _heartbeat_at >= _heartbeat_interval:
+            elapsed_min = (now - simulator.state_entered_at) / 60.0
+            state_duration = {
+                "active": simulator.active_duration,
+                "idle": simulator.idle_duration,
+                "hidden": simulator.hidden_duration,
+            }.get(simulator.state, 0.0)
+            remaining_min = max(0.0, state_duration / 60.0 - elapsed_min)
+            ws_logger.debug(
+                "daemon.runner: WS alive — state={} ({:.0f} min in state,"
+                " ~{:.0f} min remaining)",
+                simulator.state,
+                elapsed_min,
+                remaining_min,
+            )
+            _heartbeat_at = now
+
         dashboard.mark_active(TASK_SIMULATOR, "Simulator tick: advancing...")
         transition = simulator.tick()
         if transition is not None:
@@ -949,6 +1030,10 @@ async def _simulator_tick_loop(
             dashboard.set_simulator_state(simulator.state)
 
         if transition == "unhide":
+            # Reset the error budget clock: the hidden phase is intentional
+            # downtime, not an error gap — without this the first soft error
+            # after unhide trips the budget and exits the daemon.
+            budget.on_success()
             refresh_event.set()
             try:
                 await ws.stop_thread()
@@ -1011,7 +1096,10 @@ def _make_ws_handler(
             )
         except (json.JSONDecodeError, TypeError) as exc:
             ws_logger.warning(
-                "daemon.runner: WS envelope decode error svc={} - {}", service_id, exc
+                "daemon.runner: WS envelope decode error from {} svc={} - {}",
+                service_name(service_id),
+                service_id,
+                exc,
             )
             return
 
@@ -1020,28 +1108,44 @@ def _make_ws_handler(
             return
 
         ws_logger.debug(
-            "daemon.runner: WS service event svc={} type={}",
-            service_id,
-            event_type,
+            "daemon.runner: WS service event {}",
+            format_event_label(service_id, event_type),
         )
 
         # Let interrupt events wake the simulator even during hidden
-        simulator.on_ws_event_during_hidden(service_id, event_type)
+        woke = simulator.on_ws_event_during_hidden(service_id, event_type)
+        if woke:
+            logger.info(
+                "daemon.runner: activity state -> active (ws_interrupt svc={} type={})",
+                service_id,
+                event_type,
+            )
+
+        # SVC_CHAT (serviceId=46) type=10 — real-time chat message.
+        # Route to an active ChatRecorder if one exists for this room.
+        if service_id == 46 and event_type == 10:
+            chat_msg = inner.get("chatRoomMessage")
+            if isinstance(chat_msg, dict):
+                try:
+                    room_id = int(chat_msg["chatRoomId"])
+                except (KeyError, TypeError, ValueError):
+                    room_id = None
+                if room_id is not None:
+                    await route_ws_chat_message(room_id, chat_msg)
+            return
 
         item = dispatch_ws_event(service_id, event_type, inner)
         if item is None:
             if not has_handler(service_id, event_type):
                 ws_logger.debug(
-                    "daemon.runner: WS event unknown / unhandled "
-                    "(svc={} type={}) — consider adding to _DISPATCH or "
-                    "_NOOP_DESCRIPTIONS in daemon/handlers.py",
-                    service_id,
-                    event_type,
+                    "daemon.runner: WS event unknown / unhandled — {} — "
+                    "consider adding to _DISPATCH or _NOOP_DESCRIPTIONS in "
+                    "daemon/handlers.py",
+                    format_event_label(service_id, event_type),
                 )
                 ws_logger.trace(
-                    "daemon.runner: unknown event (svc={} type={}) payload - {}",
-                    service_id,
-                    event_type,
+                    "daemon.runner: unknown event {} payload - {}",
+                    format_event_label(service_id, event_type),
                     inner,
                 )
             # Handled events that return None (filtered by their handler
@@ -1050,10 +1154,9 @@ def _make_ws_handler(
             # level. No runner-side log needed here.
             return
         ws_logger.info(
-            "daemon.runner: WS event → {} (svc={} type={})",
+            "daemon.runner: WS event → {} ({})",
             type(item).__name__,
-            service_id,
-            event_type,
+            format_event_label(service_id, event_type),
         )
         await queue.put(item)
         if budget is not None:
@@ -1188,7 +1291,7 @@ async def _run_daemon_body(
     if bootstrap is not None and bootstrap.ws_started:
         ws: Any = bootstrap.ws
         ws.register_handler(
-            FanslyWebSocket.MSG_SERVICE_EVENT,
+            MSG_SERVICE_EVENT,
             _make_ws_handler(simulator, queue, budget),
         )
         dashboard.set_ws_state(True)
@@ -1199,7 +1302,7 @@ async def _run_daemon_body(
     else:
         ws = (ws_factory or _make_ws)(config)
         ws.register_handler(
-            FanslyWebSocket.MSG_SERVICE_EVENT,
+            MSG_SERVICE_EVENT,
             _make_ws_handler(simulator, queue, budget),
         )
         try:
@@ -1275,7 +1378,15 @@ async def _run_daemon_body(
         name="daemon-worker",
     )
     sim_tick_task = asyncio.create_task(
-        _simulator_tick_loop(simulator, stop_event, ws, refresh_event, dashboard),
+        _simulator_tick_loop(
+            simulator,
+            stop_event,
+            ws,
+            refresh_event,
+            budget,
+            dashboard,
+            config.monitoring_heartbeat_interval_minutes,
+        ),
         name="daemon-simulator-tick",
     )
     following_refresh_task = asyncio.create_task(

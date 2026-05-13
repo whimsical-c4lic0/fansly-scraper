@@ -3,6 +3,7 @@
 import configparser
 import os
 from pathlib import Path
+from typing import Any
 
 from config.fanslyconfig import FanslyConfig
 from config.loader import load_or_migrate
@@ -95,10 +96,14 @@ def _populate_config_from_schema(config: FanslyConfig, schema: ConfigSchema) -> 
     unchanged.
     """
     # --- TargetedCreator ---
-    # Only override if not already set via command-line
+    # Only override if not already set via command-line. ``usernames`` is
+    # nullable in the schema (fresh scaffold has no creators yet) — skip
+    # the sanitize call when it's None so config.user_names stays None
+    # until something actually populates it.
     if config.user_names is None:
         raw_names = schema.targeted_creator.usernames
-        config.user_names = sanitize_creator_names(raw_names)
+        if raw_names:
+            config.user_names = sanitize_creator_names(raw_names)
 
     config.use_following = schema.targeted_creator.use_following
 
@@ -143,10 +148,13 @@ def _populate_config_from_schema(config: FanslyConfig, schema: ConfigSchema) -> 
     config.use_duplicate_threshold = opts.use_duplicate_threshold
     config.use_pagination_duplication = opts.use_pagination_duplication
     config.use_folder_suffix = opts.use_folder_suffix
+    config.respect_timeline_stats = opts.respect_timeline_stats
     config.interactive = opts.interactive
     config.prompt_on_exit = opts.prompt_on_exit
-    config.debug = opts.debug
-    config.trace = opts.trace
+    # ``debug`` and ``trace`` are no longer schema-backed. They're runtime
+    # attributes driven by the ``-v`` / ``-vv`` CLI verbosity count (see
+    # config/args.py::_handle_verbosity_settings); start at False here so
+    # that loading config.yaml never silently reactivates a prior CLI flip.
 
     # Numeric options
     config.timeline_retries = opts.timeline_retries
@@ -195,19 +203,33 @@ def _populate_config_from_schema(config: FanslyConfig, schema: ConfigSchema) -> 
 
     # --- Logging ---
     log = schema.logging
+    config.logging = log
+
+    def _entry_level(entry: Any) -> str:
+        """Resolve a handler entry's level, falling through to global default."""
+        return entry.level or log.global_.default_level
+
+    # log_levels dict preserves the legacy flat key→level shape for
+    # ``get_log_level()`` consumers. "textio" historically governed both
+    # the rich console and the main file handler; since the new schema
+    # splits them, we resolve "textio" from main_log (the file handler is
+    # the primary "textio" surface; rich_handler runs in parallel with
+    # its own per-handler key below).
     config.log_levels = {
-        "sqlalchemy": log.sqlalchemy,
-        "stash_console": log.stash_console,
-        "stash_file": log.stash_file,
-        "textio": log.textio,
-        "websocket": log.websocket,
-        # `log.json` would return the BaseModel.json() bound method —
-        # the Python attribute is json_level, YAML key is still "json".
-        "json": log.json_level,
+        "sqlalchemy": _entry_level(log.db),
+        "stash_console": _entry_level(log.stash_console),
+        "stash_file": _entry_level(log.stash_file),
+        "textio": _entry_level(log.main_log),
+        "rich_handler": _entry_level(log.rich_handler),
+        "main_log": _entry_level(log.main_log),
+        "websocket": _entry_level(log.websocket),
+        "json": _entry_level(log.json_),
+        "trace": _entry_level(log.trace),
+        "db": _entry_level(log.db),
     }
 
     # Validate log levels
-    valid_levels = {"DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+    valid_levels = {"TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
     for logger_name, level in config.log_levels.items():
         if level not in valid_levels:
             textio_logger.opt(depth=1).log(
@@ -237,11 +259,13 @@ def _populate_config_from_schema(config: FanslyConfig, schema: ConfigSchema) -> 
     # daemon_mode: only populate from schema if not already enabled via CLI
     if not config.daemon_mode:
         config.daemon_mode = schema.monitoring.daemon_mode
+    # Daemon mode is non-interactive by definition — it runs unattended.
+    if config.daemon_mode:
+        config.interactive = False
     config.unrecoverable_error_timeout_seconds = (
         schema.monitoring.unrecoverable_error_timeout_seconds
     )
     config.monitoring_dashboard_enabled = schema.monitoring.dashboard_enabled
-    config.monitoring_websocket_subprocess = schema.monitoring.websocket_subprocess
     config.monitoring_active_duration_minutes = (
         schema.monitoring.active_duration_minutes
     )
@@ -260,6 +284,18 @@ def _populate_config_from_schema(config: FanslyConfig, schema: ConfigSchema) -> 
     )
     config.monitoring_story_poll_idle_seconds = (
         schema.monitoring.story_poll_idle_seconds
+    )
+    config.monitoring_heartbeat_interval_minutes = (
+        schema.monitoring.heartbeat_interval_minutes
+    )
+    config.monitoring_livestream_recording_enabled = (
+        schema.monitoring.livestream_recording_enabled
+    )
+    config.monitoring_livestream_poll_interval_seconds = (
+        schema.monitoring.livestream_poll_interval_seconds
+    )
+    config.monitoring_livestream_manifest_poll_interval_seconds = (
+        schema.monitoring.livestream_manifest_poll_interval_seconds
     )
 
     # --- StashContext (optional) ---

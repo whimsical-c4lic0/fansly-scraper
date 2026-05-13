@@ -957,6 +957,11 @@ async def test_main_other_tasks_generic_exception_cancels_pending(
     """
     env = main_integration_env
     env.config.download_mode = DownloadMode.TIMELINE
+    # Disable the livestream watcher for this test — its poll loop also calls
+    # asyncio.wait_for(..., timeout=30), which would collide with the
+    # discriminator below and propagate the simulated error out of the
+    # watcher task instead of staying inside the other-tasks gather block.
+    env.config.monitoring_livestream_recording_enabled = False
     init_logging_config(env.config)
     env.register_empty_content()
 
@@ -1680,7 +1685,7 @@ async def test_main_raises_runtime_error_when_validation_leaves_state_unset(
     # Stub validate_adjust_config to a no-op — the defensive RuntimeError
     # at main():301 normally can't fire because validate_adjust_config
     # raises first. Skipping validation re-opens the invariant window.
-    def _noop_validate(config, download_mode_set):
+    async def _noop_validate(config, download_mode_set):
         return None
 
     monkeypatch.setattr("fansly_downloader_ng.validate_adjust_config", _noop_validate)

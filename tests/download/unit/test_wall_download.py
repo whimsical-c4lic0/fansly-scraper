@@ -7,11 +7,13 @@ Per project testing guidelines: only mock at external boundaries.
 
 import logging
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
 from download.downloadstate import DownloadState
 from download.types import DownloadType
 from download.wall import download_wall, process_wall_data, process_wall_media
@@ -20,7 +22,7 @@ from tests.fixtures.api import dump_fansly_calls
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
-FANSLY_API = "https://apiv3.fansly.com/api/v1/"
+FANSLY_API = FanslyApi.BASE_URL
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
@@ -184,8 +186,6 @@ class TestProcessWallMedia:
         """Spy verifies process_wall_media is called and its False return
         causes the download_wall loop to break. Uses patch(wraps=) to
         intercept the return without running the deep download pipeline."""
-        from unittest.mock import AsyncMock, patch
-
         config = mock_config
         config.use_duplicate_threshold = False
         config.use_pagination_duplication = False
@@ -558,16 +558,17 @@ class TestDownloadWallEdges:
         await entity_store.save(Account(id=creator_id, username=f"wall_{creator_id}"))
 
         # Patch input_enter_continue to no-op (production sleeps 15s in non-interactive).
-        monkeypatch.setattr(
-            "download.wall.input_enter_continue", lambda _interactive: None
-        )
+        async def _noop(_interactive):
+            return None
+
+        monkeypatch.setattr("download.wall.input_enter_continue", _noop)
 
         # First call: raise. Second call: return empty wall (triggers attempts+=1 → loop exits).
         # httpx.Response needs a request= kwarg to support raise_for_status.
         call_count = 0
-        request = httpx.Request("GET", "https://apiv3.fansly.com/api/v1/wall")
+        request = httpx.Request("GET", f"{FanslyApi.BASE_URL}wall")
 
-        def _raises_once(*_args, **_kwargs):
+        async def _raises_once(*_args, **_kwargs):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
@@ -614,7 +615,7 @@ class TestDownloadWallEdges:
 
         # When the outer except calls input_enter_continue, restore creator_id
         # so the next loop iteration takes the empty-media path and exits.
-        def _restore_creator_id(_interactive):
+        async def _restore_creator_id(_interactive):
             state.creator_id = creator_id
 
         monkeypatch.setattr("download.wall.input_enter_continue", _restore_creator_id)

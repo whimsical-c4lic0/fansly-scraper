@@ -25,7 +25,7 @@ async def download_messages(config: FanslyConfig, state: DownloadState) -> None:
 
     print_info("Initiating Messages procedure. Standby for results.")
 
-    groups_response = config.get_api().get_group()
+    groups_response = await config.get_api().get_group()
 
     if groups_response.status_code != 200:
         print_error(
@@ -33,7 +33,7 @@ async def download_messages(config: FanslyConfig, state: DownloadState) -> None:
             f"{groups_response.status_code}\n{groups_response.text}",
             31,
         )
-        input_enter_continue(config.interactive)
+        await input_enter_continue(config.interactive)
         return
 
     groups_data = config.get_api().get_json_response_contents(groups_response)
@@ -78,7 +78,7 @@ async def download_messages_for_group(
     state.download_type = DownloadType.MESSAGES
     group_id_str = str(group_id)
 
-    groups_response = config.get_api().get_group()
+    groups_response = await config.get_api().get_group()
     if groups_response.status_code != 200:
         print_error(
             f"Failed to fetch groups for group {group_id_str}. Response code: "
@@ -144,7 +144,7 @@ async def _download_group_message_loop(
         if msg_cursor != "0":
             params["before"] = msg_cursor
 
-        messages_response = config.get_api().get_message(params)
+        messages_response = await config.get_api().get_message(params)
 
         if messages_response.status_code != 200:
             print_error(

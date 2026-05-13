@@ -13,16 +13,18 @@ underlying functions are monkeypatched at the daemon.runner local
 binding to control results and trigger stop_event after N iterations.
 
 Internal-mock disclosure: tests monkeypatch poll_home_timeline,
-poll_story_states, get_following_accounts, should_process_creator,
-_is_creator_in_scope at the daemon.runner binding (the local use site,
-canonical scope for testing the loop's behavior). Real-pipeline tests
-for the underlying functions live in test_polling.py / test_filters.py.
+poll_story_states, get_creator_account_info, get_following_accounts,
+should_process_creator, _is_creator_in_scope at the daemon.runner
+binding (the local use site, canonical scope for testing the loop's
+behavior). Real-pipeline tests for the underlying functions live in
+test_polling.py / test_filters.py.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import UTC
 
 import pytest
 
@@ -520,6 +522,10 @@ class TestFollowingRefreshLoop:
             stop_event.set()
             return {"new_user1", "new_user2"}
 
+        async def _account_info(_config, _state):
+            return None
+
+        monkeypatch.setattr("daemon.runner.get_creator_account_info", _account_info)
         monkeypatch.setattr("daemon.runner.get_following_accounts", _refresh)
 
         stop_event = asyncio.Event()
@@ -546,6 +552,10 @@ class TestFollowingRefreshLoop:
             stop_event.set()
             return set()
 
+        async def _account_info(_config, _state):
+            return None
+
+        monkeypatch.setattr("daemon.runner.get_creator_account_info", _account_info)
         monkeypatch.setattr("daemon.runner.get_following_accounts", _refresh)
 
         stop_event = asyncio.Event()
@@ -571,6 +581,10 @@ class TestFollowingRefreshLoop:
             stop_event.set()
             raise RuntimeError("refresh boom")
 
+        async def _account_info(_config, _state):
+            return None
+
+        monkeypatch.setattr("daemon.runner.get_creator_account_info", _account_info)
         monkeypatch.setattr("daemon.runner.get_following_accounts", _raises)
 
         stop_event = asyncio.Event()
@@ -588,6 +602,44 @@ class TestFollowingRefreshLoop:
         )
 
     @pytest.mark.asyncio
+    async def test_get_creator_account_info_called_before_following(
+        self, config, monkeypatch
+    ):
+        """Periodic refresh must populate state.creator_id before fetching the list.
+
+        Regression: the periodic loop used to construct a fresh
+        ``DownloadState()`` and call ``get_following_accounts`` directly,
+        which raises ``RuntimeError("client ID not set")`` on every tick.
+        The fix mirrors ``_refresh_following`` by calling
+        ``get_creator_account_info`` first.
+        """
+        config.use_following = True
+        sim = _make_simulator("active")
+
+        call_order: list[str] = []
+
+        async def _account_info(_config, _state):
+            call_order.append("account_info")
+
+        async def _refresh(_config, _state):
+            call_order.append("following")
+            stop_event.set()
+            return set()
+
+        monkeypatch.setattr("daemon.runner.get_creator_account_info", _account_info)
+        monkeypatch.setattr("daemon.runner.get_following_accounts", _refresh)
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+        budget = _make_budget()
+
+        await _following_refresh_loop(
+            config, sim, stop_event, refresh_event, budget, _FastDashboard()
+        )
+
+        assert call_order == ["account_info", "following"]
+
+    @pytest.mark.asyncio
     async def test_refresh_daemon_unrecoverable_re_raised(self, config, monkeypatch):
         """Lines 881-882: DaemonUnrecoverableError bypasses the generic except."""
         config.use_following = True
@@ -596,6 +648,10 @@ class TestFollowingRefreshLoop:
         async def _raises(_config, _state):
             raise DaemonUnrecoverableError("refresh fatal")
 
+        async def _account_info(_config, _state):
+            return None
+
+        monkeypatch.setattr("daemon.runner.get_creator_account_info", _account_info)
         monkeypatch.setattr("daemon.runner.get_following_accounts", _raises)
 
         stop_event = asyncio.Event()
@@ -638,7 +694,9 @@ class TestSimulatorTickLoopUnhideErrors:
         refresh_event = asyncio.Event()
         dashboard = _FastDashboard()
 
-        await _simulator_tick_loop(sim, stop_event, ws, refresh_event, dashboard)
+        await _simulator_tick_loop(
+            sim, stop_event, ws, refresh_event, _make_budget(), dashboard
+        )
 
         # The ws.stop_thread error was caught — refresh_event still set,
         # dashboard.set_ws_state(False) called.
@@ -665,11 +723,180 @@ class TestSimulatorTickLoopUnhideErrors:
         refresh_event = asyncio.Event()
         dashboard = _FastDashboard()
 
-        await _simulator_tick_loop(sim, stop_event, ws, refresh_event, dashboard)
+        await _simulator_tick_loop(
+            sim, stop_event, ws, refresh_event, _make_budget(), dashboard
+        )
 
         assert ws.stop_calls == 1
         assert ws.start_calls == 1
         assert True in dashboard.ws_states
+
+
+# ---------------------------------------------------------------------------
+# _simulator_tick_loop — Phase 1: budget.on_success() called on unhide
+# ---------------------------------------------------------------------------
+
+
+class TestSimulatorTickLoopBudgetReset:
+    """Phase 1: unhide calls budget.on_success() to prevent false
+    DaemonUnrecoverableError after long hidden periods."""
+
+    @pytest.mark.asyncio
+    async def test_unhide_resets_error_budget(self):
+        """Unhide transition resets budget.last_success_at to now."""
+        from datetime import datetime
+
+        sim = _make_simulator("hidden")
+        budget = _make_budget()
+        # Wind clock back to simulate 5 h of no API activity during hidden state.
+        budget.last_success_at = datetime(2020, 1, 1, tzinfo=UTC)
+
+        def _tick():
+            sim.state = "active"
+            stop_event.set()
+            return "unhide"
+
+        sim.tick = _tick  # type: ignore[method-assign]
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+
+        await _simulator_tick_loop(
+            sim, stop_event, FakeWS(), refresh_event, budget, _FastDashboard()
+        )
+
+        delta = (datetime.now(UTC) - budget.last_success_at).total_seconds()
+        assert delta < 5.0, "on_success() should have reset last_success_at to near-now"
+
+    @pytest.mark.asyncio
+    async def test_unhide_budget_reset_prevents_false_unrecoverable(self):
+        """After unhide, a soft error must NOT raise DaemonUnrecoverableError.
+
+        Without budget.on_success() the 5-h hidden gap exceeds the 1-h
+        timeout, so the first post-unhide error would fatally crash the daemon.
+        """
+        from datetime import datetime
+
+        sim = _make_simulator("hidden")
+        budget = _make_budget()  # 1-hour timeout
+        budget.last_success_at = datetime(2020, 1, 1, tzinfo=UTC)  # 5 h+ ago
+
+        def _tick():
+            sim.state = "active"
+            stop_event.set()
+            return "unhide"
+
+        sim.tick = _tick  # type: ignore[method-assign]
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+
+        await _simulator_tick_loop(
+            sim, stop_event, FakeWS(), refresh_event, budget, _FastDashboard()
+        )
+
+        # Clock was reset by on_success() — soft error must not raise.
+        budget.on_error(RuntimeError("soft error after unhide"))  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# _simulator_tick_loop — Phase 3: 15-minute heartbeat in all states
+# ---------------------------------------------------------------------------
+
+
+class _FakeTime:
+    """Stub for the ``time`` module imported inside ``daemon.runner``."""
+
+    def __init__(self, value: float) -> None:
+        self.value = value
+
+    def monotonic(self) -> float:
+        return self.value
+
+
+class TestSimulatorTickLoopHeartbeat:
+    """Phase 3: ws_logger DEBUG heartbeat fires every 15 min (900 s) in all states."""
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_emitted_when_interval_elapsed(self, monkeypatch, caplog):
+        """time.monotonic() returns a value 1000 s past epoch → interval elapsed → DEBUG log."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr("daemon.runner.time", _FakeTime(1000.0))
+
+        sim = _make_simulator("active")
+
+        def _tick():
+            stop_event.set()
+
+        sim.tick = _tick  # type: ignore[method-assign]
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+
+        await _simulator_tick_loop(
+            sim, stop_event, FakeWS(), refresh_event, _make_budget(), _FastDashboard()
+        )
+
+        assert any(
+            "WS alive" in r.getMessage()
+            for r in caplog.records
+            if r.levelname == "DEBUG"
+        ), "Heartbeat DEBUG log not found"
+
+    @pytest.mark.asyncio
+    async def test_heartbeat_not_emitted_before_interval(self, monkeypatch, caplog):
+        """time.monotonic() returns 0.1 s (< 900 s interval) → no heartbeat log."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr("daemon.runner.time", _FakeTime(0.1))
+
+        sim = _make_simulator("active")
+
+        def _tick():
+            stop_event.set()
+
+        sim.tick = _tick  # type: ignore[method-assign]
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+
+        await _simulator_tick_loop(
+            sim, stop_event, FakeWS(), refresh_event, _make_budget(), _FastDashboard()
+        )
+
+        assert not any(
+            "WS alive" in r.getMessage()
+            for r in caplog.records
+            if r.levelname == "DEBUG"
+        ), "Heartbeat should not fire before interval elapses"
+
+    @pytest.mark.parametrize("state", ["active", "idle", "hidden"])
+    @pytest.mark.asyncio
+    async def test_heartbeat_shows_state_for_all_states(
+        self, state: str, monkeypatch, caplog
+    ):
+        """Heartbeat includes the current simulator state — works in all three states."""
+        caplog.set_level(logging.DEBUG)
+        monkeypatch.setattr("daemon.runner.time", _FakeTime(1000.0))
+
+        sim = _make_simulator(state)
+
+        def _tick():
+            stop_event.set()
+
+        sim.tick = _tick  # type: ignore[method-assign]
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+
+        await _simulator_tick_loop(
+            sim, stop_event, FakeWS(), refresh_event, _make_budget(), _FastDashboard()
+        )
+
+        assert any(
+            f"state={state}" in r.getMessage()
+            for r in caplog.records
+            if r.levelname == "DEBUG" and "WS alive" in r.getMessage()
+        ), f"Heartbeat did not mention state={state}"
 
 
 # ---------------------------------------------------------------------------
@@ -1002,7 +1229,7 @@ class TestTimelinePollLoopShouldPollFalse:
 
 
 class TestTimelinePollLoopActiveTransition:
-    """Line 626: on_new_content returns True → refresh_event.set."""
+    """on_new_content returns True (transition) → refresh_event.set."""
 
     @pytest.mark.asyncio
     async def test_transition_to_active_sets_refresh_event(self, config, monkeypatch):
@@ -1022,7 +1249,7 @@ class TestTimelinePollLoopActiveTransition:
             return True
 
         async def _should_process(*_a, **_k):
-            return False  # don't enqueue — we only care about the refresh side-effect
+            return True  # enqueue → on_new_content fires → transition path runs
 
         monkeypatch.setattr("daemon.runner.poll_home_timeline", _poll)
         monkeypatch.setattr("daemon.runner._is_creator_in_scope", _scope_check)
@@ -1048,6 +1275,66 @@ class TestTimelinePollLoopActiveTransition:
 
         # The simulator transition fired refresh_event.
         assert refresh_event.is_set()
+        # And the candidate was enqueued (the precondition for on_new_content).
+        assert queue.qsize() == 1
+
+    @pytest.mark.asyncio
+    async def test_cache_miss_with_no_actionable_work_does_not_reset_simulator(
+        self, config, monkeypatch
+    ):
+        """Cache-miss creator + should_process=False → on_new_content not called."""
+        new_content_calls = 0
+
+        class _RecordingSimulator(StubSimulator):
+            def on_new_content(self) -> bool:
+                nonlocal new_content_calls
+                new_content_calls += 1
+                return True
+
+        sim = _RecordingSimulator(
+            timeline_interval=1.0, should_poll=True, transitions=True
+        )
+
+        creator_id = snowflake_id()
+        poll_count = 0
+
+        async def _poll(_config):
+            nonlocal poll_count
+            poll_count += 1
+            if poll_count >= 1:
+                stop_event.set()
+            return [creator_id], {creator_id: [{"id": 1, "createdAt": 0}]}
+
+        async def _scope_check(_config, _cid):
+            return True
+
+        async def _should_process(*_a, **_k):
+            return False  # limbo: cache-miss post but baseline-skipped
+
+        monkeypatch.setattr("daemon.runner.poll_home_timeline", _poll)
+        monkeypatch.setattr("daemon.runner._is_creator_in_scope", _scope_check)
+        monkeypatch.setattr("daemon.runner.should_process_creator", _should_process)
+
+        stop_event = asyncio.Event()
+        refresh_event = asyncio.Event()
+        queue: asyncio.Queue = asyncio.Queue()
+        budget = _make_budget()
+
+        await _timeline_poll_loop(
+            config,
+            sim,
+            queue,
+            None,
+            set(),
+            stop_event,
+            budget,
+            refresh_event,
+            _FastDashboard(),
+        )
+
+        assert new_content_calls == 0
+        assert not refresh_event.is_set()
+        assert queue.empty()
 
 
 class TestStoryPollLoopShouldPollFalse:

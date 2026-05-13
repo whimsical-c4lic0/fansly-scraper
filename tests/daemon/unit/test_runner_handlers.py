@@ -420,6 +420,44 @@ class TestHandleTimelineOnlyItemException:
         )
 
 
+class TestHandleTimelineOnlyItemBypassesStatsShortcut:
+    """Timeline-only handler clears the stats-cache skip flags before download."""
+
+    @pytest.mark.asyncio
+    async def test_creator_content_unchanged_flag_is_cleared_before_download(
+        self, config, entity_store, monkeypatch
+    ):
+        creator_id = snowflake_id()
+        account = AccountFactory.build(id=creator_id, username="tl_unchanged")
+        await entity_store.save(account)
+
+        async def _info_marks_unchanged(_config, state):
+            state.creator_content_unchanged = True
+            state.fetched_timeline_duplication = True
+
+        captured: dict = {}
+
+        async def _capture_download(_config, state):
+            captured["creator_content_unchanged"] = state.creator_content_unchanged
+            captured["fetched_timeline_duplication"] = (
+                state.fetched_timeline_duplication
+            )
+
+        monkeypatch.setattr(
+            "daemon.runner.get_creator_account_info", _info_marks_unchanged
+        )
+        monkeypatch.setattr("daemon.runner.download_timeline", _capture_download)
+
+        await _handle_timeline_only_item(
+            config, DownloadTimelineOnly(creator_id=creator_id)
+        )
+
+        assert captured == {
+            "creator_content_unchanged": False,
+            "fetched_timeline_duplication": False,
+        }
+
+
 # ---------------------------------------------------------------------------
 # _handle_mark_messages_deleted — entirely uncovered (lines 448-475)
 # ---------------------------------------------------------------------------
@@ -719,7 +757,7 @@ class TestOnServiceEvent:
 
         assert queue.empty()
         warnings = _logged(caplog, "WARNING")
-        assert any("WS envelope decode error svc=15" in m for m in warnings)
+        assert any("WS envelope decode error" in m and "svc=15" in m for m in warnings)
 
     @pytest.mark.asyncio
     async def test_event_type_missing_returns_silently(self):

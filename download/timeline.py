@@ -11,6 +11,7 @@ from config import FanslyConfig
 from errors import ApiError, DuplicatePageError
 from helpers.timer import timing_jitter
 from metadata import process_timeline_posts
+from metadata.models import Post, get_store
 from textio import (
     input_enter_continue,
     print_debug,
@@ -103,17 +104,7 @@ async def download_timeline(
     timeline_cursor = 0
     attempts = 0
 
-    if state.creator_content_unchanged:
-        # Credit skipped items to duplicate_count so the final summary
-        # reports them correctly — we never touched them individually,
-        # but counts matched, so they're all known-in-DB duplicates.
-        skipped = state.total_timeline_pictures + state.total_timeline_videos
-        state.duplicate_count += skipped
-        print_info(
-            f"Skipping Timeline download — creator counts and wall structure "
-            f"unchanged ({skipped} items already in DB, counted as duplicates)."
-        )
-        return
+    probe_pending = config.respect_timeline_stats and state.creator_content_unchanged
 
     if (
         config.use_duplicate_threshold or config.use_pagination_duplication
@@ -140,7 +131,7 @@ async def download_timeline(
             if state.creator_id is None or timeline_cursor is None:
                 raise RuntimeError("Creator name or timeline cursor should not be None")
 
-            timeline_response = config.get_api().get_timeline(
+            timeline_response = await config.get_api().get_timeline(
                 state.creator_id, str(timeline_cursor)
             )
 
@@ -150,6 +141,30 @@ async def download_timeline(
                 timeline = config.get_api().get_json_response_contents(
                     timeline_response
                 )
+
+                # Probe must run before process_timeline_data populates the
+                # identity map, otherwise the cache check trivially succeeds.
+                if probe_pending and timeline_cursor == 0:
+                    store = get_store()
+                    posts_on_page = (
+                        timeline.get("posts", []) if isinstance(timeline, dict) else []
+                    )
+                    all_known = bool(posts_on_page) and all(
+                        store.get_from_cache(Post, int(post["id"])) is not None
+                        for post in posts_on_page
+                    )
+                    if all_known:
+                        skipped = (
+                            state.total_timeline_pictures + state.total_timeline_videos
+                        )
+                        state.duplicate_count += skipped
+                        print_info(
+                            f"Skipping Timeline download — page 1 probe "
+                            f"verified counts unchanged ({skipped} items "
+                            f"already in DB, counted as duplicates)."
+                        )
+                        return
+                    probe_pending = False
 
                 await process_timeline_data(
                     config,
@@ -223,7 +238,7 @@ async def download_timeline(
                 \n or the creator is not providing unlocked content.",
                 35,
             )
-            input_enter_continue(config.interactive)
+            await input_enter_continue(config.interactive)
             if not config.interactive:
                 break
 
@@ -237,6 +252,6 @@ async def download_timeline(
                 f"Unexpected error during Timeline download: \n{traceback.format_exc()}",
                 36,
             )
-            input_enter_continue(config.interactive)
+            await input_enter_continue(config.interactive)
             if not config.interactive:
                 break

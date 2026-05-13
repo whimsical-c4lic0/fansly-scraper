@@ -36,26 +36,23 @@ orchestration; ``_mark_stories_viewed`` issues real HTTP POSTs to
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
 from download.downloadstate import DownloadState
 from download.stories import _mark_stories_viewed, download_stories
 from download.types import DownloadType
 from metadata import Account, MediaStoryState
 from tests.fixtures.api import dump_fansly_calls
+from tests.fixtures.download import FakeStory
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
-@dataclass
-class _FakeStory:
-    """Minimal story object exposing only ``.id`` for ``_mark_stories_viewed``."""
-
-    id: int
+# FakeStory lives in tests/fixtures/download/story_factories.py.
 
 
 # ---------------------------------------------------------------------------
@@ -63,23 +60,14 @@ class _FakeStory:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def config_with_api(test_config, fansly_api_with_respx):
-    """FanslyConfig whose get_api() returns a real httpx-backed FanslyApi.
-
-    Bypasses FanslyConfig.get_api()'s lazy-construction path (which would
-    try to read missing auth tokens) by injecting the api directly.
-    """
-    test_config._api = fansly_api_with_respx
-    return test_config
-
-
-@respx.mock
-def test_mark_stories_viewed_posts_once_per_story(config_with_api):
+@pytest.mark.asyncio
+async def test_mark_stories_viewed_posts_once_per_story(respx_fansly_api, test_config):
+    config_with_api = test_config
     """Helper POSTs /mediastory/view once per saved story with the story id."""
-    route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
-    ).mock(
+    respx.route(method="OPTIONS", url__startswith=FanslyApi.BASE_URL).mock(
+        side_effect=lambda _r: httpx.Response(200)
+    )
+    route = respx.post(url__startswith=f"{FanslyApi.BASE_URL}mediastory/view").mock(
         side_effect=[
             httpx.Response(200, json={"storyId": "111", "accountId": "999"}),
             httpx.Response(200, json={"storyId": "222", "accountId": "999"}),
@@ -87,9 +75,9 @@ def test_mark_stories_viewed_posts_once_per_story(config_with_api):
     )
 
     try:
-        _mark_stories_viewed(
+        await _mark_stories_viewed(
             config_with_api,
-            [_FakeStory(id=111), _FakeStory(id=222)],
+            [FakeStory(id=111), FakeStory(id=222)],
         )
     finally:
         dump_fansly_calls(route.calls, label="mark_stories_viewed_posts_once")
@@ -99,8 +87,11 @@ def test_mark_stories_viewed_posts_once_per_story(config_with_api):
     assert route.calls[1].request.read() == b'{"storyId":"222"}'
 
 
-@respx.mock
-def test_mark_stories_viewed_swallows_single_failure(config_with_api):
+@pytest.mark.asyncio
+async def test_mark_stories_viewed_swallows_single_failure(
+    respx_fansly_api, test_config
+):
+    config_with_api = test_config
     """One story failing with 500 must not prevent the others from being marked.
 
     ``api.mark_story_viewed`` uses ``http_session.post`` directly (no retry
@@ -109,9 +100,10 @@ def test_mark_stories_viewed_swallows_single_failure(config_with_api):
     try/except is there to catch connection errors or raise_for_status
     usage in future versions.
     """
-    route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
-    ).mock(
+    respx.route(method="OPTIONS", url__startswith=FanslyApi.BASE_URL).mock(
+        side_effect=lambda _r: httpx.Response(200)
+    )
+    route = respx.post(url__startswith=f"{FanslyApi.BASE_URL}mediastory/view").mock(
         side_effect=[
             httpx.Response(200, json={"storyId": "111"}),
             httpx.Response(500),
@@ -120,9 +112,9 @@ def test_mark_stories_viewed_swallows_single_failure(config_with_api):
     )
 
     try:
-        _mark_stories_viewed(
+        await _mark_stories_viewed(
             config_with_api,
-            [_FakeStory(id=111), _FakeStory(id=222), _FakeStory(id=333)],
+            [FakeStory(id=111), FakeStory(id=222), FakeStory(id=333)],
         )
     finally:
         dump_fansly_calls(route.calls, label="mark_stories_viewed_swallows_500")
@@ -136,20 +128,27 @@ def test_mark_stories_viewed_swallows_single_failure(config_with_api):
     ]
 
 
-@respx.mock
-def test_mark_stories_viewed_empty_list_is_noop(config_with_api):
+@pytest.mark.asyncio
+async def test_mark_stories_viewed_empty_list_is_noop(respx_fansly_api, test_config):
+    config_with_api = test_config
     """Passing an empty list does not hit the network."""
-    route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
-    ).mock(side_effect=[httpx.Response(200)])
+    respx.route(method="OPTIONS", url__startswith=FanslyApi.BASE_URL).mock(
+        side_effect=lambda _r: httpx.Response(200)
+    )
+    route = respx.post(url__startswith=f"{FanslyApi.BASE_URL}mediastory/view").mock(
+        side_effect=[httpx.Response(200)]
+    )
 
-    _mark_stories_viewed(config_with_api, [])
+    await _mark_stories_viewed(config_with_api, [])
 
     assert route.call_count == 0
 
 
-@respx.mock
-def test_mark_stories_viewed_swallows_post_exception(config_with_api):
+@pytest.mark.asyncio
+async def test_mark_stories_viewed_swallows_post_exception(
+    respx_fansly_api, test_config
+):
+    config_with_api = test_config
     """Connection-level exception from POST → caught + logged, others continue.
 
     Covers lines 106-107 (``except Exception as e: print_warning(...)``).
@@ -157,9 +156,10 @@ def test_mark_stories_viewed_swallows_post_exception(config_with_api):
     default), a real connection error surfaces as ``httpx.ConnectError``.
     The helper must swallow it and proceed to the next story.
     """
-    route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
-    ).mock(
+    respx.route(method="OPTIONS", url__startswith=FanslyApi.BASE_URL).mock(
+        side_effect=lambda _r: httpx.Response(200)
+    )
+    route = respx.post(url__startswith=f"{FanslyApi.BASE_URL}mediastory/view").mock(
         side_effect=[
             httpx.Response(200, json={"storyId": "111"}),
             httpx.ConnectError("simulated network drop"),
@@ -168,9 +168,9 @@ def test_mark_stories_viewed_swallows_post_exception(config_with_api):
     )
 
     try:
-        _mark_stories_viewed(
+        await _mark_stories_viewed(
             config_with_api,
-            [_FakeStory(id=111), _FakeStory(id=222), _FakeStory(id=333)],
+            [FakeStory(id=111), FakeStory(id=222), FakeStory(id=333)],
         )
     finally:
         dump_fansly_calls(route.calls, label="mark_stories_viewed_post_exception")
@@ -286,7 +286,7 @@ async def test_download_stories_calls_mark_when_mark_viewed_true(
 
     am_entry = _account_media_entry(media_id, creator_id)
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -303,7 +303,7 @@ async def test_download_stories_calls_mark_when_mark_viewed_true(
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(200, json={"success": True, "response": [am_entry]})
         ]
@@ -311,7 +311,7 @@ async def test_download_stories_calls_mark_when_mark_viewed_true(
 
     # The real /mediastory/view boundary — the gate-under-test.
     mark_view_route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
+        url__startswith=f"{FanslyApi.BASE_URL}mediastory/view"
     ).mock(
         side_effect=[
             httpx.Response(
@@ -323,7 +323,10 @@ async def test_download_stories_calls_mark_when_mark_viewed_true(
     _noop_download = AsyncMock(return_value=None)
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
 
@@ -368,7 +371,7 @@ async def test_download_stories_skips_mark_when_mark_viewed_false(
 
     am_entry = _account_media_entry(media_id, creator_id)
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -385,7 +388,7 @@ async def test_download_stories_skips_mark_when_mark_viewed_false(
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(200, json={"success": True, "response": [am_entry]})
         ]
@@ -393,13 +396,16 @@ async def test_download_stories_skips_mark_when_mark_viewed_false(
 
     # Same route as above — but assert it's NEVER called when gate is closed.
     mark_view_route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
+        url__startswith=f"{FanslyApi.BASE_URL}mediastory/view"
     ).mock(side_effect=[httpx.Response(200, json={"storyId": str(story_id)})])
 
     _noop_download = AsyncMock(return_value=None)
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
 
@@ -473,7 +479,7 @@ async def test_download_stories_empty_media_returns_early(
     await _seed_creator_account(entity_store, creator_id, "no_media")
     state = DownloadState(creator_id=creator_id, creator_name="no_media")
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -494,7 +500,7 @@ async def test_download_stories_empty_media_returns_early(
     # No mark-view route registered — should never be hit since we return
     # before reaching the gate.
     mark_view_route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
+        url__startswith=f"{FanslyApi.BASE_URL}mediastory/view"
     ).mock(side_effect=[httpx.Response(200)])
 
     await download_stories(config, state)
@@ -517,14 +523,14 @@ async def test_download_stories_no_stories_in_response(
     creator_id = snowflake_id()
     state = DownloadState(creator_id=creator_id, creator_name="empty")
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[
             httpx.Response(200, json=_stories_response(media_stories=[])),
         ]
     )
 
     mark_view_route = respx.post(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastory/view"
+        url__startswith=f"{FanslyApi.BASE_URL}mediastory/view"
     ).mock(side_effect=[httpx.Response(200)])
 
     await download_stories(config, state)
@@ -552,7 +558,7 @@ async def test_download_stories_no_creator_id_skips_cache_check(
     # creator_id is None — exercises the False branch of `if state.creator_id`.
     state = DownloadState(creator_id=None, creator_name="no_id")
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[
             httpx.Response(200, json=_stories_response(media_stories=[])),
         ]
@@ -581,7 +587,7 @@ async def test_download_stories_swallows_outer_exception(
     creator_id = snowflake_id()
     state = DownloadState(creator_id=creator_id, creator_name="boom")
 
-    respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+    respx.get(f"{FanslyApi.BASE_URL}mediastoriesnew").mock(
         side_effect=[httpx.Response(403, text="Forbidden")]
     )
 

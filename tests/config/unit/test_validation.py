@@ -33,7 +33,7 @@ import logging
 import platform as _platform
 import types
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -55,43 +55,15 @@ from config.validation import (
 from errors import ConfigError
 
 
-@pytest.fixture
-def validation_config(tmp_path):
-    """Return a real ``FanslyConfig`` configured for validation tests.
-
-    Replaces the old ``mock_config`` (``MagicMock(spec=FanslyConfig)``)
-    fixture. Every field starts at a known real value so the production
-    ``token_is_valid()`` / ``useragent_is_valid()`` methods return True
-    by default — tests that want the "invalid" branch of those checks
-    override the field explicitly (e.g., ``config.token = "short"``).
-
-    The ``config_path`` points at ``tmp_path / "config.yaml"`` so any
-    ``save_config_or_raise`` path runs real YAML I/O into a throwaway
-    directory — no mocks. Because asserted-on values like ``token`` and
-    ``user_agent`` round-trip through YAML and get re-loaded in some
-    validators, the size of the strings matches Fansly's real shape
-    (60-char token, Mozilla/5.0 UA).
-    """
-    config = FanslyConfig(program_version="0.13.0-test")
-    config.config_path = tmp_path / "config.yaml"
-    config.interactive = False
-    config.user_names = {"validuser1", "validuser2"}
-    # token_is_valid() requires len >= 50 and no "ReplaceMe".
-    config.token = "a" * 60
-    # useragent_is_valid() requires len >= 40 and no "ReplaceMe".
-    config.user_agent = "Mozilla/5.0 " + "A" * 60
-    config.check_key = "check-key-placeholder-123"
-    config.download_directory = Path.cwd()
-    config.download_mode = DownloadMode.TIMELINE
-    config.username = None
-    config.password = None
-    return config
+# validation_config fixture lives in tests/fixtures/config/ and flows through
+# tests/conftest.py via the wildcard import — single-source-of-truth per
+# project convention.
 
 
 # -- validate_creator_names -------------------------------------------------
 
 
-def test_validate_creator_names_valid_names_pass_through(validation_config):
+async def test_validate_creator_names_valid_names_pass_through(validation_config):
     """Validation accepts a set of real valid names unchanged.
 
     Runs the real ``validate_adjust_creator_name`` for each name — every
@@ -99,19 +71,21 @@ def test_validate_creator_names_valid_names_pass_through(validation_config):
     unchanged. No internal patches.
     """
     validation_config.user_names = {"alice", "bobuser"}
-    assert validate_creator_names(validation_config) is True
+    assert await validate_creator_names(validation_config) is True
     assert validation_config.user_names == {"alice", "bobuser"}
 
 
-def test_validate_creator_names_returns_false_when_user_names_is_none(
+async def test_validate_creator_names_returns_false_when_user_names_is_none(
     validation_config,
 ):
     """Validation returns False immediately when user_names is None (line 36)."""
     validation_config.user_names = None
-    assert validate_creator_names(validation_config) is False
+    assert await validate_creator_names(validation_config) is False
 
 
-def test_validate_creator_names_removes_invalid_and_saves(validation_config, caplog):
+async def test_validate_creator_names_removes_invalid_and_saves(
+    validation_config, caplog
+):
     """Names failing the real validator are removed and config is saved.
 
     Mixes valid + invalid names (too short, spaces, bad chars) and asserts
@@ -123,7 +97,7 @@ def test_validate_creator_names_removes_invalid_and_saves(validation_config, cap
     caplog.set_level(logging.WARNING)
     validation_config.user_names = {"a", "valid", "bad chars!"}
 
-    assert validate_creator_names(validation_config) is True
+    assert await validate_creator_names(validation_config) is True
     # Invalid names filtered out; only "valid" (5 chars, OK) remains.
     assert validation_config.user_names == {"valid"}
     # Real YAML save happened.
@@ -139,7 +113,7 @@ def test_validate_creator_names_removes_invalid_and_saves(validation_config, cap
     )
 
 
-def test_validate_creator_names_all_removed_returns_true_and_falls_back(
+async def test_validate_creator_names_all_removed_returns_true_and_falls_back(
     validation_config, caplog
 ):
     """All-names-removed path returns True ("will process following list").
@@ -152,7 +126,7 @@ def test_validate_creator_names_all_removed_returns_true_and_falls_back(
     caplog.set_level(logging.INFO)
     validation_config.user_names = {"a", "b"}  # all too short
 
-    assert validate_creator_names(validation_config) is True
+    assert await validate_creator_names(validation_config) is True
     assert len(validation_config.user_names) == 0
     info_messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
     assert any("will process following list" in m for m in info_messages), (
@@ -160,20 +134,25 @@ def test_validate_creator_names_all_removed_returns_true_and_falls_back(
     )
 
 
-def test_validate_creator_names_interactive_adjustment(validation_config, monkeypatch):
+async def test_validate_creator_names_interactive_adjustment(
+    validation_config, monkeypatch
+):
     """Interactive mode: user fixes an invalid name → config updates and saves.
 
     The real ``validate_adjust_creator_name`` loops on invalid input until
-    the user types a valid name. We inject ``correctuser`` via
-    ``builtins.input``; the real validator accepts it and the set mutation
-    + save fires.
+    the user types a valid name. We inject ``correctuser`` by monkey-patching
+    the ``aprompt_text`` async helper; the real validator accepts the result
+    and the set mutation + save fires.
     """
     validation_config.interactive = True
     validation_config.user_names = {"bad user"}  # space → invalid
 
-    monkeypatch.setattr("builtins.input", lambda _prompt: "correctuser")
+    async def _fake_aprompt_text(_prompt: str, **_kwargs) -> str:
+        return "correctuser"
 
-    assert validate_creator_names(validation_config) is True
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
+
+    assert await validate_creator_names(validation_config) is True
     assert validation_config.user_names == {"correctuser"}
     assert validation_config.config_path.exists()
 
@@ -181,41 +160,51 @@ def test_validate_creator_names_interactive_adjustment(validation_config, monkey
 # -- validate_adjust_creator_name (pure function, no fixture) ---------------
 
 
-def test_validate_adjust_creator_name_valid():
+async def test_validate_adjust_creator_name_valid():
     """Real validator accepts a well-formed name."""
-    assert validate_adjust_creator_name("validuser") == "validuser"
+    assert await validate_adjust_creator_name("validuser") == "validuser"
 
 
-def test_validate_adjust_creator_name_replaceme_placeholder():
+async def test_validate_adjust_creator_name_replaceme_placeholder():
     """ReplaceMe placeholder is rejected (non-interactive → None)."""
-    assert validate_adjust_creator_name("ReplaceMe") is None
+    assert await validate_adjust_creator_name("ReplaceMe") is None
 
 
-def test_validate_adjust_creator_name_rejects_spaces():
-    assert validate_adjust_creator_name("invalid user") is None
+async def test_validate_adjust_creator_name_rejects_spaces():
+    assert await validate_adjust_creator_name("invalid user") is None
 
 
 @pytest.mark.parametrize(
     "name", ["a", "abc", "a" * 31], ids=["one_char", "three_chars", "thirty_one"]
 )
-def test_validate_adjust_creator_name_rejects_bad_length(name):
-    assert validate_adjust_creator_name(name) is None
+async def test_validate_adjust_creator_name_rejects_bad_length(name):
+    assert await validate_adjust_creator_name(name) is None
 
 
-def test_validate_adjust_creator_name_rejects_bad_chars():
-    assert validate_adjust_creator_name("user!@#") is None
+async def test_validate_adjust_creator_name_rejects_bad_chars():
+    assert await validate_adjust_creator_name("user!@#") is None
 
 
-def test_validate_adjust_creator_name_interactive_retries_until_valid(monkeypatch):
+async def test_validate_adjust_creator_name_interactive_retries_until_valid(
+    monkeypatch,
+):
     """Interactive mode loops on invalid input until a valid one is entered."""
-    monkeypatch.setattr("builtins.input", lambda _: "validuser")
-    assert validate_adjust_creator_name("invalid user", interactive=True) == "validuser"
+
+    async def _fake_aprompt_text(_prompt: str, **_kwargs) -> str:
+        return "validuser"
+
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
+    assert (
+        await validate_adjust_creator_name("invalid user", interactive=True)
+        == "validuser"
+    )
 
 
 # -- validate_adjust_token --------------------------------------------------
 
 
-def test_validate_adjust_token_skips_when_username_password_set(
+@pytest.mark.asyncio
+async def test_validate_adjust_token_skips_when_username_password_set(
     validation_config, caplog
 ):
     """When credentials are configured, token validation is skipped (lines 139-143).
@@ -231,7 +220,7 @@ def test_validate_adjust_token_skips_when_username_password_set(
     validation_config.password = "secret"
     validation_config.token = "short"  # would be invalid, but should be ignored
 
-    validate_adjust_token(validation_config)  # Must not raise.
+    await validate_adjust_token(validation_config)  # Must not raise.
 
     info_messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]
     assert any("Username and password configured" in m for m in info_messages), (
@@ -239,8 +228,9 @@ def test_validate_adjust_token_skips_when_username_password_set(
     )
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec", side_effect=ImportError("no plyvel"))
-def test_validate_adjust_token_plyvel_import_error_raises_config_error(
+async def test_validate_adjust_token_plyvel_import_error_raises_config_error(
     _find_spec,  # noqa: PT019 — @patch decorator, not a fixture
     validation_config,
 ):
@@ -248,11 +238,12 @@ def test_validate_adjust_token_plyvel_import_error_raises_config_error(
     validation_config.token = "short"  # invalid (<50 chars)
 
     with pytest.raises(ConfigError, match=r"authorization token.*still invalid"):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec", return_value=None)
-def test_validate_adjust_token_no_plyvel_invalid_token_raises(
+async def test_validate_adjust_token_no_plyvel_invalid_token_raises(
     _find_spec,  # noqa: PT019 — @patch decorator, not a fixture
     validation_config,
 ):
@@ -261,11 +252,12 @@ def test_validate_adjust_token_no_plyvel_invalid_token_raises(
     validation_config.interactive = False
 
     with pytest.raises(ConfigError, match=r"authorization token.*still invalid"):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_interactive_invalid_token_opens_url_and_raises(
+async def test_validate_adjust_token_interactive_invalid_token_opens_url_and_raises(
     mock_find_spec, validation_config
 ):
     """Interactive + invalid token + no browsers → open_get_started_url fires."""
@@ -277,13 +269,14 @@ def test_validate_adjust_token_interactive_invalid_token_opens_url_and_raises(
         patch("config.validation.open_get_started_url") as mock_open_url,
         pytest.raises(ConfigError, match=r"authorization token.*still invalid"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     mock_open_url.assert_called_once()
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_plyvel_installed_no_account_raises(
+async def test_validate_adjust_token_plyvel_installed_no_account_raises(
     mock_find_spec, validation_config
 ):
     """Plyvel installed + empty browser list → raises with "not found" message."""
@@ -295,11 +288,12 @@ def test_validate_adjust_token_plyvel_installed_no_account_raises(
         patch("config.browser.get_browser_config_paths", return_value=[]),
         pytest.raises(ConfigError, match="not found in any of your browser"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_auto_links_in_non_interactive_mode(
+async def test_validate_adjust_token_auto_links_in_non_interactive_mode(
     mock_find_spec, validation_config
 ):
     """Non-interactive + token found in browser → auto-linked (lines 242-258)."""
@@ -327,18 +321,19 @@ def test_validate_adjust_token_auto_links_in_non_interactive_mode(
             FanslyConfig,
             "get_api",
             return_value=types.SimpleNamespace(
-                get_client_user_name=lambda _token: "found_user"
+                get_client_user_name=AsyncMock(return_value="found_user")
             ),
         ),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     assert validation_config.token == valid_token
     assert validation_config.token_from_browser_name == "Chromium"
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_firefox_profile_branch(
+async def test_validate_adjust_token_firefox_profile_branch(
     mock_find_spec, validation_config
 ):
     """Firefox path uses ``get_token_from_firefox_profile`` (lines 208-214)."""
@@ -362,17 +357,18 @@ def test_validate_adjust_token_firefox_profile_branch(
             FanslyConfig,
             "get_api",
             return_value=types.SimpleNamespace(
-                get_client_user_name=lambda _token: "firefox_user"
+                get_client_user_name=AsyncMock(return_value="firefox_user")
             ),
         ),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     assert validation_config.token == firefox_token
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_interactive_user_accepts_link(
+async def test_validate_adjust_token_interactive_user_accepts_link(
     mock_find_spec, validation_config, monkeypatch
 ):
     """Interactive: token found → user types "yes" → token saved (lines 222-258)."""
@@ -380,7 +376,10 @@ def test_validate_adjust_token_interactive_user_accepts_link(
     validation_config.interactive = True
     validation_config.token = "short"
 
-    monkeypatch.setattr("builtins.input", lambda _: "yes")
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return True
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
 
     valid_token = "c" * 60
 
@@ -402,18 +401,19 @@ def test_validate_adjust_token_interactive_user_accepts_link(
             FanslyConfig,
             "get_api",
             return_value=types.SimpleNamespace(
-                get_client_user_name=lambda _token: "found_user"
+                get_client_user_name=AsyncMock(return_value="found_user")
             ),
         ),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     assert validation_config.token == valid_token
     assert validation_config.token_from_browser_name == "Chromium"
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_interactive_user_rejects_link(
+async def test_validate_adjust_token_interactive_user_rejects_link(
     mock_find_spec, validation_config, monkeypatch
 ):
     """Interactive: token found but user says "no" → raises ConfigError."""
@@ -421,7 +421,10 @@ def test_validate_adjust_token_interactive_user_rejects_link(
     validation_config.interactive = True
     validation_config.token = "short"
 
-    monkeypatch.setattr("builtins.input", lambda _: "no")
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return False
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
 
     with (
         patch(
@@ -442,16 +445,17 @@ def test_validate_adjust_token_interactive_user_rejects_link(
             FanslyConfig,
             "get_api",
             return_value=types.SimpleNamespace(
-                get_client_user_name=lambda _token: "found_user"
+                get_client_user_name=AsyncMock(return_value="found_user")
             ),
         ),
         pytest.raises(ConfigError, match=r"authorization token.*still invalid"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_leveldb_folder_no_token_continues_loop(
+async def test_validate_adjust_token_leveldb_folder_no_token_continues_loop(
     mock_find_spec, validation_config
 ):
     """Leveldb folder yields no token → inner ``if`` False; outer ``if all`` False.
@@ -480,11 +484,12 @@ def test_validate_adjust_token_leveldb_folder_no_token_continues_loop(
         ),
         pytest.raises(ConfigError, match="not found in any of your browser"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_empty_leveldb_folders_continues(
+async def test_validate_adjust_token_empty_leveldb_folders_continues(
     mock_find_spec, validation_config
 ):
     """``find_leveldb_folders`` returns empty → inner for-loop body skipped.
@@ -505,11 +510,12 @@ def test_validate_adjust_token_empty_leveldb_folders_continues(
         patch("config.browser.find_leveldb_folders", return_value=[]),
         pytest.raises(ConfigError, match="not found in any of your browser"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_firefox_no_token_continues(
+async def test_validate_adjust_token_firefox_no_token_continues(
     mock_find_spec, validation_config
 ):
     """Firefox profile yields no token → ``if browser_fansly_token`` False.
@@ -532,11 +538,12 @@ def test_validate_adjust_token_firefox_no_token_continues(
         ),
         pytest.raises(ConfigError, match="not found in any of your browser"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_plyvel_installed_interactive_opens_started_url(
+async def test_validate_adjust_token_plyvel_installed_interactive_opens_started_url(
     mock_find_spec, validation_config
 ):
     """Plyvel + interactive + no account found → ``open_get_started_url`` fires.
@@ -555,13 +562,14 @@ def test_validate_adjust_token_plyvel_installed_interactive_opens_started_url(
         patch("config.validation.open_get_started_url") as mock_open_url,
         pytest.raises(ConfigError, match="not found in any of your browser"),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     mock_open_url.assert_called_once()
 
 
+@pytest.mark.asyncio
 @patch("importlib.util.find_spec")
-def test_validate_adjust_token_interactive_reprompts_on_invalid_input(
+async def test_validate_adjust_token_interactive_reprompts_on_invalid_input(
     mock_find_spec, validation_config, monkeypatch
 ):
     """Interactive: user types garbage → prompt re-asks → accepts next valid input.
@@ -575,8 +583,13 @@ def test_validate_adjust_token_interactive_reprompts_on_invalid_input(
     validation_config.interactive = True
     validation_config.token = "short"
 
-    inputs = iter(["maybe", "dunno", "yes"])
-    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    # Note: invalid-input retry behavior now lives in textio.prompts.aconfirm
+    # itself (the helper loops on unparseable answers); production code only
+    # sees the final True/False. Test simplifies to "user eventually accepts."
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return True
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
 
     with (
         patch(
@@ -596,11 +609,11 @@ def test_validate_adjust_token_interactive_reprompts_on_invalid_input(
             FanslyConfig,
             "get_api",
             return_value=types.SimpleNamespace(
-                get_client_user_name=lambda _token: "found_user"
+                get_client_user_name=AsyncMock(return_value="found_user")
             ),
         ),
     ):
-        validate_adjust_token(validation_config)
+        await validate_adjust_token(validation_config)
 
     # User eventually accepted, so token is saved.
     assert validation_config.token == "e" * 60
@@ -729,78 +742,101 @@ def test_validate_adjust_user_agent_logs_browser_specific_when_token_from_browse
 # -- validate_adjust_check_key ----------------------------------------------
 
 
-def test_validate_adjust_check_key_guess_succeeds_sets_key(validation_config):
+async def test_validate_adjust_check_key_guess_succeeds_sets_key(validation_config):
     """guess_check_key returns a value → config.check_key is updated + saved."""
     # config.user_agent is set via fixture — guess_check_key gets called.
     with patch("helpers.checkkey.guess_check_key", return_value="guessed_key_xyz"):
-        validate_adjust_check_key(validation_config)
+        await validate_adjust_check_key(validation_config)
 
     assert validation_config.check_key == "guessed_key_xyz"
     assert validation_config.config_path.exists()
 
 
-def test_validate_adjust_check_key_guess_fails_interactive_confirm_keeps_key(
+async def test_validate_adjust_check_key_guess_fails_interactive_confirm_keeps_key(
     validation_config, monkeypatch
 ):
-    """guess_check_key returns None → interactive 'y' confirms existing key."""
+    """guess_check_key returns None → interactive yes confirms existing key."""
     validation_config.interactive = True
     original_key = validation_config.check_key
 
-    monkeypatch.setattr("builtins.input", lambda _: "y")
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return True
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
 
     with patch("helpers.checkkey.guess_check_key", return_value=None):
-        validate_adjust_check_key(validation_config)
+        await validate_adjust_check_key(validation_config)
 
     assert validation_config.check_key == original_key
 
 
-def test_validate_adjust_check_key_guess_fails_interactive_user_enters_new_key(
+async def test_validate_adjust_check_key_guess_fails_interactive_user_enters_new_key(
     validation_config, monkeypatch
 ):
-    """guess fails → user types 'n' → types new key → confirms with 'y'."""
+    """guess fails → user rejects current → enters new key → confirms it."""
     validation_config.interactive = True
 
-    # 'n' (reject current), 'new_key_value', 'y' (confirm new key)
-    inputs = iter(["n", "new_key_value", "y"])
-    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    # First aconfirm: reject current. Second aconfirm: accept new key.
+    confirm_answers = iter([False, True])
+
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return next(confirm_answers)
+
+    async def _fake_aprompt_text(_q: str, **_k) -> str:
+        return "new_key_value"
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
 
     with patch("helpers.checkkey.guess_check_key", return_value=None):
-        validate_adjust_check_key(validation_config)
+        await validate_adjust_check_key(validation_config)
 
     assert validation_config.check_key == "new_key_value"
 
 
-def test_validate_adjust_check_key_user_rejects_new_key_then_accepts(
+async def test_validate_adjust_check_key_user_rejects_new_key_then_accepts(
     validation_config, monkeypatch
 ):
     """Interactive: user rejects a new-key confirmation, re-enters, accepts next.
 
-    Covers partial branch 402->391: the while-loop continues when the
-    confirmation of the typed key is 'n' (not-'y'), prompting again.
+    Covers partial branch where the while-loop continues when the
+    confirmation of the typed key is False, prompting again.
     """
     validation_config.interactive = True
 
-    # Inputs: 'n' (reject current), 'first_try', 'n' (reject first try),
-    #         'second_try', 'y' (accept second try).
-    inputs = iter(["n", "first_try", "n", "second_try", "y"])
-    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
+    # aconfirm sequence: reject current, reject first try, accept second try.
+    confirm_answers = iter([False, False, True])
+    text_answers = iter(["first_try", "second_try"])
+
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return next(confirm_answers)
+
+    async def _fake_aprompt_text(_q: str, **_k) -> str:
+        return next(text_answers)
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
 
     with patch("helpers.checkkey.guess_check_key", return_value=None):
-        validate_adjust_check_key(validation_config)
+        await validate_adjust_check_key(validation_config)
 
     assert validation_config.check_key == "second_try"
 
 
-def test_validate_adjust_check_key_no_user_agent_non_interactive(validation_config):
+async def test_validate_adjust_check_key_no_user_agent_non_interactive(
+    validation_config,
+):
     """user_agent is None → skips guess; non-interactive falls through to continue.
 
-    Covers the ``if config.user_agent:`` False branch at line 358.
+    Covers the ``if config.user_agent:`` False branch.
     """
     validation_config.user_agent = None
     validation_config.interactive = False
 
-    with patch("config.validation.input_enter_continue") as mock_continue:
-        validate_adjust_check_key(validation_config)
+    with patch(
+        "config.validation.input_enter_continue", new_callable=AsyncMock
+    ) as mock_continue:
+        await validate_adjust_check_key(validation_config)
 
     mock_continue.assert_called_once_with(False)
 
@@ -808,16 +844,18 @@ def test_validate_adjust_check_key_no_user_agent_non_interactive(validation_conf
 # -- validate_adjust_download_directory -------------------------------------
 
 
-def test_validate_adjust_download_directory_local_dir_sets_cwd(validation_config):
+async def test_validate_adjust_download_directory_local_dir_sets_cwd(
+    validation_config,
+):
     """``local_dir`` sentinel in path → resolved to Path.cwd()."""
     validation_config.download_directory = Path("local_dir")
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert validation_config.download_directory == Path.cwd()
 
 
-def test_validate_adjust_download_directory_valid_custom_dir_kept(
+async def test_validate_adjust_download_directory_valid_custom_dir_kept(
     validation_config, tmp_path
 ):
     """Valid existing directory is kept as-is (no save, no dialog)."""
@@ -825,34 +863,41 @@ def test_validate_adjust_download_directory_valid_custom_dir_kept(
     custom.mkdir()
     validation_config.download_directory = custom
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert validation_config.download_directory == custom
 
 
-def test_validate_adjust_download_directory_invalid_prompts_for_replacement(
+async def test_validate_adjust_download_directory_invalid_prompts_for_replacement(
     validation_config, tmp_path, monkeypatch
 ):
     """Invalid directory → sleep + ask_correct_dir → save.
 
     Uses a non-existent Path as the bad directory; a real tmp_path
-    directory as the replacement. Patches ``sleep`` (so tests don't
+    directory as the replacement. Patches ``asyncio.sleep`` (so tests don't
     pause 10s) and ``ask_correct_dir`` (would open a prompt_toolkit prompt).
     """
     validation_config.download_directory = tmp_path / "nonexistent"
     replacement = tmp_path / "picked"
     replacement.mkdir()
 
-    monkeypatch.setattr("config.validation.sleep", lambda _seconds: None)
+    async def _fake_sleep(_seconds):
+        return None
 
-    with patch("config.validation.ask_correct_dir", return_value=replacement):
-        validate_adjust_download_directory(validation_config)
+    monkeypatch.setattr("config.validation.asyncio.sleep", _fake_sleep)
+
+    with patch(
+        "config.validation.ask_correct_dir",
+        new_callable=AsyncMock,
+        return_value=replacement,
+    ):
+        await validate_adjust_download_directory(validation_config)
 
     assert validation_config.download_directory == replacement
     assert validation_config.config_path.exists()
 
 
-def test_validate_adjust_download_directory_creates_missing_temp_folder(
+async def test_validate_adjust_download_directory_creates_missing_temp_folder(
     validation_config, tmp_path
 ):
     """Non-existent temp_folder → created on disk, kept in config."""
@@ -861,14 +906,14 @@ def test_validate_adjust_download_directory_creates_missing_temp_folder(
     # Valid download_directory so we don't enter the prompt branch.
     validation_config.download_directory = tmp_path
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert new_temp.exists()
     assert new_temp.is_dir()
     assert validation_config.temp_folder == new_temp
 
 
-def test_validate_adjust_download_directory_temp_folder_creation_error_falls_back(
+async def test_validate_adjust_download_directory_temp_folder_creation_error_falls_back(
     validation_config, tmp_path, monkeypatch
 ):
     """PermissionError when creating temp_folder → falls back to None.
@@ -891,12 +936,12 @@ def test_validate_adjust_download_directory_temp_folder_creation_error_falls_bac
     validation_config.temp_folder = bad_temp
     validation_config.download_directory = tmp_path
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert validation_config.temp_folder is None
 
 
-def test_validate_adjust_download_directory_temp_folder_not_a_directory(
+async def test_validate_adjust_download_directory_temp_folder_not_a_directory(
     validation_config, tmp_path
 ):
     """temp_folder path exists but is a file, not a directory → falls back."""
@@ -905,12 +950,12 @@ def test_validate_adjust_download_directory_temp_folder_not_a_directory(
     validation_config.temp_folder = not_a_dir
     validation_config.download_directory = tmp_path
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert validation_config.temp_folder is None
 
 
-def test_validate_adjust_download_directory_temp_folder_valid_existing_dir(
+async def test_validate_adjust_download_directory_temp_folder_valid_existing_dir(
     validation_config, tmp_path
 ):
     """temp_folder already exists as a directory → kept unchanged."""
@@ -919,7 +964,7 @@ def test_validate_adjust_download_directory_temp_folder_valid_existing_dir(
     validation_config.temp_folder = existing
     validation_config.download_directory = tmp_path
 
-    validate_adjust_download_directory(validation_config)
+    await validate_adjust_download_directory(validation_config)
 
     assert validation_config.temp_folder == existing
 
@@ -927,68 +972,88 @@ def test_validate_adjust_download_directory_temp_folder_valid_existing_dir(
 # -- validate_adjust_download_mode ------------------------------------------
 
 
-def test_validate_adjust_download_mode_non_interactive_no_change(validation_config):
+async def test_validate_adjust_download_mode_non_interactive_no_change(
+    validation_config,
+):
     """Non-interactive mode: no prompt, mode unchanged."""
-    validate_adjust_download_mode(validation_config, download_mode_set=False)
+    await validate_adjust_download_mode(validation_config, download_mode_set=False)
     assert validation_config.download_mode == DownloadMode.TIMELINE
 
 
-def test_validate_adjust_download_mode_interactive_user_declines(
+async def test_validate_adjust_download_mode_interactive_user_declines(
     validation_config, monkeypatch
 ):
-    """Interactive mode: user types 'n' → mode unchanged."""
+    """Interactive mode: user answers no → mode unchanged."""
     validation_config.interactive = True
-    monkeypatch.setattr("builtins.input", lambda _: "n")
 
-    validate_adjust_download_mode(validation_config, download_mode_set=False)
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return False
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
+
+    await validate_adjust_download_mode(validation_config, download_mode_set=False)
 
     assert validation_config.download_mode == DownloadMode.TIMELINE
 
 
-def test_validate_adjust_download_mode_interactive_user_changes_mode(
+async def test_validate_adjust_download_mode_interactive_user_changes_mode(
     validation_config, monkeypatch
 ):
-    """Interactive mode: user types 'y' then 'SINGLE' → mode updated."""
+    """Interactive mode: user answers yes then 'SINGLE' → mode updated."""
     validation_config.interactive = True
-    inputs = iter(["y", "SINGLE"])
-    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
-    validate_adjust_download_mode(validation_config, download_mode_set=False)
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return True
+
+    async def _fake_aprompt_text(_q: str, **_k) -> str:
+        return "SINGLE"
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
+
+    await validate_adjust_download_mode(validation_config, download_mode_set=False)
 
     assert validation_config.download_mode == DownloadMode.SINGLE
 
 
-def test_validate_adjust_download_mode_interactive_invalid_mode_preserves_original(
+async def test_validate_adjust_download_mode_interactive_invalid_mode_preserves_original(
     validation_config, monkeypatch
 ):
-    """Interactive: user types 'y' → invalid mode → 'n' exits → original kept.
+    """Interactive: user yes → invalid mode → no exits → original kept.
 
     Runs real ``DownloadMode(...)`` constructor — an invalid string raises
     the real ``ValueError`` which the production code catches and logs.
     """
     validation_config.interactive = True
-    inputs = iter(["y", "INVALIDMODE", "n"])
-    monkeypatch.setattr("builtins.input", lambda _: next(inputs))
 
-    validate_adjust_download_mode(validation_config, download_mode_set=False)
+    confirm_answers = iter([True, False])
+
+    async def _fake_aconfirm(_q: str, **_k) -> bool:
+        return next(confirm_answers)
+
+    async def _fake_aprompt_text(_q: str, **_k) -> str:
+        return "INVALIDMODE"
+
+    monkeypatch.setattr("config.validation.aconfirm", _fake_aconfirm)
+    monkeypatch.setattr("config.validation.aprompt_text", _fake_aprompt_text)
+
+    await validate_adjust_download_mode(validation_config, download_mode_set=False)
 
     assert validation_config.download_mode == DownloadMode.TIMELINE
 
 
-def test_validate_adjust_download_mode_skips_prompt_when_mode_preset(
+async def test_validate_adjust_download_mode_skips_prompt_when_mode_preset(
     validation_config, monkeypatch
 ):
     """download_mode_set=True → no interactive prompt even if interactive=True."""
     validation_config.interactive = True
-    # If input() is called, it'd raise StopIteration — test proves it's NOT called.
-    inputs = iter([])
 
-    def _fail_input(_prompt):
-        return next(inputs)
+    async def _fail_aconfirm(*_args, **_kwargs):
+        raise AssertionError("aconfirm should not be called when download_mode_set")
 
-    monkeypatch.setattr("builtins.input", _fail_input)
+    monkeypatch.setattr("config.validation.aconfirm", _fail_aconfirm)
 
-    validate_adjust_download_mode(validation_config, download_mode_set=True)
+    await validate_adjust_download_mode(validation_config, download_mode_set=True)
     assert validation_config.download_mode == DownloadMode.TIMELINE
 
 
@@ -1021,7 +1086,10 @@ def test_validate_log_levels_debug_mode_forces_debug_everywhere(validation_confi
 # -- validate_adjust_config (orchestrator) ----------------------------------
 
 
-def test_validate_adjust_config_raises_when_creator_names_invalid(validation_config):
+@pytest.mark.asyncio
+async def test_validate_adjust_config_raises_when_creator_names_invalid(
+    validation_config,
+):
     """Orchestrator raises ConfigError when validate_creator_names returns False.
 
     Sets user_names to None so the real ``validate_creator_names`` returns
@@ -1030,10 +1098,11 @@ def test_validate_adjust_config_raises_when_creator_names_invalid(validation_con
     validation_config.user_names = None
 
     with pytest.raises(ConfigError, match="no valid creator name specified"):
-        validate_adjust_config(validation_config, download_mode_set=False)
+        await validate_adjust_config(validation_config, download_mode_set=False)
 
 
-def test_validate_adjust_config_runs_all_validators_end_to_end(
+@pytest.mark.asyncio
+async def test_validate_adjust_config_runs_all_validators_end_to_end(
     validation_config, caplog
 ):
     """Orchestrator invokes every sub-validator end-to-end with no internal mocks.
@@ -1047,7 +1116,7 @@ def test_validate_adjust_config_runs_all_validators_end_to_end(
     caplog.set_level(logging.INFO)
 
     # Everything's valid → no sub-validator should raise or do meaningful work.
-    validate_adjust_config(validation_config, download_mode_set=True)
+    await validate_adjust_config(validation_config, download_mode_set=True)
 
     # Smoke: we hit at least one informational log from any sub-validator.
     info_messages = [r.getMessage() for r in caplog.records if r.levelname == "INFO"]

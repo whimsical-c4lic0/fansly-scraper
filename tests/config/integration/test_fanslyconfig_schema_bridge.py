@@ -19,10 +19,10 @@ from pydantic import SecretStr
 
 from config.args import (
     _handle_boolean_settings,
-    _handle_debug_settings,
     _handle_download_mode,
     _handle_monitoring_settings,
     _handle_user_settings,
+    _handle_verbosity_settings,
 )
 from config.config import load_config
 from config.fanslyconfig import FanslyConfig
@@ -72,7 +72,7 @@ def test_round_trip_load_from_yaml(
     schema.postgres.pg_port = 5433
     schema.cache.device_id = "abc-device-id"
     schema.cache.device_id_timestamp = 999_000_000
-    schema.logging.sqlalchemy = "DEBUG"
+    schema.logging.db.level = "DEBUG"
     schema.dump_yaml(yaml_path)
 
     load_config(fresh_config)
@@ -116,7 +116,8 @@ def test_round_trip_save_and_reload(
     fresh_config._save_config()
 
     yaml_text = yaml_path.read_text(encoding="utf-8")
-    assert "\n  json: WARNING\n" in yaml_text or "\n  json: 'WARNING'\n" in yaml_text
+    # New nested logging shape: json.level instead of flat json:LEVEL.
+    assert "level: WARNING" in yaml_text or "level: 'WARNING'" in yaml_text
     assert "json_level:" not in yaml_text
 
     # Reload into a completely fresh config
@@ -130,13 +131,9 @@ def test_round_trip_save_and_reload(
     assert second_config.separate_previews is True
     assert second_config.log_levels["json"] == "WARNING"
 
-    legacy_yaml = yaml_text.replace("json: WARNING", "json_level: WARNING").replace(
-        "json: 'WARNING'", "json_level: 'WARNING'"
-    )
-    yaml_path.write_text(legacy_yaml, encoding="utf-8")
-    third_config = FanslyConfig(program_version="0.13.0")
-    load_config(third_config)
-    assert third_config.log_levels["json"] == "WARNING"
+    # Legacy flat-shape compatibility (`logging.json_level: WARNING`) is
+    # covered by the unit tests in tests/config/unit/test_schema.py:
+    # ``test_logging_legacy_json_level_alias_migrates``.
 
 
 # ---------------------------------------------------------------------------
@@ -526,6 +523,44 @@ def test_cli_daemon_flag_overrides_yaml_false(
     assert fresh_config.daemon_mode is True
 
 
+def test_yaml_daemon_mode_forces_interactive_false(
+    config_dir: Path, fresh_config: FanslyConfig
+) -> None:
+    """monitoring.daemon_mode: true in YAML forces config.interactive to False."""
+    yaml_path = config_dir / "config.yaml"
+
+    schema = ConfigSchema()
+    schema.monitoring.daemon_mode = True
+    schema.options.interactive = True
+    schema.dump_yaml(yaml_path)
+
+    load_config(fresh_config)
+
+    assert fresh_config.daemon_mode is True
+    assert fresh_config.interactive is False
+
+
+def test_cli_daemon_flag_forces_interactive_false(
+    config_dir: Path, fresh_config: FanslyConfig
+) -> None:
+    """CLI --daemon forces config.interactive=False regardless of YAML."""
+    yaml_path = config_dir / "config.yaml"
+
+    schema = ConfigSchema()
+    schema.monitoring.daemon_mode = False
+    schema.options.interactive = True
+    schema.dump_yaml(yaml_path)
+
+    load_config(fresh_config)
+    assert fresh_config.interactive is True  # YAML value loaded
+
+    cli_args = argparse.Namespace(full_pass=False, monitor_since=None, daemon_mode=True)
+    _handle_monitoring_settings(cli_args, fresh_config)
+
+    assert fresh_config.daemon_mode is True
+    assert fresh_config.interactive is False
+
+
 # ---------------------------------------------------------------------------
 # 14. unrecoverable_error_timeout_seconds: YAML value → config attribute
 # ---------------------------------------------------------------------------
@@ -561,6 +596,37 @@ def test_unrecoverable_error_timeout_default_survives_load(
     load_config(fresh_config)
 
     assert fresh_config.unrecoverable_error_timeout_seconds == 3600
+
+
+def test_heartbeat_interval_populated_from_schema(
+    config_dir: Path, fresh_config: FanslyConfig
+) -> None:
+    """config.monitoring_heartbeat_interval_minutes is populated from
+    schema.monitoring.heartbeat_interval_minutes after load_config()."""
+    yaml_path = config_dir / "config.yaml"
+
+    schema = ConfigSchema()
+    schema.monitoring.heartbeat_interval_minutes = 5
+    schema.dump_yaml(yaml_path)
+
+    load_config(fresh_config)
+
+    assert fresh_config.monitoring_heartbeat_interval_minutes == 5
+
+
+def test_heartbeat_interval_default_survives_load(
+    config_dir: Path, fresh_config: FanslyConfig
+) -> None:
+    """When heartbeat_interval_minutes is absent from YAML,
+    config attribute defaults to 15."""
+    yaml_path = config_dir / "config.yaml"
+
+    schema = ConfigSchema()
+    schema.dump_yaml(yaml_path)
+
+    load_config(fresh_config)
+
+    assert fresh_config.monitoring_heartbeat_interval_minutes == 15
 
 
 # ---------------------------------------------------------------------------
@@ -640,7 +706,7 @@ def _full_args_namespace(**overrides) -> argparse.Namespace:
     Pass keyword overrides for the flags under test.
     """
     defaults = {
-        "debug": False,
+        "verbose": 0,
         "users": None,
         "download_mode_normal": False,
         "download_mode_messages": False,
@@ -684,55 +750,59 @@ def _full_args_namespace(**overrides) -> argparse.Namespace:
     return argparse.Namespace(**defaults)
 
 
-def test_debug_cli_does_not_clobber_yaml_true(
+def test_verbose_flag_does_not_persist_to_yaml(
     config_dir: Path, fresh_config: FanslyConfig
 ) -> None:
-    """``--debug`` is per-run; YAML's ``debug: true`` survives an invocation
-    that does NOT pass ``--debug``.
+    """``-v`` / ``-vv`` are runtime-only — never written back to config.yaml.
 
-    Pre-fix, ``_handle_debug_settings`` did ``config.debug = args.debug``
-    unconditionally. With ``args.debug=False`` (the argparse default when
-    ``--debug`` is omitted), that overwrote a YAML-set True with False on
-    every invocation — silently disabling the user's persisted debug mode.
+    Pre-v0.14, ``options.debug`` was a persisted YAML field that could
+    silently flip back to False on save. The v0.14 redesign removes the
+    field entirely; verbosity lives purely in the runtime
+    ``config.debug`` / ``config.trace`` attributes, populated from
+    ``args.verbose`` and marked ephemeral.
     """
     yaml_path = config_dir / "config.yaml"
-    schema = ConfigSchema()
-    schema.options.debug = True
-    schema.dump_yaml(yaml_path)
-
+    ConfigSchema().dump_yaml(yaml_path)
     load_config(fresh_config)
-    assert fresh_config.debug is True
+    assert fresh_config.debug is False
+    assert fresh_config.trace is False
 
-    # Simulate invocation WITHOUT --debug (the regression scenario).
-    _handle_debug_settings(_full_args_namespace(debug=False), fresh_config)
-    assert fresh_config.debug is True, (
-        "Omitting --debug must not clobber the YAML-loaded debug=True"
-    )
+    # -v → runtime debug; -vv → runtime debug + trace; both ephemeral.
+    _handle_verbosity_settings(_full_args_namespace(verbose=2), fresh_config)
+    assert fresh_config.debug is True
+    assert fresh_config.trace is True
 
     fresh_config._save_config()
-    reloaded = ConfigSchema.load_yaml(yaml_path)
-    assert reloaded.options.debug is True
+    reloaded_text = yaml_path.read_text()
+    assert "debug:" not in reloaded_text, (
+        "options.debug must not appear in YAML — schema field was retired"
+    )
+    assert "trace: true" not in reloaded_text.lower(), (
+        "options.trace must not appear in YAML — schema field was retired"
+    )
 
 
-def test_debug_cli_overlay_does_not_persist(
+def test_legacy_yaml_with_options_debug_loads_cleanly(
     config_dir: Path, fresh_config: FanslyConfig
 ) -> None:
-    """``--debug`` enables debug for the session but does not write to YAML."""
+    """Pre-v0.14 YAMLs carrying ``options.debug: true`` load without error.
+
+    The keys are listed in ``OptionsSection._DROPPED_FIELDS`` so the
+    retired-field validator pops them before ``extra="forbid"`` rejects
+    them. Runtime debug/trace stay False because the legacy YAML signal
+    no longer feeds into runtime state — operators wanting persistent
+    verbosity now set ``logging.global.default_level: DEBUG`` or pass
+    ``-v`` at the CLI.
+    """
     yaml_path = config_dir / "config.yaml"
-    schema = ConfigSchema()
-    schema.options.debug = False
-    schema.dump_yaml(yaml_path)
-
-    load_config(fresh_config)
-
-    _handle_debug_settings(_full_args_namespace(debug=True), fresh_config)
-    assert fresh_config.debug is True
-
-    fresh_config._save_config()
-    reloaded = ConfigSchema.load_yaml(yaml_path)
-    assert reloaded.options.debug is False, (
-        "CLI --debug must be per-run only; YAML's debug=False stays as the default"
+    yaml_path.write_text(
+        "options:\n  download_directory: /tmp/x\n  debug: true\n  trace: true\n",
+        encoding="utf-8",
     )
+    # No ValidationError despite the now-retired keys.
+    load_config(fresh_config)
+    assert fresh_config.debug is False
+    assert fresh_config.trace is False
 
 
 def test_negative_bool_cli_flags_do_not_persist(

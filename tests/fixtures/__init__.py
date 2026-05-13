@@ -30,9 +30,7 @@ from .api import (
     dump_fansly_calls,
     fake_websocket_session,
     fake_ws,
-    fansly_api,
     fansly_api_factory,
-    fansly_api_with_respx,
     fansly_json,
     main_integration_env,
     make_fake_ws_factory,
@@ -43,9 +41,16 @@ from .api import (
     mount_empty_creator_pipeline,
     mount_empty_following_route,
     respx_fansly_api,
+    respx_ivs_cdn,
     run_main_and_cleanup,
     spawn_ctx_with_mock_process,
     ws_message,
+)
+from .config import (
+    no_display,
+    unit_config,
+    unit_config_path,
+    validation_config,
 )
 from .core import (
     FanslyConfigFactory,
@@ -90,7 +95,9 @@ from .database import (
 )
 from .download import (
     DownloadStateFactory,
+    FakeStory,
     GlobalStateFactory,
+    m3u8_mock_config,
 )
 from .metadata import (
     AccountFactory,
@@ -191,6 +198,12 @@ from .stash import (
     tag_mixin,
     test_state,
 )
+from .textio import (
+    FakePromptSession,
+    fake_prompt_session,
+    no_tty,
+    tty,
+)
 from .utils import (
     SyncExecutor,
     cleanup_fansly_websockets,
@@ -225,6 +238,13 @@ mod_core_fixtures = [
     "minimal_argv",
 ]
 
+mod_config_fixtures = [
+    "no_display",
+    "unit_config",
+    "unit_config_path",
+    "validation_config",
+]
+
 mod_daemon_fakes = [
     "RecordingSimulator",
     "StubSimulator",
@@ -232,7 +252,9 @@ mod_daemon_fakes = [
 
 mod_download_factories = [
     "DownloadStateFactory",
+    "FakeStory",
     "GlobalStateFactory",
+    "m3u8_mock_config",
 ]
 
 mod_api_fixtures = [
@@ -245,9 +267,7 @@ mod_api_fixtures = [
     "dump_fansly_calls",
     "fake_websocket_session",
     "fake_ws",
-    "fansly_api",
     "fansly_api_factory",
-    "fansly_api_with_respx",
     "fansly_json",
     "main_integration_env",
     "make_fake_ws_factory",
@@ -258,6 +278,7 @@ mod_api_fixtures = [
     "mount_empty_creator_pipeline",
     "mount_empty_following_route",
     "respx_fansly_api",
+    "respx_ivs_cdn",
     "run_main_and_cleanup",
     "spawn_ctx_with_mock_process",
     "ws_message",
@@ -448,6 +469,13 @@ mod_utils_fixtures = [
     "fake_monotonic_clock",
 ]
 
+mod_textio_fixtures = [
+    "FakePromptSession",
+    "fake_prompt_session",
+    "no_tty",
+    "tty",
+]
+
 mod_init = [
     "load_json_fixture",
     "save_json_fixture",
@@ -460,6 +488,7 @@ mod_init = [
 __all__ = [  # noqa: PLE0604
     *mod_core_factories,
     *mod_core_fixtures,
+    *mod_config_fixtures,
     *mod_daemon_fakes,
     *mod_download_factories,
     *mod_api_fixtures,
@@ -475,6 +504,7 @@ __all__ = [  # noqa: PLE0604
     *mod_cleanup_fixtures,
     *mod_utils_helpers,
     *mod_utils_fixtures,
+    *mod_textio_fixtures,
     *mod_init,
 ]
 

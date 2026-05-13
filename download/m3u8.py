@@ -87,10 +87,11 @@ def _get_highest_quality_variant_url(
     """
     m3u8_base_url, m3u8_file_url = split_url(m3u8_url)
 
-    stream_response = config.get_api().get_with_ngsw(
+    stream_response = config.get_api().get_with_ngsw_sync(
         url=m3u8_file_url,
         cookies=cookies,
         add_fansly_headers=False,
+        bypass_rate_limit=True,
     )
 
     master_playlist = M3U8(content=stream_response.text, base_uri=m3u8_base_url)
@@ -129,10 +130,11 @@ def fetch_m3u8_segment_playlist(
 
     m3u8_base_url, m3u8_file_url = split_url(m3u8_url)
 
-    stream_response = config.get_api().get_with_ngsw(
+    stream_response = config.get_api().get_with_ngsw_sync(
         url=m3u8_file_url,
         cookies=cookies,
         add_fansly_headers=False,
+        bypass_rate_limit=True,
     )
 
     if stream_response.status_code != 200:
@@ -562,7 +564,6 @@ def _try_segment_download(
     m3u8_url: str,
     output_path: Path,
     cookies: dict[str, str],
-    created_at: int | None = None,
 ) -> Path:
     """Download HLS video by fetching each segment then muxing with PyAV.
 
@@ -574,7 +575,6 @@ def _try_segment_download(
         m3u8_url: URL of the master HLS manifest
         output_path: Path to save the final video
         cookies: CloudFront authentication cookies
-        created_at: Optional timestamp to set on final file
 
     Returns:
         Path to the downloaded video file
@@ -594,7 +594,7 @@ def _try_segment_download(
         """Download a single .ts segment."""
         segment_response = None
         try:
-            segment_response = config.get_api().get_with_ngsw(
+            segment_response = config.get_api().get_with_ngsw_sync(
                 url=segment_uri,
                 cookies=cookies,
                 stream=True,
@@ -671,9 +671,6 @@ def _try_segment_download(
         else:
             raise M3U8Error("Both PyAV and FFmpeg muxing failed for segments")
 
-        if created_at:
-            os.utime(output_path, (created_at, created_at))
-
         return output_path
 
     finally:
@@ -728,10 +725,14 @@ def download_m3u8(
             return full_path
 
         # Tier 3: Manual segment download + mux
-        return _try_segment_download(config, m3u8_url, full_path, cookies, created_at)
+        result = _try_segment_download(config, m3u8_url, full_path, cookies)
+        if created_at:
+            os.utime(result, (created_at, created_at))
 
     except M3U8Error:
         raise
     except Exception as e:
         print_error(f"Failed to download HLS video from {m3u8_url}: {e}")
         raise M3U8Error(f"Failed to download HLS video: {e}") from e
+    else:
+        return result

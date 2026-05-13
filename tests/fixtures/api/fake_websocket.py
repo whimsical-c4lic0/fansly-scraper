@@ -41,6 +41,7 @@ that by default; pass different args to test auth-failure paths.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -48,6 +49,13 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from websockets.exceptions import ConnectionClosedOK
+from websockets.frames import Close
+
+from api.websocket_protocol import MSG_SERVICE_EVENT as _PROTO_MSG_SERVICE_EVENT
+
+
+_CLEAN_CLOSE_FRAME = Close(code=1000, reason="")
 
 
 class FakeSocket:
@@ -55,9 +63,12 @@ class FakeSocket:
 
     Records all sent messages and feeds back scripted recv responses from a
     queue. Once the queue is drained, ``recv()`` blocks until ``close()`` is
-    called — this matches the real WebSocket behavior of waiting for the
-    next server message, so downstream code that expects a long-lived
-    connection does not exit prematurely.
+    called, then raises ``ConnectionClosedOK`` — matching the real
+    ``websockets`` library, which raises after close rather than returning
+    a sentinel. Returning empty strings spins the listen loop forever
+    because production ``_handle_message`` catches ``JSONDecodeError`` and
+    loops; raising propagates to ``_listen_loop``'s ``WebSocketException``
+    branch which sets ``connected = False`` and exits.
 
     Attributes:
         sent: Every message sent via ``send()`` in call order.
@@ -76,14 +87,12 @@ class FakeSocket:
     async def recv(self) -> str:
         if self._recv_queue:
             return self._recv_queue.pop(0)
-        # Block until close() is called — simulates waiting for next server
-        # message on a live connection.
         await self._block_event.wait()
-        return ""
+        raise ConnectionClosedOK(_CLEAN_CLOSE_FRAME, _CLEAN_CLOSE_FRAME)
 
     async def close(self) -> None:
         self.closed = True
-        self._block_event.set()  # Unblock any pending recv.
+        self._block_event.set()
 
 
 def ws_message(msg_type: int, data: str) -> str:
@@ -144,26 +153,19 @@ def fake_websocket_session(
     ws_session_id: str = "test-ws-session-id-1",
     account_id: str = "100000001",
 ):
-    """Patch ``api.websocket.ws_client.connect`` to return an auto-authing FakeSocket.
+    """Replace ``FanslyWebSocket`` with an in-process stub that auto-authenticates.
 
-    The Fansly WebSocket auth flow (api/fansly.py:548-584, api/websocket.py:449)
-    reads ``session.id`` + ``session.websocketSessionId`` from the first
-    type-1 message and populates ``FanslyWebSocket.session_id``. This helper
-    scripts that response so ``get_active_session`` succeeds.
-
-    Use this from any test (integration or unit) that drives code through
-    ``FanslyApi.setup_api`` or ``FanslyWebSocket.connect`` without a real
-    Fansly WebSocket server.
+    Production ``FanslyWebSocket.start_in_thread`` spawns a subprocess via
+    ``multiprocessing.get_context("spawn")``. Patches applied to
+    ``ws_client.connect`` in the test (parent) process do NOT cross the
+    process boundary, so the only way to keep integration tests offline
+    is to replace the parent class itself with a stub that never spawns.
 
     Yields:
-        The FakeSocket instance — callers can inspect ``fake.sent`` to
-        verify what auth / subscribe messages were transmitted.
-
-    Example::
-
-        with fake_websocket_session() as fake:
-            await config.setup_api()
-        # fake.sent contains the auth message the real code produced
+        The FakeSocket instance for tests that want to inspect protocol
+        messages; the stub does not currently route through it (no test
+        asserts on ``fake.sent``), but the auth-response payload is
+        carried via the stub's pre-populated state attributes.
     """
     fake = FakeSocket(
         recv_messages=[
@@ -174,12 +176,58 @@ def fake_websocket_session(
             )
         ]
     )
+    stub_class = _make_in_process_ws_stub(session_id, ws_session_id, account_id)
 
-    async def _fake_connect(**_kwargs):
-        return fake
-
-    with patch("api.websocket.ws_client.connect", side_effect=_fake_connect):
+    with (
+        patch("api.fansly.FanslyWebSocket", stub_class),
+        patch("api.websocket.FanslyWebSocket", stub_class),
+    ):
         yield fake
+
+
+def _make_in_process_ws_stub(
+    session_id: str,
+    ws_session_id: str,
+    account_id: str,
+) -> type:
+    """Build a ``FanslyWebSocket`` stand-in that satisfies the parent-side surface.
+
+    Mirrors the public surface FanslyApi / daemon expects: ``connected``,
+    ``session_id``, ``register_handler``, ``start_in_thread``,
+    ``stop_thread``, ``send_message``. No subprocess, no real I/O — every
+    method is an in-process no-op except ``start_in_thread`` which marks
+    the instance as connected so the auth-wait loop in
+    ``FanslyApi.get_active_session`` short-circuits immediately.
+    """
+
+    class _InProcessFanslyWebSocketStub:
+        MSG_SERVICE_EVENT = _PROTO_MSG_SERVICE_EVENT
+
+        def __init__(self, **_kwargs: Any) -> None:
+            self.connected = False
+            self.session_id: str | None = None
+            self.websocket_session_id: str | None = None
+            self.account_id: str | None = None
+            self._event_handlers: dict[int, Callable] = {}
+
+        def register_handler(
+            self, message_type: int, handler: Callable[[Any], Any]
+        ) -> None:
+            self._event_handlers[message_type] = handler
+
+        def start_in_thread(self, *_args: Any, **_kwargs: Any) -> None:
+            self.connected = True
+            self.session_id = session_id
+            self.websocket_session_id = ws_session_id
+            self.account_id = account_id
+
+        async def stop_thread(self, *_args: Any, **_kwargs: Any) -> None:
+            self.connected = False
+
+        async def send_message(self, _message_type: int, _data: Any) -> None:
+            return
+
+    return _InProcessFanslyWebSocketStub
 
 
 class FakeWS:
@@ -211,7 +259,7 @@ class FakeWS:
             Use to exercise the WS-teardown-failure branch.
     """
 
-    MSG_SERVICE_EVENT = 10000
+    MSG_SERVICE_EVENT = _PROTO_MSG_SERVICE_EVENT
 
     def __init__(
         self,
@@ -265,7 +313,7 @@ class FakeWS:
         handler = self._handlers.get(self.MSG_SERVICE_EVENT)
         if handler is None:
             return
-        if asyncio.iscoroutinefunction(handler):
+        if inspect.iscoroutinefunction(handler):
             await handler(envelope)
         else:
             handler(envelope)

@@ -18,7 +18,7 @@ async def download_collections(config: FanslyConfig, state: DownloadState) -> No
 
     state.download_type = DownloadType.COLLECTIONS
 
-    collections_response = config.get_api().get_media_collections()
+    collections_response = await config.get_api().get_media_collections()
 
     if collections_response.status_code == 200:
         json_output(1, "Download Collections", collections_response.json())
@@ -60,4 +60,4 @@ async def download_collections(config: FanslyConfig, state: DownloadState) -> No
             f"{collections_response.status_code}\n{collections_response.text}",
             23,
         )
-        input_enter_continue(config.interactive)
+        await input_enter_continue(config.interactive)

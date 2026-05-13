@@ -16,7 +16,7 @@ from __future__ import annotations
 import io
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal, Self
 
 from pydantic import (
     BaseModel,
@@ -33,6 +33,21 @@ from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
 
 from config.modes import DownloadMode
+
+
+# Render-policy marker used in ``Field(json_schema_extra=_ALWAYS)``. A field
+# tagged "always" is written to YAML even when its value matches the default
+# and the operator never explicitly set it; the cascade-up rule in
+# ``_sync_to_map`` then forces the containing section to render. Default
+# policy is "conditional" — fields render only when in ``model_fields_set``.
+# See docs/configuration/render-policy.md (TODO) for full semantics.
+_ALWAYS: dict[str, str] = {"render": "always"}
+
+
+def _is_always(field_info: Any) -> bool:
+    """Return True iff a field's json_schema_extra marks it as render=always."""
+    extra = getattr(field_info, "json_schema_extra", None)
+    return isinstance(extra, dict) and extra.get("render") == "always"
 
 
 def _make_yaml() -> YAML:
@@ -149,16 +164,30 @@ class TargetedCreatorSection(_BaseSection):
 
     model_config = ConfigDict(extra="forbid")
 
-    usernames: list[str] = Field(default_factory=lambda: ["replaceme"])
+    # ``use_following_with_pagination`` was removed from the schema in v0.14:
+    # it's a CLI-macro (``-ufp``) that toggles ``use_following`` AND
+    # ``use_pagination_duplication`` together at runtime, never a real YAML
+    # setting. Legacy YAMLs that still carry it are silently dropped on load.
+    _DROPPED_FIELDS: ClassVar[frozenset[str]] = frozenset(
+        {"use_following_with_pagination"}
+    )
+
+    # ALWAYS-rendered: usernames is the central pivot of the program; the YAML
+    # always carries a usernames: line so operators see the slot. Type is
+    # nullable because a fresh scaffold has no creators yet (renders as null);
+    # CLI ``-u alice bob`` populates it at runtime.
+    usernames: list[str] | None = Field(default=None, json_schema_extra=_ALWAYS)
     use_following: bool = False
-    use_following_with_pagination: bool = False
 
     @field_validator("usernames", mode="before")
     @classmethod
-    def _coerce_usernames(cls, v: Any) -> list[str]:
-        """Accept a comma-separated string (config.ini legacy) or a real list."""
+    def _coerce_usernames(cls, v: Any) -> list[str] | None:
+        """Accept a comma-separated string (config.ini legacy), a real list, or None."""
+        if v is None:
+            return None
         if isinstance(v, str):
-            return [name.strip() for name in v.split(",") if name.strip()]
+            coerced = [name.strip() for name in v.split(",") if name.strip()]
+            return coerced or None
         return v
 
 
@@ -167,9 +196,14 @@ class MyAccountSection(_BaseSection):
 
     model_config = ConfigDict(extra="forbid")
 
-    authorization_token: SecretStr = SecretStr("ReplaceMe")
-    user_agent: str = "ReplaceMe"
-    check_key: str = "qybZy9-fyszis-bybxyf"
+    authorization_token: SecretStr = Field(
+        default=SecretStr("ReplaceMe"), json_schema_extra=_ALWAYS
+    )
+    user_agent: str = Field(default="ReplaceMe", json_schema_extra=_ALWAYS)
+    check_key: str = Field(default="qybZy9-fyszis-bybxyf", json_schema_extra=_ALWAYS)
+    # username/password are conditional: only used by the user/pass auto-login
+    # flow. Browser-import or hand-pasted ``authorization_token`` skip this
+    # path entirely, in which case these slots stay absent from YAML.
     username: str | None = None
     password: SecretStr | None = None
 
@@ -180,6 +214,10 @@ class OptionsSection(_BaseSection):
     model_config = ConfigDict(extra="forbid")
 
     # Retired fields silently dropped during load (see config_options.md).
+    # ``debug`` and ``trace`` were retired in v0.14 in favour of the CLI
+    # ``-v`` / ``-vv`` runtime overrides and persistent per-handler level
+    # configuration under ``logging.global.default_level``. Legacy YAMLs
+    # carrying them load cleanly; the toggles silently no-op.
     _DROPPED_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "separate_metadata",
@@ -187,10 +225,18 @@ class OptionsSection(_BaseSection):
             "db_sync_commits",
             "db_sync_seconds",
             "db_sync_min_size",
+            "debug",
+            "trace",
         }
     )
 
-    download_directory: str = "Local_directory"
+    # ALWAYS-rendered: download_directory has a placeholder default that
+    # MUST be edited; temp_folder lets operators see the override slot even
+    # when blank. Everything else in this section is conditional — present
+    # only when explicitly set.
+    download_directory: str = Field(
+        default="Local_directory", json_schema_extra=_ALWAYS
+    )
     download_mode: DownloadMode = DownloadMode.NORMAL
     show_downloads: bool = True
     show_skipped_downloads: bool = True
@@ -204,11 +250,14 @@ class OptionsSection(_BaseSection):
     use_folder_suffix: bool = True
     interactive: bool = True
     prompt_on_exit: bool = True
-    debug: bool = False
-    trace: bool = False
     timeline_retries: int = 1
     timeline_delay_seconds: int = 60
     api_max_retries: int = 10
+    # Set to ``false`` to ignore the creator_content_unchanged short-circuit
+    # in download/timeline.py and download/wall.py — forces a full scan even
+    # when TimelineStats counts and wall structure match the DB. Conditional
+    # by default; absent from scaffolded YAML.
+    respect_timeline_stats: bool = True
     rate_limiting_enabled: bool = True
     rate_limiting_adaptive: bool = True
     rate_limiting_requests_per_minute: int = 60
@@ -216,7 +265,7 @@ class OptionsSection(_BaseSection):
     rate_limiting_retry_after_seconds: int = 30
     rate_limiting_backoff_factor: float = 1.5
     rate_limiting_max_backoff_seconds: int = 300
-    temp_folder: str | None = None
+    temp_folder: str | None = Field(default=None, json_schema_extra=_ALWAYS)
 
     @field_validator("download_mode", mode="before")
     @classmethod
@@ -232,11 +281,14 @@ class PostgresSection(_BaseSection):
 
     model_config = ConfigDict(extra="forbid")
 
-    pg_host: str = "localhost"
+    # ALWAYS-rendered: connection coordinates operators almost always need
+    # to see/edit. pg_user is nullable to support trust-auth setups (no
+    # explicit user). pg_password is nullable until set.
+    pg_host: str = Field(default="localhost", json_schema_extra=_ALWAYS)
     pg_port: int = 5432
-    pg_database: str = "fansly_metadata"
-    pg_user: str = "fansly_user"
-    pg_password: SecretStr | None = None
+    pg_database: str = Field(default="fansly_metadata", json_schema_extra=_ALWAYS)
+    pg_user: str | None = Field(default="fansly_user", json_schema_extra=_ALWAYS)
+    pg_password: SecretStr | None = Field(default=None, json_schema_extra=_ALWAYS)
     pg_sslmode: str = "prefer"
     pg_sslcert: str | None = None
     pg_sslkey: str | None = None
@@ -259,33 +311,264 @@ class CacheSection(_BaseSection):
     device_id_timestamp: int | None = None
 
 
-class LoggingSection(_BaseSection):
-    """Log level configuration for named loggers.
+# ── Logging type aliases ────────────────────────────────────────
+LogLevel = Literal["TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+RotationWhen = Literal["s", "m", "h", "d", "midnight"]
+Compression = Literal["gz", "bz2", "xz"]
 
-    The YAML key for the JSON logger is ``json:``, but the Python
-    attribute is ``json_level`` because ``json`` would shadow Pydantic's
-    built-in ``BaseModel.json()`` serialisation method — accessing
-    ``section.json`` would silently return the log-level string instead
-    of a serialiser. ``populate_by_name=True`` lets callers use either
-    name when constructing from code.
+
+class ConsoleLoggerEntry(_BaseSection):
+    """Console-style logger (Rich-formatted stdout/stderr).
+
+    Rejects ``level: TRACE`` — TRACE never hits the console, it's a
+    file-only level.
+    """
+
+    enabled: bool = True
+    level: LogLevel | None = None
+    format: str | None = None
+
+    @field_validator("level")
+    @classmethod
+    def _reject_trace_on_console(cls, v: str | None) -> str | None:
+        if v == "TRACE":
+            raise ValueError(
+                "Console loggers cannot have level='TRACE' (TRACE is file-only)"
+            )
+        return v
+
+
+class FileLoggerEntry(_BaseSection):
+    """Rotating-file logger.
+
+    Size and time rotation axes are orthogonal — both can be active
+    simultaneously (matches ``SizeTimeRotatingHandler``). Either or both
+    may be ``None`` to disable that axis; per-field ``None`` falls
+    through to the matching ``default_*`` on ``LoggingGlobalSection``.
+    """
+
+    enabled: bool = True
+    filename: str
+    level: LogLevel | None = None
+    format: str | None = None
+    max_size: int | None = None
+    rotation_when: RotationWhen | None = None
+    rotation_interval: int | None = None
+    utc: bool | None = None
+    backup_count: int | None = None
+    compression: Compression | None = None
+    keep_uncompressed: int | None = None
+
+
+class MainLogEntry(FileLoggerEntry):
+    filename: str = "fansly_downloader_ng.log"
+
+
+class JsonLogEntry(FileLoggerEntry):
+    filename: str = "fansly_downloader_ng_json.log"
+
+
+class StashFileEntry(FileLoggerEntry):
+    filename: str = "stash.log"
+
+
+class DbLogEntry(FileLoggerEntry):
+    filename: str = "sqlalchemy.log"
+
+
+class TraceLogEntry(FileLoggerEntry):
+    enabled: bool = False
+    filename: str = "trace.log"
+    level: LogLevel | None = "TRACE"
+
+
+class WebsocketLogEntry(FileLoggerEntry):
+    filename: str = "websocket.log"
+
+
+class LoggingGlobalSection(_BaseSection):
+    """Cross-cutting defaults inherited by any per-logger field that is ``None``.
+
+    Defaults match FDNG's pre-config-driven behavior: 100 MB size cap,
+    hourly UTC time rotation, 5 backups, gzip compression, 2 most-recent
+    kept uncompressed for live tail-ability.
+
+    ``trace`` is a file-only toggle — when true the trace handler is
+    enabled at TRACE; console handlers ignore it (console rejects TRACE
+    by schema validation). Runtime ``-vv`` flips the same switch and also
+    forces every other handler to TRACE; YAML toggle alone only opens the
+    trace file sink at TRACE without overriding peer handlers.
+    """
+
+    # ``debug`` was retired in v0.14: it duplicated ``default_level: DEBUG``
+    # at YAML level and ``-v`` at runtime, with no behavioral difference.
+    _DROPPED_FIELDS: ClassVar[frozenset[str]] = frozenset({"verbose", "debug"})
+
+    directory: str | None = Field(default=None, json_schema_extra=_ALWAYS)
+    trace: bool = False
+    default_level: LogLevel = "INFO"
+    default_format: str | None = None
+    default_max_size: int | None = 100 * 1024 * 1024  # 100 MB
+    default_rotation_when: RotationWhen | None = "h"
+    default_rotation_interval: int = 1
+    default_utc: bool = True
+    default_backup_count: int | None = 5
+    default_compression: Compression | None = "gz"
+    default_keep_uncompressed: int = 2
+
+
+class LoggingSection(_BaseSection):
+    """Eight named loggers + global defaults.
+
+    Two console handlers (``rich_handler``, ``stash_console``) and six
+    file handlers (``main_log``, ``json``, ``stash_file``, ``db``,
+    ``trace``, ``websocket``). Each entry has its own ``enabled`` /
+    ``level`` / ``format`` plus — for file entries — independent size
+    and time rotation axes. Unset per-logger fields fall through to
+    ``global.default_*``.
+
+    The attribute ``global_`` aliases YAML key ``global`` because
+    ``global`` is a Python keyword; same for ``json_`` aliasing ``json``
+    (which would also shadow Pydantic's ``BaseModel.json()`` serialiser).
+    ``populate_by_name=True`` lets either form load.
     """
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
-    sqlalchemy: str = "INFO"
-    stash_console: str = "INFO"
-    stash_file: str = "INFO"
-    textio: str = "INFO"
-    websocket: str = "INFO"
-    json_level: str = Field("INFO", alias="json", serialization_alias="json")
+    global_: LoggingGlobalSection = Field(
+        default_factory=LoggingGlobalSection,
+        alias="global",
+        json_schema_extra=_ALWAYS,
+    )
+    rich_handler: ConsoleLoggerEntry = Field(
+        default_factory=ConsoleLoggerEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    main_log: MainLogEntry = Field(
+        default_factory=MainLogEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    json_: JsonLogEntry = Field(
+        default_factory=JsonLogEntry,
+        alias="json",
+        json_schema_extra=_ALWAYS,
+    )
+    stash_console: ConsoleLoggerEntry = Field(
+        default_factory=ConsoleLoggerEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    stash_file: StashFileEntry = Field(
+        default_factory=StashFileEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    db: DbLogEntry = Field(
+        default_factory=DbLogEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    trace: TraceLogEntry = Field(
+        default_factory=TraceLogEntry,
+        json_schema_extra=_ALWAYS,
+    )
+    websocket: WebsocketLogEntry = Field(
+        default_factory=WebsocketLogEntry,
+        json_schema_extra=_ALWAYS,
+    )
 
     @model_validator(mode="before")
     @classmethod
-    def _remap_json_level_to_alias(cls, data: Any) -> Any:
-        """Accept legacy ``json_level:`` written by buggy save code as ``json:``."""
-        if isinstance(data, dict) and "json_level" in data and "json" not in data:
-            data["json"] = data.pop("json_level")
-        return data
+    def _migrate_legacy_flat_levels(cls, data: Any) -> Any:
+        """Lift the pre-v0.14 flat shape into the nested per-logger entries.
+
+        Old::
+
+            logging:
+              sqlalchemy: INFO
+              stash_console: INFO
+              stash_file: INFO
+              textio: INFO
+              websocket: INFO
+              json: INFO
+
+        New::
+
+            logging:
+              global: {default_level: INFO, ...}
+              db: {level: INFO}
+              stash_console: {level: INFO}
+              stash_file: {level: INFO}
+              main_log: {level: INFO}
+              rich_handler: {level: INFO}
+              websocket: {level: INFO}
+              json: {level: INFO}
+
+        Note ``textio`` seeds BOTH ``main_log.level`` and
+        ``rich_handler.level`` because the legacy key drove both the
+        main file handler and the rich console handler.
+        """
+        if not isinstance(data, dict):
+            return data
+        single_target: dict[str, tuple[str, str]] = {
+            "sqlalchemy": ("db", "level"),
+            "stash_console": ("stash_console", "level"),
+            "stash_file": ("stash_file", "level"),
+            "websocket": ("websocket", "level"),
+            "json_level": ("json", "level"),
+        }
+        migrated = dict(data)
+        for legacy_key, (section, field) in single_target.items():
+            if legacy_key in migrated and isinstance(migrated[legacy_key], str):
+                value = migrated.pop(legacy_key)
+                target = migrated.setdefault(section, {})
+                if isinstance(target, dict):
+                    target.setdefault(field, value)
+        # textio seeds two targets (main file + rich console)
+        if "textio" in migrated and isinstance(migrated["textio"], str):
+            value = migrated.pop("textio")
+            for section in ("main_log", "rich_handler"):
+                target = migrated.setdefault(section, {})
+                if isinstance(target, dict):
+                    target.setdefault("level", value)
+        # Legacy `json: INFO` (string) → `json: {level: INFO}`; leave dict alone
+        if isinstance(migrated.get("json"), str):
+            migrated["json"] = {"level": migrated["json"]}
+
+        # Sanitize per-entry level strings before Literal validation. Pre-v0.14
+        # ``load_config`` accepted any string + soft-fell-back to ``INFO`` on
+        # invalid values; preserve that lenient behavior so legacy YAMLs with
+        # typos still load.
+        valid_levels = {"TRACE", "DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"}
+        for entry_key in (
+            "rich_handler",
+            "main_log",
+            "json",
+            "stash_console",
+            "stash_file",
+            "db",
+            "trace",
+            "websocket",
+        ):
+            entry = migrated.get(entry_key)
+            if not isinstance(entry, dict):
+                continue
+            level = entry.get("level")
+            if not isinstance(level, str):
+                continue
+            normalized = level.upper()
+            entry["level"] = normalized if normalized in valid_levels else "INFO"
+        return migrated
+
+    @model_validator(mode="after")
+    def _link_trace_toggles(self) -> Self:
+        """Keep ``global.trace`` and ``trace.enabled`` in sync.
+
+        Either toggle being True means trace logging is active. Setting
+        one in YAML implies the other — operators can write whichever
+        feels natural and they end up consistent.
+        """
+        if self.global_.trace or self.trace.enabled:
+            self.global_.trace = True
+            self.trace.enabled = True
+        return self
 
 
 class StashContextSection(_BaseSection):
@@ -298,10 +581,14 @@ class StashContextSection(_BaseSection):
 
     model_config = ConfigDict(extra="forbid")
 
-    scheme: str = "http"
-    host: str = "localhost"
-    port: int = 9999
-    apikey: str = ""
+    # When the section is present, all four connection fields are ALWAYS-
+    # rendered (operators opted in to Stash; they need to see all four
+    # slots). mapped_path stays conditional because it's optional even
+    # within an active Stash configuration.
+    scheme: str = Field(default="http", json_schema_extra=_ALWAYS)
+    host: str = Field(default="localhost", json_schema_extra=_ALWAYS)
+    port: int = Field(default=9999, json_schema_extra=_ALWAYS)
+    apikey: str = Field(default="", json_schema_extra=_ALWAYS)
     mapped_path: str | None = None
     override_dldir_w_mapped: bool = False
     require_stash_only_mode: bool = False
@@ -333,6 +620,7 @@ class MonitoringSection(_BaseSection):
     _DROPPED_FIELDS: ClassVar[frozenset[str]] = frozenset(
         {
             "enabled",
+            "websocket_subprocess",
         }
     )
 
@@ -347,7 +635,10 @@ class MonitoringSection(_BaseSection):
     session_baseline: datetime | None = None
     unrecoverable_error_timeout_seconds: int = 3600
     dashboard_enabled: bool = True
-    websocket_subprocess: bool = False
+    heartbeat_interval_minutes: int = 15
+    livestream_recording_enabled: bool = False
+    livestream_poll_interval_seconds: int = 30
+    livestream_manifest_poll_interval_seconds: int = Field(default=3, ge=1, le=15)
 
     @field_validator("session_baseline", mode="before")
     @classmethod
@@ -389,20 +680,49 @@ class ConfigSchema(_BaseSection):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Sections with ALWAYS-rendered leaves stay non-Optional: the cascade-
+    # up rule in _sync_to_map keeps these blocks visible by virtue of their
+    # always-leaves. ``logging`` has no always-leaves but stays default_factory
+    # for ergonomic runtime access; cascade-up still omits it from YAML when
+    # nothing is set inside.
     targeted_creator: TargetedCreatorSection = Field(
         default_factory=TargetedCreatorSection
     )
     my_account: MyAccountSection = Field(default_factory=MyAccountSection)
     options: OptionsSection = Field(default_factory=OptionsSection)
     postgres: PostgresSection = Field(default_factory=PostgresSection)
-    cache: CacheSection = Field(default_factory=CacheSection)
     logging: LoggingSection = Field(default_factory=LoggingSection)
+    # Optional, like stash_context — present in YAML only when something
+    # has been written to them. Auto-instantiated via default_factory so
+    # runtime code (``schema.cache.device_id = ...``) doesn't need null
+    # guards before mutating; the dump path's cascade-up determines whether
+    # the section appears on disk based on whether any child field is set.
+    cache: CacheSection | None = Field(default_factory=CacheSection)
+    monitoring: MonitoringSection | None = Field(default_factory=MonitoringSection)
+    logic: LogicSection | None = Field(default_factory=LogicSection)
     stash_context: StashContextSection | None = None
-    monitoring: MonitoringSection = Field(default_factory=MonitoringSection)
-    logic: LogicSection = Field(default_factory=LogicSection)
 
     # Internal storage for the live CommentedMap so we can preserve comments.
     _yaml_map: CommentedMap | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _instantiate_managed_optional_sections(self) -> ConfigSchema:
+        """Coerce explicit YAML ``null`` for managed sections back to instances.
+
+        ``cache``/``monitoring``/``logic`` are typed Optional so the dump
+        path can omit them, but runtime code accesses ``schema.cache.X``
+        without null guards. If a YAML file has ``cache: null`` literally,
+        coerce that back to an empty ``CacheSection()`` so the runtime
+        invariant holds. ``stash_context`` is genuinely Optional and is
+        intentionally NOT coerced — None there means "Stash not configured."
+        """
+        if self.cache is None:
+            self.cache = CacheSection()
+        if self.monitoring is None:
+            self.monitoring = MonitoringSection()
+        if self.logic is None:
+            self.logic = LogicSection()
+        return self
 
     @classmethod
     def load_yaml(cls, path: Path | str) -> ConfigSchema:
@@ -490,6 +810,24 @@ def _section_to_map(section: BaseModel, existing: CommentedMap | None) -> Commen
 
     If *existing* is provided its keys are updated in-place so that YAML
     comments on each key survive the writeback.
+
+    Render policy (applies at every nesting level — section, subsection,
+    sub-subsection):
+      - Fields in ``model_fields_set`` (operator explicitly set them or
+        runtime mutated them) are always written.
+      - Fields tagged ``json_schema_extra={"render": "always"}`` are written
+        even at default value — they're the visible operator-knob slots.
+      - Fields whose value is itself a BaseModel are recursed into with
+        the same policy; the nested model's own ``model_fields_set`` and
+        ``_ALWAYS`` markers drive what shows up inside.
+      - Cascade-up: when a recursive call returns an empty CommentedMap
+        (nothing renderable inside), the parent field is omitted entirely.
+        This applies even to parent fields marked ``_ALWAYS`` — an "always
+        visible slot" with no content inside is not a slot, just noise.
+      - Everything else is conditional and stays absent from YAML.
+
+    Fields previously written but no longer in either set are deleted from
+    *existing* so the on-disk file converges to the schema's view of truth.
     """
     # Explicit annotation: Pylance's inference on ruamel's partial stubs
     # flags the subsequent `target[field_name] = …` as "None is not
@@ -497,16 +835,51 @@ def _section_to_map(section: BaseModel, existing: CommentedMap | None) -> Commen
     target: CommentedMap = (
         existing if isinstance(existing, CommentedMap) else CommentedMap()
     )
-    alias_to_attr = {
-        (f.serialization_alias or f.alias or name): name
-        for name, f in section.__class__.model_fields.items()
-    }
-    for yaml_key, dump_value in section.model_dump(
-        mode="python", by_alias=True
-    ).items():
-        attr_name = alias_to_attr.get(yaml_key, yaml_key)
-        raw_value = _python_to_yaml_value(dump_value, getattr(section, attr_name))
-        target[yaml_key] = raw_value
+    fields_set = section.model_fields_set
+    field_infos = section.__class__.model_fields
+    written: set[str] = set()
+    dumped = section.model_dump(mode="python")
+    for field_name, field_value in dumped.items():
+        info = field_infos.get(field_name)
+        if field_name not in fields_set and not _is_always(info):
+            continue
+        raw_attr = getattr(section, field_name)
+        # Match `model_dump(by_alias=True)`'s key priority so YAML round-trips.
+        out_key = (
+            (info.serialization_alias or info.alias or field_name)
+            if info
+            else field_name
+        )
+        if isinstance(raw_attr, BaseModel):
+            # Nested submodel — recurse so the render policy applies INSIDE
+            # the submodel, not just at this level. Otherwise an _ALWAYS
+            # field whose value is a Pydantic model would dump the model's
+            # entire field set (including unset None-defaults), bleeding
+            # blank `key:` lines into the YAML for every conditional inner
+            # field. The fix lives here so it covers every nested section
+            # (LoggingSection.trace + global_ + per-handler entries,
+            # ConfigSchema's own top-level sections at the outer call site,
+            # any future nested submodel).
+            nested_existing = (
+                target.get(out_key)
+                if isinstance(target.get(out_key), CommentedMap)
+                else None
+            )
+            nested_map = _section_to_map(raw_attr, nested_existing)
+            if not nested_map:
+                # Cascade-up: nothing renderable inside → omit the slot
+                # even if its parent declared `_ALWAYS`.
+                continue
+            raw_value = nested_map
+        else:
+            raw_value = _python_to_yaml_value(field_value, raw_attr)
+        target[out_key] = raw_value
+        written.add(out_key)
+    # Delete keys that previously existed but are no longer rendered. Without
+    # this, a field that flips from "user-set" → "back to default+conditional"
+    # would leave a stale value behind in the YAML.
+    for key in [k for k in list(target.keys()) if k not in written]:
+        del target[key]
     return target
 
 
@@ -535,7 +908,14 @@ def _python_to_yaml_value(dump_value: Any, raw_attr: Any) -> Any:
 
 
 def _sync_to_map(schema: ConfigSchema, root: CommentedMap) -> None:
-    """Synchronise all schema sections into *root* CommentedMap in-place."""
+    """Synchronise all schema sections into *root* CommentedMap in-place.
+
+    Cascade-up rule: a section's key is written only when ``_section_to_map``
+    produces a non-empty map for it. Sections with always-rendered leaves
+    naturally satisfy this; sections like ``logging`` and the optional
+    ``cache`` / ``monitoring`` / ``logic`` are omitted entirely until at
+    least one of their fields has been explicitly set or marked always.
+    """
     _section_map: dict[str, BaseModel | None] = {
         "targeted_creator": schema.targeted_creator,
         "my_account": schema.my_account,
@@ -545,16 +925,23 @@ def _sync_to_map(schema: ConfigSchema, root: CommentedMap) -> None:
         "logging": schema.logging,
         "monitoring": schema.monitoring,
         "logic": schema.logic,
+        # stash_context is appended last so it lands at the bottom of the
+        # YAML when first written. Conditional: only included when not None.
+        "stash_context": schema.stash_context,
     }
-    # stash_context is optional — only write it when configured
-    if schema.stash_context is not None:
-        _section_map["stash_context"] = schema.stash_context
-    elif "stash_context" in root:
-        # If stash_context was removed at runtime, drop it from the map too
-        del root["stash_context"]
 
     for key, section in _section_map.items():
         if section is None:
+            # Optional section absent from runtime — drop the YAML key too
+            # so the file converges to the schema's view of truth.
+            if key in root:
+                del root[key]
             continue
         existing = root.get(key) if isinstance(root.get(key), CommentedMap) else None
-        root[key] = _section_to_map(section, existing)
+        new_map = _section_to_map(section, existing)
+        if not new_map:
+            # Cascade-up: empty section dump → omit the section entirely.
+            if key in root:
+                del root[key]
+            continue
+        root[key] = new_map

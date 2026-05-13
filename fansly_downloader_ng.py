@@ -2,7 +2,7 @@
 
 """Fansly Downloader NG"""
 
-__version__ = "0.13.4"
+__version__ = "0.14.1"
 
 import asyncio
 import atexit
@@ -26,6 +26,8 @@ from config import (
     validate_adjust_config,
 )
 from config.args import (  # Keep in args to avoid circular imports
+    handle_generate_config,
+    handle_show_config,
     map_args_to_config,
     parse_args,
 )
@@ -35,6 +37,7 @@ from daemon.bootstrap import (
     drain_backfill,
     shutdown_bootstrap,
 )
+from daemon.livestream_watcher import start_livestream_watcher, stop_all_recordings
 from daemon.runner import run_daemon
 from download.core import (
     DownloadState,
@@ -244,7 +247,7 @@ async def load_client_account_into_db(
 
     try:
         api = config.get_api()
-        response = api.get_creator_account_info(creator_name=client_user_name)
+        response = await api.get_creator_account_info(creator_name=client_user_name)
         json_output(
             1,
             "main - client-account-data",
@@ -287,15 +290,29 @@ async def main(config: FanslyConfig) -> int:
 
     print_logo()
 
+    # --generate-config short-circuits before any config load so it works
+    # without an existing config.yaml (its whole point is bootstrapping one).
+    args = parse_args()
+    if args.generate_config is not None:
+        handle_generate_config(args.generate_config)
+        sys.exit(0)
+
     load_config(config)
 
-    args = parse_args()
+    # --show-config runs AFTER load_config so the rendered output reflects
+    # the actual loaded state — operator-set fields visible as bold, defaults
+    # as dim, blank-eligible Optionals as empty after colon. Exits before any
+    # download work since this is purely an inspection mode.
+    if args.show_config:
+        handle_show_config(config)
+        sys.exit(0)
+
     download_mode_set = map_args_to_config(args, config)
     update_logging_config(
         config, config.debug
     )  # Update logging with final config state
 
-    validate_adjust_config(config, download_mode_set)
+    await validate_adjust_config(config, download_mode_set)
 
     if config.user_names is None or config.download_mode == DownloadMode.NOTSET:
         raise RuntimeError(
@@ -327,6 +344,13 @@ async def main(config: FanslyConfig) -> int:
     # the same queue/simulator/ws to continue processing live events.
     bootstrap: DaemonBootstrap = await bootstrap_daemon_ws(config)
 
+    # Start the livestream watcher immediately — before the batch download —
+    # so any creator who goes live during the initial sync is caught.
+    _watcher_stop = asyncio.Event()
+    _watcher_task: asyncio.Task | None = None
+    if config.monitoring_livestream_recording_enabled:
+        _watcher_task = start_livestream_watcher(config, _watcher_stop)
+
     print_info(f"Token: {config.token}")
     print_info(f"Check Key: {config.check_key}")
     print_info(
@@ -334,7 +358,7 @@ async def main(config: FanslyConfig) -> int:
         f"({datetime.fromtimestamp(api.device_id_timestamp / 1000, tz=UTC)})"
     )
     print_info(f"Session ID: {api.session_id}")
-    client_user_name = api.get_client_user_name()
+    client_user_name = await api.get_client_user_name()
     print_info(f"User ID: {client_user_name}")
     if client_user_name is None or client_user_name == "":
         raise ConfigError("Could not retrieve client account user name from API")
@@ -520,7 +544,7 @@ async def main(config: FanslyConfig) -> int:
                 # Still continue if one creator failed
                 except ApiAccountInfoError as e:
                     print_error(str(e))
-                    input_enter_continue(config.interactive)
+                    await input_enter_continue(config.interactive)
                     exit_code = SOME_USERS_FAILED
 
                 # Advance creator progress regardless of success/failure
@@ -689,6 +713,13 @@ async def main(config: FanslyConfig) -> int:
         # keep growing. The WS itself is torn down by the normal
         # cleanup path via config._api.close_websocket().
         await shutdown_bootstrap(bootstrap)
+
+    # Stop the livestream watcher (and any active recordings) on exit.
+    if _watcher_task is not None:
+        _watcher_stop.set()
+        await stop_all_recordings()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(_watcher_task, timeout=5.0)
 
     return exit_code
 

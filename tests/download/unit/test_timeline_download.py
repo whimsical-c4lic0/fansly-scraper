@@ -34,6 +34,7 @@ import httpx
 import pytest
 import respx
 
+from api.fansly import FanslyApi
 from download.downloadstate import DownloadState
 from download.timeline import (
     download_timeline,
@@ -211,9 +212,7 @@ async def test_download_timeline_success_full_real_pipeline(
         },
     }
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -244,7 +243,7 @@ async def test_download_timeline_success_full_real_pipeline(
     # fetch_and_process_media → get_account_media against this endpoint.
     # The response is a list of AccountMedia rows — same shape as the
     # timeline's accountMedia entries (with nested "media" dict for FK).
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -263,7 +262,10 @@ async def test_download_timeline_success_full_real_pipeline(
     monkeypatch.setattr("download.media.download_media", _noop_download)
     # No wall-time pauses — timing_jitter wraps asyncio.sleep.
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _interactive: None  # noqa: E731
+
+    async def _noop(_interactive):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -322,9 +324,7 @@ async def test_download_timeline_empty_media_retries_and_exhausts(
             }
         ],
     )
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(200, json=empty_media_response),
             httpx.Response(200, json=empty_media_response),
@@ -332,10 +332,13 @@ async def test_download_timeline_empty_media_retries_and_exhausts(
     )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
+
     # input_enter_continue is imported at module scope in BOTH
     # download.common and download.timeline — patch every call site plus
     # the source in textio to short-circuit the 15-second sleep fallback.
-    _noop = lambda _interactive: None  # noqa: E731
+    async def _noop(_interactive):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -372,27 +375,128 @@ async def test_download_timeline_skips_when_fetched_duplication_cached(
 
 
 @pytest.mark.asyncio
-async def test_download_timeline_skips_when_creator_content_unchanged(
-    entity_store, mock_config
+async def test_download_timeline_skips_when_probe_confirms_unchanged(
+    respx_fansly_api, entity_store, mock_config, monkeypatch
 ):
-    """creator_content_unchanged → credit skipped items as duplicates, return.
+    """creator_content_unchanged + page 1 all-known → skip + credit duplicates."""
+    from tests.fixtures.metadata.metadata_factories import (
+        AccountFactory,
+        PostFactory,
+    )
 
-    Covers lines 106-116 (the early-return path that credits
-    total_timeline_pictures + total_timeline_videos into duplicate_count).
-    """
     config = mock_config
+    config.use_duplicate_threshold = False
+    config.use_pagination_duplication = False
+    config.timeline_retries = 0
+    config.timeline_delay_seconds = 0
+
+    creator_id = snowflake_id()
+    post_id = snowflake_id()
+
+    # Seed the identity map: account + a post whose id we'll echo back on
+    # page 1. With the seeded post already cached, the probe finds page 1
+    # all-known and short-circuits — matching the old upfront-skip outcome.
+    account = AccountFactory.build(id=creator_id, username=f"unchanged_{creator_id}")
+    await entity_store.save(account)
+    post = PostFactory.build(id=post_id, accountId=creator_id)
+    await entity_store.save(post)
 
     state = DownloadState()
-    state.creator_id = snowflake_id()
+    state.creator_id = creator_id
+    state.creator_name = f"unchanged_{creator_id}"
     state.creator_content_unchanged = True
     state.total_timeline_pictures = 10
     state.total_timeline_videos = 5
 
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
+        return_value=httpx.Response(
+            200,
+            json=_timeline_response(
+                posts=[
+                    {
+                        "id": post_id,
+                        "accountId": creator_id,
+                        "fypFlags": 0,
+                        "createdAt": 1700000000,
+                    }
+                ],
+            ),
+        )
+    )
+    monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
+
     await download_timeline(config, state)
 
-    # Real side effect: duplicate_count incremented by 15.
+    # Probe verified page 1 was all-known → original skip path ran.
     assert state.duplicate_count == 15
     assert state.download_type == DownloadType.TIMELINE
+
+
+@pytest.mark.asyncio
+async def test_download_timeline_probe_falsified_persists_limbo_post(
+    respx_fansly_api, entity_store, mock_config, monkeypatch
+):
+    """creator_content_unchanged + page 1 has cache-miss post → fetch + persist."""
+    from tests.fixtures.metadata.metadata_factories import AccountFactory
+
+    config = mock_config
+    config.download_directory = mock_config.download_directory  # tmp_path-ish
+    config.use_duplicate_threshold = False
+    config.use_pagination_duplication = False
+    config.debug = False
+    config.show_downloads = False
+    config.show_skipped_downloads = False
+    config.interactive = False
+    config.timeline_retries = 0
+    config.timeline_delay_seconds = 0
+
+    creator_id = snowflake_id()
+    limbo_post_id = snowflake_id()
+
+    account = AccountFactory.build(id=creator_id, username=f"limbo_{creator_id}")
+    await entity_store.save(account)
+
+    state = DownloadState()
+    state.creator_id = creator_id
+    state.creator_name = f"limbo_{creator_id}"
+    state.creator_content_unchanged = True
+    state.total_timeline_pictures = 0
+    state.total_timeline_videos = 0
+
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
+        side_effect=[
+            httpx.Response(
+                200,
+                json=_timeline_response(
+                    posts=[
+                        {
+                            "id": limbo_post_id,
+                            "accountId": creator_id,
+                            "fypFlags": 0,
+                            "createdAt": 1700000000,
+                        }
+                    ],
+                ),
+            ),
+            # Second page exhausts via IndexError on timeline["posts"][-1].
+            httpx.Response(200, json=_timeline_response()),
+        ]
+    )
+    _noop_download = AsyncMock(return_value=None)
+    monkeypatch.setattr("download.common.download_media", _noop_download)
+    monkeypatch.setattr("download.media.download_media", _noop_download)
+    monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
+
+    async def _noop(_interactive):
+        return None
+
+    monkeypatch.setattr("download.common.input_enter_continue", _noop)
+    monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
+    monkeypatch.setattr("download.media.input_enter_continue", _noop)
+
+    await download_timeline(config, state)
+
+    assert get_store().get_from_cache(Post, limbo_post_id) is not None
 
 
 @pytest.mark.asyncio
@@ -423,12 +527,15 @@ async def test_download_timeline_key_error_on_malformed_response(
     # which raises KeyError. KeyError propagates out of the outer try at
     # timeline.py:139 and hits the ``except KeyError`` handler at line 219
     # → print_error + (non-interactive) break.
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(side_effect=[httpx.Response(200, json={"success": True})])
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
+        side_effect=[httpx.Response(200, json={"success": True})]
+    )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _interactive: None  # noqa: E731
+
+    async def _noop(_interactive):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -469,9 +576,7 @@ async def test_download_timeline_should_continue_false_breaks_loop(
     # directly from the patch.
     state.duplicate_count = 100
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -517,7 +622,7 @@ async def test_download_timeline_should_continue_false_breaks_loop(
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -559,10 +664,13 @@ async def test_download_timeline_should_continue_false_breaks_loop(
     monkeypatch.setattr("download.common.download_media", _raise_duplicate_count)
     monkeypatch.setattr("download.media.download_media", _raise_duplicate_count)
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
+
     # input_enter_continue is imported at module scope in BOTH
     # download.common and download.timeline — patch every call site plus
     # the source in textio to short-circuit the 15-second sleep fallback.
-    _noop = lambda _interactive: None  # noqa: E731
+    async def _noop(_interactive):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -613,9 +721,7 @@ async def test_download_timeline_debug_mode_prints_timeline_object(
             ],
         },
     }
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -641,7 +747,7 @@ async def test_download_timeline_debug_mode_prints_timeline_object(
             httpx.Response(200, json=_timeline_response()),
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[httpx.Response(200, json=_account_media_response([am_entry]))]
     )
 
@@ -649,7 +755,10 @@ async def test_download_timeline_debug_mode_prints_timeline_object(
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -713,9 +822,7 @@ async def test_download_timeline_batch_duplicate_prints_skipped_count(
             ],
         },
     }
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -741,7 +848,7 @@ async def test_download_timeline_batch_duplicate_prints_skipped_count(
             httpx.Response(200, json=_timeline_response()),
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[httpx.Response(200, json=_account_media_response([am_entry]))]
     )
 
@@ -761,7 +868,10 @@ async def test_download_timeline_batch_duplicate_prints_skipped_count(
         "download.media.download_media", _fake_download_that_counts_duplicate
     )
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -795,12 +905,15 @@ async def test_download_timeline_generic_exception_logs_and_breaks(
     state.creator_id = creator_id
     state.creator_name = f"exc_{creator_id}"
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(side_effect=[RuntimeError("simulated API explosion")])
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
+        side_effect=[RuntimeError("simulated API explosion")]
+    )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -852,9 +965,7 @@ async def test_download_timeline_cursor_index_error_breaks_cleanly(
             ],
         },
     }
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -872,7 +983,7 @@ async def test_download_timeline_cursor_index_error_breaks_cleanly(
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[httpx.Response(200, json=_account_media_response([am_entry]))]
     )
 
@@ -880,7 +991,10 @@ async def test_download_timeline_cursor_index_error_breaks_cleanly(
     monkeypatch.setattr("download.common.download_media", _noop_download)
     monkeypatch.setattr("download.media.download_media", _noop_download)
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -930,9 +1044,7 @@ async def test_download_timeline_cursor_advance_generic_exception_wraps_as_api_e
             ],
         },
     }
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -957,7 +1069,7 @@ async def test_download_timeline_cursor_advance_generic_exception_wraps_as_api_e
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/media").mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/media").mock(
         side_effect=[httpx.Response(200, json=_account_media_response([am_entry]))]
     )
 
@@ -971,7 +1083,10 @@ async def test_download_timeline_cursor_advance_generic_exception_wraps_as_api_e
         raise RuntimeError("simulated sleep failure")
 
     monkeypatch.setattr("download.timeline.sleep", _raising_sleep)
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -1012,9 +1127,7 @@ async def test_download_timeline_non_200_2xx_response_skips_block_and_re_polls(
     state.creator_id = creator_id
     state.creator_name = f"two04_{creator_id}"
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             # iter 1: 204 No Content. raise_for_status passes (2xx),
             # but `if status_code == 200` is False → skip success block →
@@ -1047,7 +1160,10 @@ async def test_download_timeline_non_200_2xx_response_skips_block_and_re_polls(
     )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -1080,7 +1196,10 @@ async def test_download_timeline_none_creator_id_raises_runtime_error(
     state.creator_name = "none_cid"
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -1127,9 +1246,7 @@ async def test_download_timeline_interactive_key_error_continues_loop(
 
     # Provide multiple fallback responses so the loop can exit naturally
     # after KeyError → continue → empty-retry-exhaust.
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(200, json={"success": True}),  # triggers KeyError
             *[httpx.Response(200, json=_timeline_response()) for _ in range(5)],
@@ -1137,7 +1254,10 @@ async def test_download_timeline_interactive_key_error_continues_loop(
     )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -1169,9 +1289,7 @@ async def test_download_timeline_interactive_generic_exception_continues_loop(
     state.creator_id = creator_id
     state.creator_name = f"iexc_{creator_id}"
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             RuntimeError("simulated API explosion"),
             *[httpx.Response(200, json=_timeline_response()) for _ in range(5)],
@@ -1179,7 +1297,10 @@ async def test_download_timeline_interactive_generic_exception_continues_loop(
     )
 
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
-    _noop = lambda _: None  # noqa: E731
+
+    async def _noop(_):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)
@@ -1230,9 +1351,7 @@ async def test_download_timeline_duplicate_page_error_breaks_loop(
     # Confirm cache seed.
     assert get_store().get_from_cache(Post, post_id) is not None
 
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}"
-    ).mock(
+    respx.get(url__startswith=f"{FanslyApi.BASE_URL}timelinenew/{creator_id}").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -1261,10 +1380,13 @@ async def test_download_timeline_duplicate_page_error_breaks_loop(
     # circuit via the module-level patch.
     monkeypatch.setattr("download.common.asyncio.sleep", AsyncMock(return_value=None))
     monkeypatch.setattr("download.timeline.sleep", AsyncMock(return_value=None))
+
     # input_enter_continue is imported at module scope in BOTH
     # download.common and download.timeline — patch every call site plus
     # the source in textio to short-circuit the 15-second sleep fallback.
-    _noop = lambda _interactive: None  # noqa: E731
+    async def _noop(_interactive):
+        return None
+
     monkeypatch.setattr("download.common.input_enter_continue", _noop)
     monkeypatch.setattr("download.timeline.input_enter_continue", _noop)
     monkeypatch.setattr("download.media.input_enter_continue", _noop)

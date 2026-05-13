@@ -18,9 +18,15 @@ relationship) that don't reduce to a (input, expected) shape.
 
 from __future__ import annotations
 
+import io
+import logging
+
 import pytest
+from loguru import logger as loguru_logger
 
 from daemon.handlers import (
+    _GATHERING_DESCRIPTIONS,
+    _NOOP_DESCRIPTIONS,
     CheckCreatorAccess,
     DownloadMessagesForGroup,
     DownloadTimelineOnly,
@@ -29,12 +35,20 @@ from daemon.handlers import (
     RedownloadCreatorMedia,
     WorkItem,
     dispatch_ws_event,
+    has_handler,
 )
+from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 # ---------------------------------------------------------------------------
 # Happy-path dispatch matrix: (svc, type, event) → expected WorkItem
 # ---------------------------------------------------------------------------
+
+
+# IDs that must match between input payload and expected WorkItem assertion.
+# Generated once at module-load so the two sides of each paired case agree.
+_PPV_CREATOR_ID = snowflake_id()
+_DELETED_MSG_ID = snowflake_id()
 
 
 _HAPPY_PATH_CASES: list[tuple[int, int, dict, WorkItem]] = [
@@ -120,11 +134,11 @@ _HAPPY_PATH_CASES: list[tuple[int, int, dict, WorkItem]] = [
             "order": {
                 "orderId": "900000000001",
                 "accountMediaId": "800000000001",
-                "correlationAccountId": "658810502633238529",
+                "correlationAccountId": str(_PPV_CREATOR_ID),
                 "type": 1,
             }
         },
-        RedownloadCreatorMedia(creator_id=658810502633238529),
+        RedownloadCreatorMedia(creator_id=_PPV_CREATOR_ID),
         id="story_ppv_purchase",
     ),
     # svc=5 type=10 — message deleted via ids list
@@ -147,9 +161,9 @@ _HAPPY_PATH_CASES: list[tuple[int, int, dict, WorkItem]] = [
     pytest.param(
         5,
         10,
-        {"message": {"id": "903213063648329728", "deletedAt": 1_776_837_144}},
+        {"message": {"id": str(_DELETED_MSG_ID), "deletedAt": 1_776_837_144}},
         MarkMessagesDeleted(
-            message_ids=(903_213_063_648_329_728,),
+            message_ids=(_DELETED_MSG_ID,),
             deleted_at_epoch=1_776_837_144,
         ),
         id="message_deleted_single_id_with_deletedAt",
@@ -248,13 +262,13 @@ _RETURNS_NONE_CASES: list[tuple[int, int, dict]] = [
         3,
         {
             "transaction": {
-                "id": "904475239180673024",
+                "id": str(snowflake_id()),
                 "type": 58000,
-                "originWalletId": "720168220631244800",
+                "originWalletId": str(snowflake_id()),
                 "destinationWalletId": None,
                 "status": 2,
                 "amount": 6990,
-                "correlationId": "904475238538952704",
+                "correlationId": str(snowflake_id()),
             }
         },
         id="wallet_transaction_observation_only",
@@ -265,7 +279,7 @@ _RETURNS_NONE_CASES: list[tuple[int, int, dict]] = [
         2,
         {
             "account": {
-                "id": "720167541418237953",
+                "id": str(snowflake_id()),
                 "displayName": "Test",
                 "flags": 0,
             }
@@ -274,9 +288,46 @@ _RETURNS_NONE_CASES: list[tuple[int, int, dict]] = [
     ),
     # Defensive: account not a dict (the `if not isinstance(account, dict)` guard)
     pytest.param(12, 2, {"account": None}, id="account_profile_not_a_dict"),
-    # ── _NOOP_DESCRIPTIONS path (svc=4 events; routed through _handle_noop_events) ──
+    # ── _NOOP_DESCRIPTIONS path (engagement / receipts; routed through _handle_noop_events) ──
+    pytest.param(
+        1,
+        2,
+        {
+            "like": {
+                "accountId": str(snowflake_id()),
+                "postId": str(snowflake_id()),
+                "id": str(snowflake_id()),
+            }
+        },
+        id="noop_post_like",
+    ),
+    pytest.param(
+        2,
+        2,
+        {
+            "like": {
+                "accountId": str(snowflake_id()),
+                "accountMediaId": str(snowflake_id()),
+                "id": str(snowflake_id()),
+            }
+        },
+        id="noop_media_like",
+    ),
     pytest.param(4, 1, {"foo": "bar"}, id="noop_message_delivered_ack"),
     pytest.param(4, 2, {"foo": "bar"}, id="noop_message_read_receipt_ack"),
+    # Phase 5: svc=5 type=22 typing-announce — intentional noop (fires every 3-5 s)
+    pytest.param(
+        5,
+        22,
+        {
+            "typingAnnounceEvent": {
+                "accountId": str(snowflake_id()),
+                "groupId": str(snowflake_id()),
+                "lastAnnounce": 0,
+            }
+        },
+        id="noop_typing_announce",
+    ),
     # ── Empty / unknown events ──
     pytest.param(5, 10, {"message": {}}, id="message_deleted_empty_payload"),
     # Defensive: message.ids is not a list (the `if not isinstance(raw_ids, list)` guard)
@@ -425,7 +476,7 @@ _ALL_DISPATCH_PAIRS: list[tuple[int, int, dict]] = [
     (3, 2, {"follow": {"accountId": "500000000003"}}),
     (6, 2, {"wallet": {"balance": 5000}}),
     (6, 3, {"transaction": {"type": 58000, "status": 2, "amount": 6990}}),
-    (12, 2, {"account": {"id": "720167541418237953"}}),
+    (12, 2, {"account": {"id": str(snowflake_id())}}),
     (32, 7, {"order": {"correlationAccountId": "500000000004"}}),
 ]
 
@@ -441,3 +492,66 @@ def test_dispatch_never_emits_download_timeline_only(
     """
     result = dispatch_ws_event(svc, etype, event)
     assert not isinstance(result, DownloadTimelineOnly)
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: has_handler() recognises (5, 22) typing-announce as handled
+# ---------------------------------------------------------------------------
+
+
+def test_has_handler_typing_announce() -> None:
+    """Phase 5: has_handler(5, 22) returns True.
+
+    Ensures the runner won't log “unknown/unhandled” for every typing-announce
+    event, which fires every 3-5 seconds and would flood the log.
+    """
+    assert has_handler(5, 22) is True
+
+
+# ---------------------------------------------------------------------------
+# Four-class taxonomy: gathering tier (provisional classification)
+# ---------------------------------------------------------------------------
+
+
+def test_gathering_entry_routes_to_gathering_handler(caplog) -> None:
+    """An entry in _GATHERING_DESCRIPTIONS dispatches via the gathering path."""
+    caplog.set_level(logging.DEBUG)
+    _GATHERING_DESCRIPTIONS[(9999, 1)] = "test gathering entry"
+    try:
+        result = dispatch_ws_event(9999, 1, {"sample": "payload"})
+    finally:
+        _GATHERING_DESCRIPTIONS.pop((9999, 1), None)
+
+    assert result is None
+    debug_msgs = [r.getMessage() for r in caplog.records if r.levelname == "DEBUG"]
+    assert any(
+        "gathering" in m and "svc=9999 type=1" in m and "test gathering entry" in m
+        for m in debug_msgs
+    )
+
+
+def test_has_handler_recognises_gathering_entries() -> None:
+    """has_handler returns True for entries in _GATHERING_DESCRIPTIONS."""
+    _GATHERING_DESCRIPTIONS[(9999, 2)] = "test gathering entry"
+    try:
+        assert has_handler(9999, 2) is True
+    finally:
+        _GATHERING_DESCRIPTIONS.pop((9999, 2), None)
+
+
+def test_noop_takes_precedence_over_gathering() -> None:
+    """A (svc, type) pair listed in both tables routes through noop, not gathering."""
+    _NOOP_DESCRIPTIONS[(8888, 1)] = "noop wins"
+    _GATHERING_DESCRIPTIONS[(8888, 1)] = "gathering loses"
+    sink = io.StringIO()
+    sink_id = loguru_logger.add(sink, level="DEBUG")
+    try:
+        dispatch_ws_event(8888, 1, {})
+    finally:
+        loguru_logger.remove(sink_id)
+        _NOOP_DESCRIPTIONS.pop((8888, 1), None)
+        _GATHERING_DESCRIPTIONS.pop((8888, 1), None)
+    output = sink.getvalue()
+    assert "known event" in output
+    assert "noop wins" in output
+    assert "gathering loses" not in output

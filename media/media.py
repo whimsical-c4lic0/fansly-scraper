@@ -9,6 +9,7 @@ from __future__ import annotations
 from config.logging import textio_logger
 from download.downloadstate import DownloadState
 from metadata.models import Media, get_store
+from textio.prompts import await_for_enter
 
 
 def simplify_mimetype(mimetype: str) -> str:
@@ -75,10 +76,12 @@ def _build_m3u8_auth_url(variant: Media) -> str | None:
         return url
 
 
-def parse_media_info(
+async def parse_media_info(
     state: DownloadState,
     media_info: dict,
     post_id: str | None = None,
+    *,
+    interactive: bool = False,
 ) -> Media:
     """Select best variant and populate download fields on a cached Media object.
 
@@ -182,7 +185,8 @@ def parse_media_info(
                 f"\n\tMetadata Missing\n\tpost_id: {post_id} & media_id: {effective_id} "
                 f"& creator username: {state.creator_name}\n",
             )
-            input("Press Enter to attempt continue downloading ...")
+            if interactive:
+                await await_for_enter("Press Enter to attempt continue downloading ...")
 
     # Set preview fields
     if "preview" in media_info:

@@ -123,7 +123,8 @@ async def download_wall(
     # Reliable short-circuit: creator's TimelineStats counts + wall
     # structure are both identical to DB → no activity since last run,
     # no need to scan this wall. Set by download.account.get_creator_account_info.
-    if state.creator_content_unchanged:
+    # Gated by config.respect_timeline_stats so users can force a full scan.
+    if config.respect_timeline_stats and state.creator_content_unchanged:
         print_info(
             f"Creator counts and wall structure unchanged — skipping wall {wall_info}"
         )
@@ -157,7 +158,7 @@ async def download_wall(
             if state.creator_id is None:
                 raise RuntimeError("Creator ID should not be None")
 
-            wall_response = config.get_api().get_wall_posts(
+            wall_response = await config.get_api().get_wall_posts(
                 state.creator_id, wall_id, str(before_cursor)
             )
 
@@ -245,7 +246,7 @@ async def download_wall(
                 "or the creator is not providing unlocked content.",
                 35,
             )
-            input_enter_continue(config.interactive)
+            await input_enter_continue(config.interactive)
 
         except DuplicatePageError as e:
             print_info_highlight(str(e))
@@ -257,4 +258,4 @@ async def download_wall(
                 f"Unexpected error during wall download: \n{traceback.format_exc()}",
                 36,
             )
-            input_enter_continue(config.interactive)
+            await input_enter_continue(config.interactive)
