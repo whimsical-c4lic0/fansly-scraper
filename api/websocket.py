@@ -21,7 +21,7 @@ from collections.abc import Callable
 from http.cookies import SimpleCookie
 from typing import TYPE_CHECKING, Any
 
-from websockets import client as ws_client
+from websockets.asyncio.client import connect as ws_connect
 from websockets.exceptions import ConnectionClosedOK, WebSocketException
 
 from api.websocket_protocol import (
@@ -31,6 +31,7 @@ from api.websocket_protocol import (
     MSG_PING,
     MSG_SERVICE_EVENT,
     MSG_SESSION,
+    SILENT_SERVICE_EVENTS,
 )
 from config.logging import websocket_logger as logger
 from helpers.timer import timing_jitter
@@ -46,6 +47,31 @@ if TYPE_CHECKING:
 # enough that shutdown observes cancellation/queue-death promptly, long
 # enough that the wakeup overhead is negligible (~2 wakes/sec/thread).
 _QUEUE_POLL_INTERVAL_S = 0.5
+
+
+def _is_silent_service_event(event_data: Any) -> bool:
+    """Return True when this service event is in ``SILENT_SERVICE_EVENTS``.
+
+    Silent events skip both the WS-layer DEBUG/TRACE log lines and the
+    dispatch into the daemon — same fast-path applied to MSG_PING.
+    Returns False on any malformed payload so a decode failure surfaces
+    via the normal log + dispatch path rather than being silently dropped.
+    """
+    if not isinstance(event_data, dict):
+        return False
+    service_id = event_data.get("serviceId")
+    if service_id is None:
+        return False
+    raw_inner = event_data.get("event")
+    try:
+        inner = (
+            json.loads(raw_inner) if isinstance(raw_inner, str) else (raw_inner or {})
+        )
+    except (json.JSONDecodeError, TypeError):
+        return False
+    if not isinstance(inner, dict):
+        return False
+    return (service_id, inner.get("type")) in SILENT_SERVICE_EVENTS
 
 
 class _ChildWebSocket:
@@ -294,6 +320,20 @@ class _ChildWebSocket:
             message_type = data.get("t")
             message_data = data.get("d")
 
+            # Pre-decode service-event envelopes so the silent filter can
+            # match on (serviceId, inner.type) without re-parsing later.
+            # The decoded dict is reused in the MSG_SERVICE_EVENT branch
+            # below, so this is a one-time outer decode, not a duplicate.
+            service_event_data: Any = None
+            if message_type == MSG_SERVICE_EVENT:
+                service_event_data = (
+                    json.loads(message_data)
+                    if isinstance(message_data, str)
+                    else message_data
+                )
+                if _is_silent_service_event(service_event_data):
+                    return
+
             if message_type != MSG_PING:
                 # Type at DEBUG, payload at TRACE — payloads can carry DM
                 # bodies, accountIds, and other PII that should not land in
@@ -324,16 +364,11 @@ class _ChildWebSocket:
 
             # JS: 1e4 === r → handleServiceEvent(decodeMessage("ServiceEvent", t.d))
             elif message_type == MSG_SERVICE_EVENT:
-                event_data = (
-                    json.loads(message_data)
-                    if isinstance(message_data, str)
-                    else message_data
-                )
                 if MSG_SERVICE_EVENT in self._event_handlers:
                     handler = self._event_handlers[MSG_SERVICE_EVENT]
                     # Marshal to main loop so handler-side state (EntityStore,
                     # StashClient, asyncpg pool) stays single-threaded.
-                    await self._dispatch_event(handler, event_data)
+                    await self._dispatch_event(handler, service_event_data)
 
             # JS: 10001 === r → iterate t.d array, recursively handleText each
             elif message_type == MSG_BATCH:
@@ -465,11 +500,19 @@ class _ChildWebSocket:
         logger.info("Connecting to WebSocket: {}", connection_url)
 
         try:
-            ssl_context = self._create_ssl_context()
+            # Only pass ssl_context for wss:// URIs. The new
+            # ``websockets.asyncio.client.connect`` raises on ssl= with a
+            # ws:// URI (legacy silently ignored it). Production is wss://;
+            # test scripted-responders use ws://.
+            ssl_context: ssl.SSLContext | None = (
+                self._create_ssl_context()
+                if connection_url.startswith("wss://")
+                else None
+            )
 
-            # Prepare extra headers (matching browser request)
-            extra_headers = {
-                "User-Agent": self.user_agent,
+            # Prepare additional headers (matching browser request).
+            # User-Agent goes via the dedicated user_agent_header param.
+            additional_headers = {
                 "Origin": "https://fansly.com",
                 "Sec-Fetch-Dest": "empty",
                 "Sec-Fetch-Mode": "websocket",
@@ -481,12 +524,13 @@ class _ChildWebSocket:
             # Add cookies if provided
             cookie_header = self._create_cookie_header()
             if cookie_header:
-                extra_headers["Cookie"] = cookie_header
+                additional_headers["Cookie"] = cookie_header
 
             # Connect to WebSocket
-            self.websocket = await ws_client.connect(
+            self.websocket = await ws_connect(
                 uri=connection_url,
-                extra_headers=extra_headers,
+                user_agent_header=self.user_agent,
+                additional_headers=additional_headers,
                 ssl=ssl_context,
             )
 
@@ -962,15 +1006,25 @@ def _run_ws_subprocess(
                     task.cancel()
             # Close the websocket so any in-flight recv() returns and
             # _listen_loop exits, instead of blocking on the 60s timeout.
+            # Bounded — websockets.asyncio's default close-handshake timeout
+            # is 10s; we don't need to eat that on shutdown.
             if ws.websocket is not None:
-                with contextlib.suppress(Exception):
-                    await ws.websocket.close()
+                with contextlib.suppress(Exception, TimeoutError):
+                    await asyncio.wait_for(ws.websocket.close(), timeout=2.0)
             for task in (status_task, consumer_task, maintain_task):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
 
     with contextlib.suppress(KeyboardInterrupt):
         asyncio.run(_supervisor())
+
+    # Symmetric to FanslyWebSocket.stop_thread on the parent: don't wait
+    # for child-side feeder threads to drain at process exit. mp's
+    # in-child atexit will block on undelivered items otherwise, even
+    # though the parent has already torn down its end of the pipes.
+    for q in (cmd_q, evt_q):
+        with contextlib.suppress(Exception):
+            q.cancel_join_thread()
 
 
 # ---------------------------------------------------------------------------
@@ -1134,6 +1188,15 @@ class FanslyWebSocket:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._drain_task
             self._drain_task = None
+
+        # Don't wait for queue feeder threads at interpreter exit. Without
+        # this, mp's atexit handler blocks for ~10s per queue when the
+        # subprocess is unresponsive to the stop command — the feeder is
+        # writing to a (now-broken) pipe. Call before join so even a
+        # non-responsive child doesn't strand the feeder.
+        for q in (self._cmd_q, self._evt_q):
+            if q is not None:
+                q.cancel_join_thread()
 
         await asyncio.to_thread(self._proc.join, join_timeout)
         if self._proc.is_alive():

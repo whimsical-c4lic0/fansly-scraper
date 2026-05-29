@@ -37,7 +37,7 @@ class TestSizeAndTimeRotatingFileHandlerInit:
         """Invalid compression raises ValueError (line 74)."""
         log_file = tmp_path / "test.log"
         with pytest.raises(ValueError, match="Unsupported compression type"):
-            SizeAndTimeRotatingFileHandler(filename=str(log_file), compression="bz2")
+            SizeAndTimeRotatingFileHandler(filename=str(log_file), compression="7z")
 
     def test_invalid_when_value(self, tmp_path):
         """Invalid when raises ValueError (line 93-95)."""
@@ -71,6 +71,33 @@ class TestSizeAndTimeRotatingFileHandlerInit:
         # After rollover, a .1 backup should exist
         backup = Path(f"{log_file}.1")
         assert backup.exists()
+        handler.close()
+
+    def test_no_rollover_on_init_empty_old_file(self, tmp_path):
+        """Empty file with stale mtime does NOT trigger rollover on init.
+
+        Regression: ``_check_rollover_on_init`` previously rolled any file
+        whose mtime was older than the interval, regardless of size. That
+        produced a backup slot consumed by a zero-byte file when the
+        daemon restarted after an idle period with no log activity since
+        the prior cycle.
+        """
+        log_file = tmp_path / "test.log"
+        log_file.touch()  # empty file
+
+        old_time = time.time() - 7200  # 2 hours ago, > 1h interval
+        os.utime(log_file, (old_time, old_time))
+
+        handler = SizeAndTimeRotatingFileHandler(
+            filename=str(log_file),
+            when="h",
+            interval=1,
+            backupCount=2,
+        )
+        backup = Path(f"{log_file}.1")
+        assert not backup.exists(), (
+            "empty file with stale mtime should NOT roll on init"
+        )
         handler.close()
 
     def test_rollover_on_init_large_file(self, tmp_path):
@@ -422,79 +449,36 @@ class TestCompressFile:
             handler._compress_file(str(target))
         handler.close()
 
-    def test_7z_compression(self, tmp_path):
-        """7z compression path (lines 325-338)."""
+    def test_bz2_compression(self, tmp_path):
+        """bz2 compression creates .bz2 file and removes original."""
         log_file = tmp_path / "test.log"
         handler = SizeAndTimeRotatingFileHandler(
-            filename=str(log_file), compression="7z", keep_uncompressed=0
+            filename=str(log_file), compression="bz2", keep_uncompressed=0
         )
 
         target = tmp_path / "test.log.3"
-        target.write_text("compress this with 7z")
+        target.write_text("compress this with bz2")
 
-        with patch("shutil.make_archive") as mock_archive:
-            handler._compress_file(str(target))
-            mock_archive.assert_called_once()
+        handler._compress_file(str(target))
+
+        assert Path(f"{target}.bz2").exists()
+        assert not target.exists()
         handler.close()
 
-    def test_lzha_compression(self, tmp_path):
-        """lzha compression path (lines 339-352)."""
+    def test_xz_compression(self, tmp_path):
+        """xz compression creates .xz file and removes original."""
         log_file = tmp_path / "test.log"
         handler = SizeAndTimeRotatingFileHandler(
-            filename=str(log_file), compression="lzha", keep_uncompressed=0
+            filename=str(log_file), compression="xz", keep_uncompressed=0
         )
 
         target = tmp_path / "test.log.3"
-        target.write_text("compress this with lzha")
+        target.write_text("compress this with xz")
 
-        with patch("shutil.make_archive") as mock_archive:
-            handler._compress_file(str(target))
-            mock_archive.assert_called_once()
-        handler.close()
+        handler._compress_file(str(target))
 
-    def test_7z_compression_error_cleanup(self, tmp_path):
-        """7z compression failure cleans up partial archive (lines 334-338)."""
-        log_file = tmp_path / "test.log"
-        handler = SizeAndTimeRotatingFileHandler(
-            filename=str(log_file), compression="7z", keep_uncompressed=0
-        )
-
-        target = tmp_path / "test.log.3"
-        target.write_text("fail")
-
-        # Create the partial archive to verify cleanup
-        partial = Path(f"{target}.7z")
-        partial.write_text("partial")
-
-        with (
-            patch("shutil.make_archive", side_effect=OSError("archive failed")),
-            pytest.raises(OSError),
-        ):
-            handler._compress_file(str(target))
-
-        assert not partial.exists()
-        handler.close()
-
-    def test_lzha_compression_error_cleanup(self, tmp_path):
-        """lzha compression failure cleans up partial archive (lines 349-352)."""
-        log_file = tmp_path / "test.log"
-        handler = SizeAndTimeRotatingFileHandler(
-            filename=str(log_file), compression="lzha", keep_uncompressed=0
-        )
-
-        target = tmp_path / "test.log.3"
-        target.write_text("fail")
-
-        partial = Path(f"{target}.zip")
-        partial.write_text("partial")
-
-        with (
-            patch("shutil.make_archive", side_effect=OSError("archive failed")),
-            pytest.raises(OSError),
-        ):
-            handler._compress_file(str(target))
-
-        assert not partial.exists()
+        assert Path(f"{target}.xz").exists()
+        assert not target.exists()
         handler.close()
 
 

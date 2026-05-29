@@ -31,10 +31,13 @@ import respx
 from daemon.bootstrap import DaemonBootstrap
 from daemon.filters import should_process_creator
 from daemon.handlers import (
+    CheckCreatorAccess,
     DownloadMessagesForGroup,
     DownloadStoriesOnly,
     DownloadTimelineOnly,
     FullCreatorDownload,
+    MarkMessagesDeleted,
+    RedownloadCreatorMedia,
     WorkItem,
 )
 from daemon.polling import poll_home_timeline, poll_story_states
@@ -44,6 +47,7 @@ from daemon.runner import (
     _handle_full_creator_item,
     _handle_stories_only_item,
     _handle_timeline_only_item,
+    _handle_work_item,
     _is_creator_in_scope,
     _make_ws_handler,
     _process_timeline_candidate,
@@ -56,7 +60,7 @@ from errors import DaemonUnrecoverableError
 from tests.fixtures.api import (
     FakeWS,
     dump_fansly_calls,
-    make_fake_ws_factory,
+    make_ws_factory_for,
     mount_client_account_me_route,
     mount_empty_creator_pipeline,
     mount_empty_following_route,
@@ -117,7 +121,7 @@ class TestDaemonTaskScheduling:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_all_tasks_started_and_cancelled_on_shutdown(
-        self, config_wired, entity_store, fake_ws
+        self, config_wired, entity_store, ws_server
     ):
         """run_daemon starts 5 tasks; they all complete on shutdown signal.
 
@@ -138,17 +142,19 @@ class TestDaemonTaskScheduling:
             "daemon.runner.asyncio.create_task",
             side_effect=_patched_create_task,
         ):
-            # Run daemon but stop it after a short delay via injected stop_event
+            # Run daemon but stop it after WS authenticates via injected stop_event
             async def _run_and_stop():
                 task = asyncio.create_task(
                     run_daemon(
                         config_wired,
-                        ws_factory=make_fake_ws_factory(fake_ws),
+                        ws_factory=make_ws_factory_for(ws_server.base_url),
                         stop_event=stop_event,
                     )
                 )
-                # Give it a tick to set up, then trigger shutdown
-                await asyncio.sleep(0.05)
+                # Wait for the WS subprocess to authenticate before shutting
+                # down — gives spawn + handshake time the previous 0.05s
+                # sleep didn't have to provide because FakeWS was in-process.
+                await ws_server.wait_for_auth(timeout=10.0)
                 stop_event.set()
                 try:
                     await asyncio.wait_for(task, timeout=5.0)
@@ -168,7 +174,7 @@ class TestDaemonTaskScheduling:
         assert expected.issubset(set(task_names)), (
             f"Missing tasks: {expected - set(task_names)}"
         )
-        assert fake_ws.started, "WebSocket was not started"
+        assert ws_server.auth_event.is_set(), "WebSocket was not started"
 
 
 # ---------------------------------------------------------------------------
@@ -188,7 +194,7 @@ class TestRunDaemonBootstrapFallback:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_fallback_builds_fresh_ws_and_reuses_collaborators(
-        self, config_wired, entity_store, fake_ws, monkeypatch
+        self, config_wired, entity_store, ws_server, monkeypatch
     ):
         """ws_started=False → ws_factory called, queue/simulator reused."""
         shared_queue: asyncio.Queue[WorkItem] = asyncio.Queue()
@@ -219,12 +225,30 @@ class TestRunDaemonBootstrapFallback:
         task = asyncio.create_task(
             run_daemon(
                 config_wired,
-                ws_factory=make_fake_ws_factory(fake_ws),
+                ws_factory=make_ws_factory_for(ws_server.base_url),
                 stop_event=stop_event,
                 bootstrap=bootstrap,
             )
         )
-        await asyncio.sleep(0.05)
+
+        # Wait for the fresh WS subprocess to authenticate (proves
+        # ws_factory was called and the WS started).
+        await ws_server.wait_for_auth(timeout=10.0)
+
+        # Push a real (15, 5) status=3 event over the wire. If the daemon
+        # registered the service-event handler on the fresh WS (budget-aware
+        # variant), this lands on shared_queue as a FullCreatorDownload
+        # WorkItem — proving both registration and wiring end-to-end.
+        ws_server.push_subscription_event(
+            subscription_id=str(snowflake_id()),
+            history_id=str(snowflake_id()),
+            subscriber_id="100",
+            creator_id="200",
+            status=3,
+            price_mills=10000,
+        )
+        await asyncio.sleep(0.2)  # let the event traverse the wire
+
         stop_event.set()
         try:
             await asyncio.wait_for(task, timeout=5.0)
@@ -232,11 +256,12 @@ class TestRunDaemonBootstrapFallback:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
 
-        # Fresh WS was constructed via ws_factory and started.
-        assert fake_ws.started, "Fallback did not build + start a fresh WS"
-        # Handler was registered on the fresh WS (budget-aware variant).
-        assert fake_ws.MSG_SERVICE_EVENT in fake_ws._handlers, (
-            "Service-event handler was not registered on the fallback WS"
+        # Round-trip evidence the handler was registered AND wired:
+        # the pushed event landed on the bootstrap's shared queue
+        # (worker is stubbed and never drains).
+        assert shared_queue.qsize() >= 1, (
+            "Pushed (15, 5) event never reached the shared queue — "
+            "either ws_factory wasn't called or the handler wasn't registered"
         )
         # Bootstrap's queue is the same object the worker received.
         assert captured_queue, "Worker loop was not invoked"
@@ -307,6 +332,183 @@ class TestIsCreatorInScope:
         config_wired.user_names = {"alice"}
 
         assert await _is_creator_in_scope(config_wired, snowflake_id()) is False
+
+
+class TestHandleWorkItemScopeHoist:
+    """Coverage for the v0.14.2 dispatch-level scope hoist (#94).
+
+    Pre-v0.14.2, only ``_handle_messages_item`` and
+    ``_handle_full_creator_item`` checked scope inline. The other five
+    dispatch entries (``RedownloadCreatorMedia``, ``CheckCreatorAccess``,
+    ``DownloadStoriesOnly``, ``DownloadTimelineOnly``,
+    ``MarkMessagesDeleted``) ran unfiltered — which is how the #94
+    reporter saw downloads triggered for non-listed creators even in
+    batch mode (``daemon_mode: false``, ``use_following: false``,
+    ``usernames: [xx]``): WS events captured during the initial sync
+    drained through ``drain_backfill`` → ``_handle_work_item`` → those
+    five unfiltered handlers.
+
+    The fix hoists the scope check into ``_handle_work_item`` itself,
+    so every WorkItem type dispatched through ``_WORK_DISPATCH`` is
+    scope-gated. ``MarkMessagesDeleted`` has no creator field and
+    falls through unfiltered by design (idempotent: marks
+    already-downloaded message rows; no-op for never-downloaded
+    out-of-scope creators).
+    """
+
+    @pytest.mark.asyncio
+    async def test_out_of_scope_blocks_every_id_carrying_workitem_type(
+        self, config_wired, entity_store, saved_account, monkeypatch
+    ):
+        """Six of seven WorkItem types carry a creator/sender id; the hoist
+        rejects all six when the creator is out of ``user_names``.
+
+        ``saved_account`` is in the store but its username is NOT in
+        ``user_names``; the predicate resolves id→username (via the
+        shim) and returns False. The hoist short-circuits before any
+        handler in ``_WORK_DISPATCH`` runs.
+        """
+        config_wired.use_following = False
+        config_wired.user_names = {"someone_else"}  # NOT saved_account.username
+
+        # Replace each handler with a recorder. If the hoist works, none
+        # of these get called for the out-of-scope creator.
+        calls: list[str] = []
+
+        async def _record(name: str, _config, _item):
+            calls.append(name)
+
+        recorders = {
+            cls: (lambda _c, _i, _n=cls.__name__: _record(_n, _c, _i))
+            for cls in _WORK_DISPATCH
+        }
+        monkeypatch.setattr("daemon.runner._WORK_DISPATCH", recorders)
+
+        # Items carrying creator_id directly:
+        id_items: list[WorkItem] = [
+            FullCreatorDownload(creator_id=saved_account.id),
+            RedownloadCreatorMedia(creator_id=saved_account.id),
+            CheckCreatorAccess(creator_id=saved_account.id),
+            DownloadStoriesOnly(creator_id=saved_account.id),
+            DownloadTimelineOnly(creator_id=saved_account.id),
+            # sender_id field, not creator_id — getattr handles both:
+            DownloadMessagesForGroup(
+                group_id=snowflake_id(), sender_id=saved_account.id
+            ),
+        ]
+
+        for item in id_items:
+            await _handle_work_item(config_wired, item)
+
+        # The hoist blocked every dispatch — recorders never fired.
+        assert calls == [], (
+            f"hoist failed to block out-of-scope items; recorders fired: {calls}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_in_scope_passes_through_to_handler(
+        self, config_wired, entity_store, saved_account, monkeypatch
+    ):
+        """The positive case: in-scope creator reaches its handler.
+
+        With ``user_names`` containing the creator's username, the hoist
+        lets the dispatch proceed and the recorder fires once per item.
+        """
+        config_wired.use_following = False
+        config_wired.user_names = {saved_account.username}
+
+        calls: list[type] = []
+
+        async def _record(_c, item):
+            calls.append(type(item))
+
+        recorders = dict.fromkeys(_WORK_DISPATCH, _record)
+        monkeypatch.setattr("daemon.runner._WORK_DISPATCH", recorders)
+
+        await _handle_work_item(
+            config_wired, FullCreatorDownload(creator_id=saved_account.id)
+        )
+        await _handle_work_item(
+            config_wired, RedownloadCreatorMedia(creator_id=saved_account.id)
+        )
+        await _handle_work_item(
+            config_wired, CheckCreatorAccess(creator_id=saved_account.id)
+        )
+
+        assert calls == [
+            FullCreatorDownload,
+            RedownloadCreatorMedia,
+            CheckCreatorAccess,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_mark_messages_deleted_falls_through_unfiltered(
+        self, config_wired, entity_store, monkeypatch
+    ):
+        """``MarkMessagesDeleted`` has no creator_id/sender_id field — the
+        hoist's ``getattr(item, ..., None)`` returns None, the scope
+        check is skipped, the handler runs.
+
+        Semantic justification: the work item operates on already-downloaded
+        Message rows by id. For messages from out-of-scope creators we
+        never downloaded the message in the first place, so the deletion
+        marker is a no-op against the local archive — idempotent and safe.
+        """
+        config_wired.use_following = False
+        config_wired.user_names = {"someone_else"}
+
+        called = False
+
+        async def _record(_c, _i):
+            nonlocal called
+            called = True
+
+        recorders = dict.fromkeys(_WORK_DISPATCH, _record)
+        monkeypatch.setattr("daemon.runner._WORK_DISPATCH", recorders)
+
+        await _handle_work_item(
+            config_wired,
+            MarkMessagesDeleted(message_ids=(snowflake_id(), snowflake_id())),
+        )
+
+        assert called is True, (
+            "MarkMessagesDeleted should fall through the scope hoist — "
+            "no creator/sender field means no scope predicate input"
+        )
+
+    @pytest.mark.asyncio
+    async def test_use_following_lets_every_item_through(
+        self, config_wired, entity_store, saved_account, monkeypatch
+    ):
+        """Under ``-uf`` / ``-ufp``, every WorkItem reaches its handler.
+
+        The predicate short-circuits True for any creator under
+        ``use_following=True``, so the hoist is a no-op in that mode.
+        Pins the contract that ``-uf`` doesn't accidentally start
+        filtering things it shouldn't.
+        """
+        config_wired.use_following = True
+        config_wired.user_names = None
+
+        calls: list[type] = []
+
+        async def _record(_c, item):
+            calls.append(type(item))
+
+        recorders = dict.fromkeys(_WORK_DISPATCH, _record)
+        monkeypatch.setattr("daemon.runner._WORK_DISPATCH", recorders)
+
+        # Use a snowflake id that's NOT in the store at all — under -uf
+        # the predicate doesn't even look up the account.
+        unknown_id = snowflake_id()
+        await _handle_work_item(
+            config_wired, FullCreatorDownload(creator_id=unknown_id)
+        )
+        await _handle_work_item(
+            config_wired, DownloadStoriesOnly(creator_id=unknown_id)
+        )
+
+        assert calls == [FullCreatorDownload, DownloadStoriesOnly]
 
 
 # ---------------------------------------------------------------------------
@@ -851,7 +1053,7 @@ class TestWsEventEnqueuesWork:
 
     @pytest.mark.asyncio
     async def test_ws_subscription_event_enqueues_full_creator_download(
-        self, config_wired, entity_store, fake_ws
+        self, config_wired, entity_store
     ):
         """svc=15 type=5 status=3 -> FullCreatorDownload in queue."""
         creator_id = snowflake_id()
@@ -1831,7 +2033,7 @@ class TestRunDaemonSigintHandler:
     """Capture the SIGINT handler installed by _run_daemon_body and exercise both branches."""
 
     async def _run_with_captured_sigint_handler(
-        self, config_wired, fake_ws, monkeypatch
+        self, config_wired, ws_server, monkeypatch
     ):
         """Install a capture for loop.add_signal_handler and start the daemon.
 
@@ -1854,7 +2056,7 @@ class TestRunDaemonSigintHandler:
         task = asyncio.create_task(
             run_daemon(
                 config_wired,
-                ws_factory=make_fake_ws_factory(fake_ws),
+                ws_factory=make_ws_factory_for(ws_server.base_url),
                 stop_event=stop_event,
             )
         )
@@ -1868,11 +2070,11 @@ class TestRunDaemonSigintHandler:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_first_sigint_sets_stop_event_and_logs_info(
-        self, config_wired, entity_store, fake_ws, monkeypatch, caplog
+        self, config_wired, entity_store, ws_server, monkeypatch, caplog
     ):
         caplog.set_level(logging.INFO)
         task, captured, stop_event = await self._run_with_captured_sigint_handler(
-            config_wired, fake_ws, monkeypatch
+            config_wired, ws_server, monkeypatch
         )
 
         assert captured, "SIGINT handler was not installed by _run_daemon_body"
@@ -1892,11 +2094,11 @@ class TestRunDaemonSigintHandler:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_second_sigint_raises_keyboard_interrupt_and_logs_warning(
-        self, config_wired, entity_store, fake_ws, monkeypatch, caplog
+        self, config_wired, entity_store, ws_server, monkeypatch, caplog
     ):
         caplog.set_level(logging.WARNING)
         task, captured, _stop_event = await self._run_with_captured_sigint_handler(
-            config_wired, fake_ws, monkeypatch
+            config_wired, ws_server, monkeypatch
         )
 
         assert captured, "SIGINT handler was not installed by _run_daemon_body"
@@ -1927,7 +2129,7 @@ class TestRunDaemonInnerCancellation:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_inner_cancelled_error_is_caught_and_finally_runs(
-        self, config_wired, entity_store, fake_ws, monkeypatch
+        self, config_wired, entity_store, ws_server, monkeypatch
     ):
         async def _cancel_immediately(*_a, **_k):
             raise asyncio.CancelledError("simulated inner cancellation")
@@ -1938,7 +2140,7 @@ class TestRunDaemonInnerCancellation:
         task = asyncio.create_task(
             run_daemon(
                 config_wired,
-                ws_factory=make_fake_ws_factory(fake_ws),
+                ws_factory=make_ws_factory_for(ws_server.base_url),
                 stop_event=stop_event,
             )
         )
@@ -1955,8 +2157,8 @@ class TestRunDaemonInnerCancellation:
         # The except (CancelledError, KeyboardInterrupt): pass branch swallows
         # the cancellation, so exit_code is EXIT_SUCCESS (0), NOT a re-raise.
         assert exit_code == 0
-        # WS was stopped via the finally block.
-        assert fake_ws.stopped
+        # WS was stopped via the finally block — connections closed.
+        assert len(ws_server.connections) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1970,7 +2172,7 @@ class TestRunDaemonWorkerDrainTimeout:
     @pytest.mark.asyncio
     @pytest.mark.timeout(10)
     async def test_worker_drain_timeout_logs_and_cancels(
-        self, config_wired, entity_store, fake_ws, monkeypatch, caplog
+        self, config_wired, entity_store, ws_server, monkeypatch, caplog
     ):
         caplog.set_level(logging.WARNING)
         real_wait_for = asyncio.wait_for
@@ -1992,7 +2194,7 @@ class TestRunDaemonWorkerDrainTimeout:
         task = asyncio.create_task(
             run_daemon(
                 config_wired,
-                ws_factory=make_fake_ws_factory(fake_ws),
+                ws_factory=make_ws_factory_for(ws_server.base_url),
                 stop_event=stop_event,
             )
         )

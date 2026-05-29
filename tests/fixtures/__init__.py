@@ -21,6 +21,7 @@ from typing import Any
 
 # Import from nested modules
 from .api import (
+    FakeFanslyWSServer,
     FakeSocket,
     FakeWS,
     MainIntegrationEnv,
@@ -28,13 +29,16 @@ from .api import (
     build_mock_ws_class,
     create_mock_json_response,
     dump_fansly_calls,
+    dump_ws_server_state,
     fake_websocket_session,
     fake_ws,
     fansly_api_factory,
     fansly_json,
     main_integration_env,
+    make_child_ws_for,
     make_fake_ws_factory,
     make_proxy,
+    make_ws_factory_for,
     mock_fansly_account_response,
     mock_fansly_timeline_response,
     mount_client_account_me_route,
@@ -45,6 +49,7 @@ from .api import (
     run_main_and_cleanup,
     spawn_ctx_with_mock_process,
     ws_message,
+    ws_server,
 )
 from .config import (
     no_display,
@@ -63,6 +68,7 @@ from .core import (
 from .daemon import (
     RecordingSimulator,
     StubSimulator,
+    isolate_active_recordings,
 )
 from .database import (
     config,
@@ -248,6 +254,7 @@ mod_config_fixtures = [
 mod_daemon_fakes = [
     "RecordingSimulator",
     "StubSimulator",
+    "isolate_active_recordings",
 ]
 
 mod_download_factories = [
@@ -258,6 +265,7 @@ mod_download_factories = [
 ]
 
 mod_api_fixtures = [
+    "FakeFanslyWSServer",
     "FakeSocket",
     "FakeWS",
     "MainIntegrationEnv",
@@ -265,13 +273,16 @@ mod_api_fixtures = [
     "build_mock_ws_class",
     "create_mock_json_response",
     "dump_fansly_calls",
+    "dump_ws_server_state",
     "fake_websocket_session",
     "fake_ws",
     "fansly_api_factory",
     "fansly_json",
     "main_integration_env",
+    "make_child_ws_for",
     "make_fake_ws_factory",
     "make_proxy",
+    "make_ws_factory_for",
     "mock_fansly_account_response",
     "mock_fansly_timeline_response",
     "mount_client_account_me_route",
@@ -282,6 +293,7 @@ mod_api_fixtures = [
     "run_main_and_cleanup",
     "spawn_ctx_with_mock_process",
     "ws_message",
+    "ws_server",
 ]
 
 mod_metadata_factories = [

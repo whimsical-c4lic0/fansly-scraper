@@ -559,7 +559,7 @@ def setup_handlers() -> None:
             wrapper.handler.db_logger_name = "database_logger"  # debug tag
         handler_id = logger.add(
             wrapper.write,
-            format=entry.format or g.default_format or default_format,
+            format=default_format,
             level=get_log_level(level_logger_name, default_level),
             filter=filter,
             backtrace=True,
@@ -577,7 +577,7 @@ def setup_handlers() -> None:
             return
         handler_id = logger.add(  # type: ignore[call-overload]
             sink=console_sink,
-            format=entry.format or g.default_format or format_record,
+            format=format_record,
             level=get_log_level(level_logger_name, "INFO"),
             filter=filter,
             colorize=use_colorize,
@@ -715,36 +715,20 @@ def set_trace_enabled(enabled: bool) -> None:
     update_logging_config(_config, _debug_enabled)
 
 
+# Only these sinks may emit TRACE. All others clamp at DEBUG.
+_TRACE_CAPABLE_LOGGERS = frozenset({"trace", "sqlalchemy", "websocket"})
+
+
 def get_log_level(logger_name: str, default: str = "INFO") -> int:
-    """Get log level for a logger.
+    """Resolve effective level for a sink, honoring CLI and YAML overrides."""
+    schema_trace = bool(
+        _config
+        and getattr(getattr(_config, "logging", None), "global_", None)
+        and _config.logging.global_.trace
+    )
+    is_trace_capable = logger_name in _TRACE_CAPABLE_LOGGERS
 
-    Precedence (highest first):
-        1. ``-vv`` / ``_trace_enabled`` — every handler floors at TRACE,
-           including ``trace_logger`` and the otherwise-default-INFO peers.
-        2. ``-v`` / ``_debug_enabled`` — every non-trace handler floors at
-           DEBUG; ``trace_logger`` stays disabled (CRITICAL).
-        3. Per-handler schema config (``config.log_levels[name]``), with
-           a DEBUG ceiling so users can't accidentally TRACE-spam non-trace
-           handlers via YAML.
-
-    Args:
-        logger_name: handler identity — "textio", "stash_console",
-            "stash_file", "sqlalchemy", "trace", "websocket", "json".
-        default: Fallback when neither overrides nor config provide one.
-
-    Returns:
-        Log level as integer (e.g., 5 for TRACE, 10 for DEBUG, 20 for INFO).
-    """
     if logger_name == "trace":
-        # Trace handler is dormant unless trace mode is on (either CLI
-        # ``-vv`` or YAML ``logging.global.trace=true``). CRITICAL is the
-        # canonical "effectively off" level for a loguru sink that should
-        # otherwise stay registered.
-        schema_trace = bool(
-            _config
-            and getattr(getattr(_config, "logging", None), "global_", None)
-            and _config.logging.global_.trace
-        )
         return (
             _LEVEL_VALUES["TRACE"]
             if (_trace_enabled or schema_trace)
@@ -752,22 +736,17 @@ def get_log_level(logger_name: str, default: str = "INFO") -> int:
         )
 
     if _trace_enabled:
-        # -vv override — every handler goes to TRACE. Console handlers'
-        # schema-level "no TRACE in YAML" rule doesn't apply here because
-        # this is a runtime opt-in, not a persisted misconfiguration.
-        return _LEVEL_VALUES["TRACE"]
+        return _LEVEL_VALUES["TRACE"] if is_trace_capable else _LEVEL_VALUES["DEBUG"]
 
     if _debug_enabled:
         return _LEVEL_VALUES["DEBUG"]
 
-    # Get level name from config or use default
-    if _config is None:
-        level_name = default
-    else:
-        level_name = _config.log_levels.get(logger_name, default)
-
-    # Convert level name to integer and ensure minimum DEBUG level
+    level_name = _config.log_levels.get(logger_name, default) if _config else default
     level = _LEVEL_VALUES[level_name.upper()]
+
+    if schema_trace and is_trace_capable and level == _LEVEL_VALUES["TRACE"]:
+        return level
+
     return max(level, _LEVEL_VALUES["DEBUG"])
 
 

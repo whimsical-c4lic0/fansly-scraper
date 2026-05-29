@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel, SecretStr
 from stash_graphql_client import StashClient, StashContext
 
-from api import FanslyApi
 from api.rate_limiter import RateLimiter
 from api.rate_limiter_display import RateLimiterDisplay
 from config.modes import DownloadMode
@@ -24,6 +23,14 @@ from config.schema import (
 
 
 if TYPE_CHECKING:
+    # ``from api import FanslyApi`` would cause a circular-import failure
+    # under spawn-context subprocess unpickle: child imports api.websocket
+    # first (to resolve the pickled WS subprocess target), which triggers
+    # api/__init__ → api.fansly → api.websocket → config.logging → config →
+    # config.fanslyconfig → ``from api import FanslyApi`` ← partial-init
+    # ImportError. TYPE_CHECKING-only here + inline import at the one
+    # runtime callsite (``get_api``) avoids the loop.
+    from api import FanslyApi
     from metadata import Database
 
 
@@ -188,9 +195,9 @@ class FanslyConfig:
     # the daemon is running during long hidden phases with no other activity.
     # Loaded from schema.monitoring.heartbeat_interval_minutes.
     monitoring_heartbeat_interval_minutes: int = 15
-    # Opt-out flag for livestream recording (silent until a followed creator
+    # Opt-in flag for livestream recording (silent until a followed creator
     # goes live). Loaded from schema.monitoring.livestream_recording_enabled.
-    monitoring_livestream_recording_enabled: bool = True
+    monitoring_livestream_recording_enabled: bool = False
     # Seconds between followingstreams/online polls.
     # Loaded from schema.monitoring.livestream_poll_interval_seconds.
     monitoring_livestream_poll_interval_seconds: int = 30
@@ -255,6 +262,8 @@ class FanslyConfig:
                 # Otherwise use the valid unscrambled token
                 api_token = token if self.token_is_valid() else ""
 
+                from api import FanslyApi  # noqa: PLC0415, I001  # circular-break: spawn-context subprocess unpickle fails if top-level
+
                 self._api = FanslyApi(
                     token=api_token,
                     user_agent=user_agent,
@@ -292,6 +301,70 @@ class FanslyConfig:
             self._save_config()
 
         return api
+
+    def is_username_in_scope(self, username: str | None) -> bool:
+        """Return True when *username* is in scope for this invocation.
+
+        Cross-cutting scope predicate shared by every code path that
+        decides "is this creator something the user asked us to act
+        on?" — daemon WS dispatch (after resolving id→username),
+        livestream watcher (api payload carries the username
+        directly), polling loops, future entry points. Lives on
+        FanslyConfig because the answer is a function of config
+        (``user_names`` + ``use_following``) alone — no subsystem
+        state, no metadata store, no async.
+
+        Synchronous + string-based on purpose. Callers that only hold a
+        creator_id resolve to username first (via their own cached
+        account lookup, or by reading the username off whatever
+        payload spawned the work). Keeping the predicate id-free
+        means scope checks never have to poll the metadata store.
+
+        Resolution:
+          - ``use_following=True`` (``-uf`` / ``-ufp``) → True for any
+            username. The whole following-list is in scope.
+          - Empty ``user_names`` with ``use_following=False`` → True
+            (unrestricted edge case; legacy or test-time configs).
+          - Populated ``user_names`` → True iff *username*
+            (case-insensitive) is in ``user_names``. None or empty
+            *username* returns False.
+
+        Args:
+            username: Fansly account username (case-insensitive
+                compared). ``None`` and empty strings return False
+                (under restricted scope). Must be ``str`` or ``None``
+                — passing an ``int`` (e.g., a stray creator_id from a
+                caller migrating off the id-based shim) raises
+                ``TypeError`` to surface the misuse at the entry
+                point rather than fail confusingly inside the
+                predicate. Content-based validation is deliberately
+                NOT performed: Fansly allows all-digit usernames
+                ("12345" is a legitimate username) so we cannot
+                reject "looks-like-an-id" inputs without breaking
+                real operators.
+
+        Returns:
+            True when the username is in scope; False otherwise.
+
+        Raises:
+            TypeError: When *username* is neither ``str`` nor ``None``.
+        """
+        if username is not None and not isinstance(username, str):
+            raise TypeError(
+                "is_username_in_scope() expects str | None; got "
+                f"{type(username).__name__}. If you have a creator_id "
+                "(int), resolve to username first (e.g., via "
+                "daemon.runner._is_creator_in_scope which does the "
+                "Account-store lookup) — the canonical predicate is "
+                "str-based on purpose."
+            )
+        if self.use_following:
+            return True
+        if not self.user_names:
+            return True  # unrestricted edge case
+        if not username:
+            return False  # unknown / empty username — skip
+        return username.lower() in {n.lower() for n in self.user_names}
 
     def user_names_str(self) -> str:
         """Returns a nicely formatted and alphabetically sorted list of
