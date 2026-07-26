@@ -15,7 +15,7 @@ import json
 from collections.abc import Callable
 from datetime import UTC, datetime
 from enum import Enum
-from typing import Annotated, Any, ClassVar, Self
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Self
 from urllib.parse import urlparse
 
 from pydantic import (
@@ -31,6 +31,11 @@ from pydantic import (
 from stash_graphql_client.types.unset import UNSET, UnsetType
 
 from errors import StubNotImplementedError
+from helpers.common import parse_timestamp
+
+
+if TYPE_CHECKING:
+    from metadata.entity_store import PostgresEntityStore
 
 
 # ── Snowflake ID type ───────────────────────────────────────────────────
@@ -65,7 +70,7 @@ SnowflakeId = Annotated[int, BeforeValidator(_validate_snowflake)]
 # ── Module-level store accessor ──────────────────────────────────────────
 
 
-def get_store() -> Any:
+def get_store() -> PostgresEntityStore:
     """Get the global EntityStore singleton.
 
     Returns the store set on FanslyObject._store. Raises RuntimeError if
@@ -81,8 +86,21 @@ def get_store() -> Any:
 
 # ── RelationshipMetadata ─────────────────────────────────────────────────
 
+
 # Sentinel for fields resolved by __init_subclass__ from the dict key name.
-_DEFERRED = object()
+class _Deferred(str):
+    """Sentinel for RelationshipMetadata fields auto-resolved by
+    ``FanslyObject.__init_subclass__``.
+
+    Subclasses ``str`` so it satisfies the str-typed ``target_field`` /
+    ``query_field`` / ``fk_column`` parameters at construction; detection is by
+    identity (``is _DEFERRED``), so the placeholder value is never read.
+    """
+
+    __slots__ = ()
+
+
+_DEFERRED = _Deferred("<deferred>")
 
 
 class RelationshipMetadata:
@@ -406,22 +424,6 @@ class ContentType(Enum):
     POLL = 42001
 
 
-# ── Timestamp / utility helpers ──────────────────────────────────────────
-
-
-def _parse_timestamp(v: Any) -> Any:
-    """Parse timestamp from int/float/string to datetime. Shared by validators."""
-    if v is None or isinstance(v, datetime):
-        return v
-    if isinstance(v, (int, float)):
-        if v > 1e10:
-            v = v / 1000
-        return datetime.fromtimestamp(v, UTC)
-    if isinstance(v, str):
-        return datetime.fromisoformat(v.replace("Z", "+00:00"))
-    return v
-
-
 # ── FanslyRecord — simple records without identity map ───────────────────
 
 
@@ -453,7 +455,7 @@ class FanslyObject(BaseModel):
     well-defined and don't need the triality.
     """
 
-    _store: ClassVar[Any] = None  # Set to PostgresEntityStore at runtime
+    _store: ClassVar[PostgresEntityStore | None] = None  # set at runtime
 
     __table_name__: ClassVar[str] = ""
     __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {}
@@ -555,7 +557,7 @@ class FanslyObject(BaseModel):
                         "utf-8", errors="replace"
                     )
             elif isinstance(v, (int, float)) and k.endswith("At"):
-                data[k] = _parse_timestamp(v)
+                data[k] = parse_timestamp(v)
         return data
 
     # Fields excluded from DB writes (extended by subclasses): inverse-only
@@ -619,7 +621,7 @@ class FanslyObject(BaseModel):
                 # Evict during re-validation to avoid recursion. try/finally
                 # guards against a validation-error leak that would otherwise
                 # force the next save into INSERT → UniqueViolationError.
-                cls._store.invalidate(cls, cached.id)
+                cls._store.invalidate(cls, entity_id)
                 try:
                     validated = handler(processed, ctx)
 
@@ -708,7 +710,7 @@ class FanslyObject(BaseModel):
                 continue
 
             if meta.is_list and isinstance(value, list):
-                resolved = []
+                resolved: list[object] = []
                 for item in value:
                     if isinstance(item, int):
                         cached = cls._store.get_from_cache_by_type_name(
@@ -861,7 +863,10 @@ class FanslyObject(BaseModel):
             if self not in current:
                 current.append(self)
                 # Update snapshot so inverse-sync additions aren't falsely dirty
-                if inverse_field in related_obj._snapshot:
+                if (
+                    related_obj._snapshot is not None
+                    and inverse_field in related_obj._snapshot
+                ):
                     related_obj._snapshot[inverse_field] = current.copy()
         else:
             object.__setattr__(related_obj, inverse_field, self)
@@ -931,16 +936,18 @@ class FanslyObject(BaseModel):
         return value.copy() if isinstance(value, list) else value
 
     def is_dirty(self) -> bool:
+        snapshot = self._snapshot or {}
         for field in self.__tracked_fields__:
-            if getattr(self, field, None) != self._snapshot.get(field):
+            if getattr(self, field, None) != snapshot.get(field):
                 return True
         return False
 
     def get_changed_fields(self) -> dict[str, Any]:
+        snapshot = self._snapshot or {}
         return {
             field: getattr(self, field)
             for field in self.__tracked_fields__
-            if getattr(self, field) != self._snapshot.get(field)
+            if getattr(self, field) != snapshot.get(field)
         }
 
     def mark_clean(self) -> None:
@@ -955,7 +962,7 @@ class FanslyObject(BaseModel):
     # ── Output Serialization ─────────────────────────────────────────
 
     @staticmethod
-    def _get_id(obj: Any) -> int | None:
+    def _get_id(obj: object) -> int | None:
         """Extract ID from an object or dict. Used by store for associations."""
         if isinstance(obj, dict):
             return obj.get("id")
@@ -1056,7 +1063,7 @@ class FanslyObject(BaseModel):
                     and hasattr(field_info.annotation, "__args__")
                     and datetime in getattr(field_info.annotation, "__args__", ())
                 ):
-                    value = _parse_timestamp(value)  # noqa: PLW2901
+                    value = parse_timestamp(value)  # noqa: PLW2901
 
             current_value = getattr(instance, key, None)
             if current_value != value:
@@ -1111,7 +1118,7 @@ class PinnedPost(FanslyRecord):
     def _coerce_fields(cls, data: Any) -> Any:
         if isinstance(data, dict):
             if isinstance(data.get("createdAt"), (int, float)):
-                data = {**data, "createdAt": _parse_timestamp(data["createdAt"])}
+                data = {**data, "createdAt": parse_timestamp(data["createdAt"])}
             if "pos" in data and not isinstance(data["pos"], int):
                 data = {
                     **data,
@@ -1302,12 +1309,12 @@ class MonitorState(FanslyObject):
 
     creatorId: SnowflakeId
     lastHasActiveStories: bool | None = None
-    lastCheckedAt: Annotated[datetime | None, BeforeValidator(_parse_timestamp)] = None
+    lastCheckedAt: Annotated[datetime | None, BeforeValidator(parse_timestamp)] = None
     # lastRunAt and updatedAt also coerce int/float unix timestamps —
     # the daemon writes values straight from WS frame timestamps which
     # arrive as integer milliseconds.
-    lastRunAt: Annotated[datetime | None, BeforeValidator(_parse_timestamp)] = None
-    updatedAt: Annotated[datetime, BeforeValidator(_parse_timestamp)] = Field(
+    lastRunAt: Annotated[datetime | None, BeforeValidator(parse_timestamp)] = None
+    updatedAt: Annotated[datetime, BeforeValidator(parse_timestamp)] = Field(
         default_factory=lambda: datetime.now(UTC)
     )
 
@@ -1406,6 +1413,7 @@ class Media(FanslyObject):
     preview_url: str | None = None
     preview_mimetype: str | None = None
     default_normal_id: SnowflakeId | None = None
+    local_path: str | None = None  # Full on-disk path (local_filename is basename only)
 
     # Relationships (managed by _sync_associations on save)
     account: Account | UnsetType | None = UNSET  # type: ignore[name-defined]
@@ -1421,6 +1429,7 @@ class Media(FanslyObject):
         "preview_url",
         "preview_mimetype",
         "default_normal_id",
+        "local_path",
     }
 
     @property
@@ -1946,6 +1955,189 @@ class Group(FanslyObject):
     messages: list[Message] = Field(default_factory=list)
 
 
+class SubscriptionPromo(FanslyObject):
+    """A promo discount attached to a SubscriptionPlan.
+
+    Persisted so promo lifecycle events (svc=15 type=11 / inner type 15011)
+    received over the WS can be correlated with cached state.
+    """
+
+    __table_name__: ClassVar[str] = "subscription_promos"
+    __tracked_fields__: ClassVar[set[str]] = {
+        "planId",
+        "status",
+        "price",
+        "duration",
+        "maxUses",
+        "maxUsesBefore",
+        "newSubscribersOnly",
+        "description",
+        "startsAt",
+        "endsAt",
+    }
+    __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {
+        "plan": belongs_to("SubscriptionPlan", fk_column="planId"),
+    }
+
+    planId: SnowflakeId
+    status: int | None = None
+    price: int | None = None
+    duration: int | None = None
+    maxUses: int | None = None
+    maxUsesBefore: datetime | None = None
+    newSubscribersOnly: int | None = None
+    description: str | None = None
+    startsAt: datetime | None = None
+    endsAt: datetime | None = None
+
+    plan: SubscriptionPlan | UnsetType | None = UNSET  # type: ignore[name-defined]
+
+
+class SubscriptionPlan(FanslyObject):
+    """A creator's offered subscription plan.
+
+    From /api/v1/subscriptions response subscriptionPlans[] — the catalog
+    of plans creators sell. Distinct from Subscription (a user's purchase).
+    """
+
+    __table_name__: ClassVar[str] = "subscription_plans"
+    __tracked_fields__: ClassVar[set[str]] = {
+        "accountId",
+        "subscriptionTierId",
+        "billingCycle",
+        "price",
+        "useAmounts",
+        "promos",
+    }
+    __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {
+        "account": belongs_to("Account", fk_column="accountId"),
+        "promos": has_many("SubscriptionPromo", fk_column="planId"),
+    }
+
+    accountId: SnowflakeId
+    subscriptionTierId: SnowflakeId | None = None
+    billingCycle: int | None = None
+    price: int | None = None
+    useAmounts: int | None = None
+
+    account: Account | UnsetType | None = UNSET  # type: ignore[name-defined]
+    promos: list[SubscriptionPromo] = Field(default_factory=list)
+
+
+class Subscription(FanslyObject):
+    """A user's subscription to a creator.
+
+    Multi-row per accountId (allows resub-after-expiry creating new rows
+    if Fansly ever changes behavior; current observed behavior is in-place
+    update). Status: 3=active, 5=expired; other values seen but not catalogued.
+    Renewal extends endsAt + advances updatedAt on the same row.
+
+    `renewDatexD` is preserved alongside `renewDate` — appears in API
+    responses with the same value, may diverge in future schema revisions.
+    """
+
+    __table_name__: ClassVar[str] = "subscriptions"
+    __tracked_fields__: ClassVar[set[str]] = {
+        "accountId",
+        "subscriptionTierId",
+        "subscriptionTierName",
+        "subscriptionTierColor",
+        "planId",
+        "promoId",
+        "giftCodeId",
+        "status",
+        "price",
+        "renewPrice",
+        "renewCorrelationId",
+        "autoRenew",
+        "billingCycle",
+        "duration",
+        "renewDate",
+        "renewDatexD",
+        "createdAt",
+        "updatedAt",
+        "endsAt",
+        "promoPrice",
+        "promoDuration",
+        "promoStatus",
+        "promoStartsAt",
+        "promoEndsAt",
+        "version",
+    }
+    __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {
+        "account": belongs_to("Account", fk_column="accountId"),
+    }
+
+    @model_validator(mode="before")
+    @classmethod
+    def _stringify_id_fields(cls, data: Any) -> Any:
+        # Fansly returns promoId / giftCodeId / renewCorrelationId as ints
+        # in embedded Account.subscription payloads (0 for absent promo,
+        # Snowflake-shaped gift code and correlation IDs); DB columns are
+        # String, so coerce before strict Pydantic typing rejects int → str.
+        if not isinstance(data, dict):
+            return data
+        for field in ("promoId", "giftCodeId", "renewCorrelationId"):
+            v = data.get(field)
+            if v is not None and not isinstance(v, str):
+                data[field] = str(v)
+        return data
+
+    accountId: SnowflakeId
+    subscriptionTierId: SnowflakeId | None = None
+    subscriptionTierName: str | None = None
+    subscriptionTierColor: str | None = None
+    planId: SnowflakeId | None = None
+    promoId: str | None = None
+    giftCodeId: str | None = None
+    status: int | None = None
+    price: int | None = None
+    renewPrice: int | None = None
+    renewCorrelationId: str | None = None
+    autoRenew: int | None = None
+    billingCycle: int | None = None
+    duration: int | None = None
+    renewDate: datetime | None = None
+    renewDatexD: datetime | None = None
+    createdAt: datetime | None = None
+    updatedAt: datetime | None = None
+    endsAt: datetime | None = None
+    promoPrice: int | None = None
+    promoDuration: int | None = None
+    promoStatus: int | None = None
+    promoStartsAt: datetime | None = None
+    promoEndsAt: datetime | None = None
+    version: int | None = None
+
+    account: Account | UnsetType | None = UNSET  # type: ignore[name-defined]
+
+
+class FollowEvent(FanslyObject):
+    """Append-only audit row recording a follow-state observation.
+
+    Inserted only on transition (no prior row OR latest row's following_state
+    differs from current observation). Used to drive creator_access_changed
+    when following flips False→True.
+    """
+
+    __table_name__: ClassVar[str] = "follow_events"
+    __tracked_fields__: ClassVar[set[str]] = {
+        "accountId",
+        "observed_at",
+        "following_state",
+    }
+    __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {
+        "account": belongs_to("Account", fk_column="accountId"),
+    }
+
+    id: int | None = None  # auto-increment
+    accountId: SnowflakeId
+    observed_at: datetime
+    following_state: bool
+
+    account: Account | UnsetType | None = UNSET  # type: ignore[name-defined]
+
+
 class Account(FanslyObject):
     """A Fansly account — the hub entity connecting all content."""
 
@@ -1972,6 +2164,8 @@ class Account(FanslyObject):
         "stories",
         "timelineStats",
         "mediaStoryState",
+        "subscriptions",
+        "follow_events",
     }
     __relationships__: ClassVar[dict[str, RelationshipMetadata]] = {
         "avatar": has_one_through(
@@ -2004,6 +2198,8 @@ class Account(FanslyObject):
         "stories": has_many("MediaStory", fk_column="accountId"),
         "timelineStats": has_one("TimelineStats", fk_column="accountId"),
         "mediaStoryState": has_one("MediaStoryState", fk_column="accountId"),
+        "subscriptions": has_many("Subscription", fk_column="accountId"),
+        "follow_events": has_many("FollowEvent", fk_column="accountId"),
     }
     # Inverse-only fields — no DB column, no __relationships__ entry
     _WRITE_EXCLUDED: ClassVar[set[str]] = {
@@ -2039,6 +2235,52 @@ class Account(FanslyObject):
     posts: list[Post] = Field(default_factory=list)
     sent_messages: list[Message] = Field(default_factory=list)
     received_messages: list[Message] = Field(default_factory=list)
+    subscriptions: list[Subscription] = Field(default_factory=list)
+    follow_events: list[FollowEvent] = Field(default_factory=list)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_embedded_subscription(cls, data: Any) -> Any:
+        """Normalize the API's singular ``subscription`` field into the
+        plural ``subscriptions`` list our model has_many declares.
+
+        /api/v1/account?usernames= responses embed a singular ``subscription``
+        dict (the active sub, same shape as a /api/v1/subscriptions row) when
+        the user is subscribed. Without this coercion ``extra="ignore"``
+        drops it silently because the field name + cardinality mismatch
+        the declared has_many. Idempotent: merge by sub.id so repeat
+        observations don't duplicate the entry.
+        """
+        if not isinstance(data, dict):
+            return data
+        sub = data.get("subscription")
+        if not isinstance(sub, dict) or "id" not in sub:
+            return data
+        existing = data.get("subscriptions") or []
+        if not isinstance(existing, list):
+            return data
+        if not any(
+            isinstance(s, dict) and s.get("id") == sub.get("id") for s in existing
+        ):
+            data["subscriptions"] = [*existing, sub]
+        return data
+
+    @property
+    def current_subscription(self) -> Subscription | None:
+        """Derived view: most recent active subscription (status=3), if any.
+
+        Returns None when no active subscription exists. Mirrors the
+        embedded ``subscription`` (singular) field shape from /account_info,
+        but computed from the has_many list to keep history intact.
+        Uses ``datetime.min`` (UTC-aware) as a tie-breaker when both
+        ``updatedAt`` and ``createdAt`` are None on a row so ``max()``
+        never compares ``datetime`` against ``None``.
+        """
+        active = [s for s in self.subscriptions if s.status == 3]
+        if not active:
+            return None
+        _epoch = datetime.min.replace(tzinfo=UTC)
+        return max(active, key=lambda s: s.updatedAt or s.createdAt or _epoch)
 
     def __repr__(self) -> str:
         return f"<Account {self.id}: {self.username}>"
@@ -2075,7 +2317,7 @@ class StreamSession(BaseModel):
     title: str | None = None
     status: int | None = None
     viewerCount: int | None = None
-    startedAt: Annotated[datetime | None, BeforeValidator(_parse_timestamp)] = None
+    startedAt: Annotated[datetime | None, BeforeValidator(parse_timestamp)] = None
     playbackUrl: str | None = None
 
 
@@ -2125,29 +2367,29 @@ class StreamingInfo(BaseModel):
 # ── Type Registry ────────────────────────────────────────────────────────
 # Maps type name strings (used in RelationshipMetadata.inverse_type) to classes.
 
+_REGISTERED_TYPES: list[type[FanslyObject]] = [
+    Account,
+    AccountMedia,
+    AccountMediaBundle,
+    Attachment,
+    Group,
+    Hashtag,
+    Media,
+    MediaStoryState,
+    Message,
+    Post,
+    PostMention,
+    MediaStory,
+    TimelineStats,
+    Wall,
+]
 _TYPE_REGISTRY: dict[str, type[FanslyObject]] = {
-    cls.__name__: cls
-    for cls in [
-        Account,
-        AccountMedia,
-        AccountMediaBundle,
-        Attachment,
-        Group,
-        Hashtag,
-        Media,
-        MediaStoryState,
-        Message,
-        Post,
-        PostMention,
-        MediaStory,
-        TimelineStats,
-        Wall,
-    ]
+    cls.__name__: cls for cls in _REGISTERED_TYPES
 }
 
 
 def get_from_cache_by_type_name(
-    store: Any, type_name: str, entity_id: int
+    store: PostgresEntityStore, type_name: str, entity_id: int
 ) -> FanslyObject | None:
     """Lookup cached entity by type name string."""
     model_type = _TYPE_REGISTRY.get(type_name)

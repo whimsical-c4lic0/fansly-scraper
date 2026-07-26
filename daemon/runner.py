@@ -33,15 +33,22 @@ import contextlib
 import json
 import signal
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any, ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import httpx
 from loguru import logger
+from pydantic import JsonValue
 
 from api.websocket import FanslyWebSocket
-from api.websocket_protocol import MSG_SERVICE_EVENT, format_event_label, service_name
+from api.websocket_protocol import (
+    MSG_SERVICE_EVENT,
+    format_event_label,
+    notification_inner_to_service_event,
+    service_name,
+)
 from config.fanslyconfig import FanslyConfig
 from config.logging import websocket_logger as ws_logger
 from daemon.dashboard import (
@@ -74,6 +81,7 @@ from download.livestream_chat import route_ws_chat_message
 
 if TYPE_CHECKING:
     from daemon.bootstrap import DaemonBootstrap
+from download.common import process_download_accessible_media
 from download.core import (
     DownloadState,
     download_messages,
@@ -84,8 +92,15 @@ from download.core import (
     get_creator_account_info,
     get_following_accounts,
 )
+from download.media import fetch_and_process_media
+from download.types import DownloadType
 from errors import DAEMON_UNRECOVERABLE, EXIT_SUCCESS, DaemonUnrecoverableError
-from metadata.models import Account, Message, get_store
+from helpers.common import JsonDict, expect_int
+from metadata.models import Account, AccountMediaBundle, Message, get_store
+from metadata.subscriptions import (
+    _access_changed_accounts,
+    apply_subscription_ws_event,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -282,6 +297,8 @@ async def _handle_messages_item(
         )
         raise
 
+    await _run_incremental_stash(config, state)
+
 
 async def _handle_full_creator_item(
     config: FanslyConfig, item: FullCreatorDownload
@@ -335,6 +352,8 @@ async def _handle_full_creator_item(
         )
         raise
 
+    await _run_incremental_stash(config, state)
+
 
 async def _handle_redownload_item(
     config: FanslyConfig, item: RedownloadCreatorMedia
@@ -356,10 +375,49 @@ async def _handle_redownload_item(
         )
         return
 
-    logger.info(
-        "daemon.runner: PPV re-download for {} ({})", creator_name, item.creator_id
-    )
     state = DownloadState(creator_name=creator_name)
+    targeted_ids = await _collect_ppv_targeted_media_ids(item)
+    pending_reason = _access_changed_accounts.get(item.creator_id)
+
+    # Take the targeted shortcut only when this is a pure PPV — no other
+    # access-change reason from a sibling WS event (sub-activated,
+    # tier-upgraded, follow-transition) is pending for this creator. A
+    # non-PPV reason needs the full re-walk so its content surfaces;
+    # otherwise consume_access_change inside get_creator_account_info
+    # would pop the reason silently and the parallel FullCreatorDownload
+    # would see an empty registry → dedup short-circuit → re-walk dropped.
+    if targeted_ids and pending_reason in (None, "ppv-purchase"):
+        logger.info(
+            "daemon.runner: PPV targeted re-download for {} ({}) — {} media ids",
+            creator_name,
+            item.creator_id,
+            len(targeted_ids),
+        )
+        state.download_type = DownloadType.MESSAGES
+        try:
+            await get_creator_account_info(config, state)
+            accessible = await fetch_and_process_media(config, state, targeted_ids)
+            if accessible:
+                await process_download_accessible_media(config, state, accessible)
+        except Exception as exc:
+            logger.opt(exception=exc).error(
+                "daemon.runner: RedownloadCreatorMedia targeted path failed for {} - {}",
+                creator_name,
+                exc,
+            )
+            raise
+        return
+
+    logger.info(
+        "daemon.runner: PPV re-download for {} ({}) — full re-walk "
+        "(targeted={}, pending_reason={})",
+        creator_name,
+        item.creator_id,
+        bool(targeted_ids),
+        pending_reason,
+    )
+    # setdefault so we don't clobber a non-PPV reason already in the registry.
+    _access_changed_accounts.setdefault(item.creator_id, "ppv-purchase")
     try:
         await get_creator_account_info(config, state)
         await download_timeline(config, state)
@@ -371,6 +429,31 @@ async def _handle_redownload_item(
             exc,
         )
         raise
+
+    await _run_incremental_stash(config, state)
+
+
+async def _collect_ppv_targeted_media_ids(item: RedownloadCreatorMedia) -> list[int]:
+    """Resolve a PPV WorkItem into the AccountMedia IDs it targets.
+
+    For a standalone AccountMedia: returns [account_media_id]. For a bundle:
+    returns the bundle's cached constituent AM ids (if the bundle is in
+    cache) plus the bundle's preview AM id (if any). Empty list when the
+    item carries no targeting hint or the bundle isn't cached yet — caller
+    falls back to the full re-walk in that case.
+    """
+    ids: list[int] = []
+    if item.account_media_id is not None:
+        ids.append(item.account_media_id)
+    if item.account_media_bundle_id is not None:
+        bundle = get_store().get_from_cache(
+            AccountMediaBundle, item.account_media_bundle_id
+        )
+        if bundle:
+            for am in bundle.accountMedia or []:
+                if am.id is not None and am.id not in ids:
+                    ids.append(am.id)
+    return ids
 
 
 async def _handle_check_access_item(
@@ -444,6 +527,8 @@ async def _handle_stories_only_item(
         )
         raise
 
+    await _run_incremental_stash(config, state)
+
 
 async def _handle_timeline_only_item(
     config: FanslyConfig, item: DownloadTimelineOnly
@@ -486,6 +571,8 @@ async def _handle_timeline_only_item(
         )
         raise
 
+    await _run_incremental_stash(config, state)
+
 
 async def _handle_mark_messages_deleted(
     config: FanslyConfig,  # noqa: ARG001 — store access is process-global
@@ -527,7 +614,29 @@ async def _handle_mark_messages_deleted(
     )
 
 
-_WORK_DISPATCH: dict[type[WorkItem], Any] = {
+async def _run_incremental_stash(config: FanslyConfig, state: DownloadState) -> None:
+    """Push a creator's just-downloaded content into Stash (sweep-free).
+
+    No-op unless Stash is active and the creator is resolved. Errors are logged,
+    never raised, so a Stash hiccup cannot fail the download work item.
+    """
+    if not config.stash_active or not state.creator_name:
+        return
+    # Deferred import: avoid pulling stash deps when the integration is off.
+    from stash import StashProcessing  # noqa: PLC0415, I001  # only used in stash context
+
+    processor = StashProcessing.from_config(config, state)
+    try:
+        await processor.process_creator_incremental()
+    except Exception as exc:
+        logger.opt(exception=exc).error(
+            "daemon.runner: incremental Stash failed for {} - {}",
+            state.creator_name,
+            exc,
+        )
+
+
+_WORK_DISPATCH: dict[type[WorkItem], Callable[..., Awaitable[None]]] = {
     DownloadMessagesForGroup: _handle_messages_item,
     FullCreatorDownload: _handle_full_creator_item,
     RedownloadCreatorMedia: _handle_redownload_item,
@@ -985,7 +1094,7 @@ async def _following_refresh_loop(
 async def _simulator_tick_loop(
     simulator: ActivitySimulator,
     stop_event: asyncio.Event,
-    ws: Any,
+    ws: FanslyWebSocket,
     refresh_event: asyncio.Event,
     budget: ErrorBudget,
     dashboard: DaemonDashboard | NullDashboard,
@@ -1089,7 +1198,7 @@ def _make_ws_handler(
     simulator: ActivitySimulator,
     queue: asyncio.Queue[WorkItem],
     budget: ErrorBudget | None = None,
-) -> Any:
+) -> Callable[[JsonValue], Awaitable[None]]:
     """Build an async callback suitable for FanslyWebSocket.register_handler.
 
     The returned coroutine decodes the ServiceEvent envelope and calls
@@ -1105,7 +1214,7 @@ def _make_ws_handler(
         An async callable compatible with register_handler(MSG_SERVICE_EVENT, ...).
     """
 
-    async def _on_service_event(event_data: Any) -> None:
+    async def _on_service_event(event_data: JsonValue) -> None:
         """Handle a decoded MSG_SERVICE_EVENT envelope from the WebSocket.
 
         Args:
@@ -1117,14 +1226,12 @@ def _make_ws_handler(
         service_id = event_data.get("serviceId")
         raw_event = event_data.get("event")
 
-        if service_id is None:
+        if not isinstance(service_id, int):
             return
 
         try:
-            inner: dict[str, Any] = (
-                json.loads(raw_event)
-                if isinstance(raw_event, str)
-                else (raw_event or {})
+            decoded: JsonValue = (
+                json.loads(raw_event) if isinstance(raw_event, str) else raw_event
             )
         except (json.JSONDecodeError, TypeError) as exc:
             ws_logger.warning(
@@ -1135,8 +1242,10 @@ def _make_ws_handler(
             )
             return
 
+        inner: JsonDict = decoded if isinstance(decoded, dict) else {}
+
         event_type = inner.get("type")
-        if event_type is None:
+        if not isinstance(event_type, int):
             return
 
         ws_logger.debug(
@@ -1159,12 +1268,51 @@ def _make_ws_handler(
             chat_msg = inner.get("chatRoomMessage")
             if isinstance(chat_msg, dict):
                 try:
-                    room_id = int(chat_msg["chatRoomId"])
+                    room_id = expect_int(chat_msg["chatRoomId"], "chatRoomId")
                 except (KeyError, TypeError, ValueError):
                     room_id = None
                 if room_id is not None:
                     await route_ws_chat_message(room_id, chat_msg)
             return
+
+        # NotificationService (svc=9) type=1 — unwrap inner notification.type
+        # (serviceId*1000+N) into a synthetic (svc, type) pair so sub-related
+        # notifications dispatch through the same code path as direct events.
+        if service_id == 9 and event_type == 1:
+            notification = inner.get("notification")
+            if isinstance(notification, dict):
+                inner_type = notification.get("type")
+                if isinstance(inner_type, int):
+                    svc_synth, type_synth = notification_inner_to_service_event(
+                        inner_type
+                    )
+                    if svc_synth == 15:
+                        sub_payload = notification.get("subscription")
+                        if isinstance(sub_payload, dict):
+                            try:
+                                await apply_subscription_ws_event(sub_payload)
+                            except Exception:
+                                ws_logger.exception(
+                                    "daemon.runner: apply_subscription_ws_event "
+                                    "failed for unwrapped notification "
+                                    f"svc={svc_synth} type={type_synth}"
+                                )
+
+        # SubscriptionService (svc=15) type in {5, 102} — persist embedded
+        # subscription payload via version-guarded merge. The dispatcher
+        # below still runs to translate (15, 5) into a WorkItem for the
+        # FullCreatorDownload path; this just keeps our Subscription cache
+        # current ahead of any per-creator processing.
+        if service_id == 15 and event_type in (5, 102):
+            sub_payload = inner.get("subscription")
+            if isinstance(sub_payload, dict):
+                try:
+                    await apply_subscription_ws_event(sub_payload)
+                except Exception:
+                    ws_logger.exception(
+                        "daemon.runner: apply_subscription_ws_event failed "
+                        f"for svc={service_id} type={event_type}"
+                    )
 
         item = dispatch_ws_event(service_id, event_type, inner)
         if item is None:
@@ -1205,7 +1353,7 @@ def _make_ws_handler(
 async def run_daemon(
     config: FanslyConfig,
     *,
-    ws_factory: Any = None,
+    ws_factory: Callable[[FanslyConfig], FanslyWebSocket] | None = None,
     stop_event: asyncio.Event | None = None,
     bootstrap: DaemonBootstrap | None = None,
 ) -> int:
@@ -1298,10 +1446,33 @@ async def run_daemon(
         )
 
 
+@contextlib.asynccontextmanager
+async def _daemon_stash_context(config: FanslyConfig) -> AsyncIterator[None]:
+    """Hold the shared Stash context open for the whole daemon run.
+
+    Entering increments the SGC context's reference count (and opens the
+    singleton client once); exiting decrements it, so the client is closed only
+    when this outer hold releases at daemon shutdown -- never by an individual
+    incremental pass. No-op when Stash is inactive; on a failed initial connect
+    it logs and continues, leaving passes to connect lazily.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        if config.stash_active:
+            try:
+                await stack.enter_async_context(config.get_stash_context())
+            except Exception as exc:
+                logger.warning(
+                    "daemon.runner: could not pre-open Stash context "
+                    "(incremental passes will connect lazily) - {}",
+                    exc,
+                )
+        yield
+
+
 async def _run_daemon_body(
     *,
     config: FanslyConfig,
-    ws_factory: Any,
+    ws_factory: Callable[[FanslyConfig], FanslyWebSocket] | None,
     simulator: ActivitySimulator,
     budget: ErrorBudget,
     stop_event: asyncio.Event,
@@ -1320,8 +1491,8 @@ async def _run_daemon_body(
     # When a bootstrap is supplied, reuse its already-started WS and just
     # re-register the handler with a budget-aware closure. Otherwise
     # build a fresh WS (legacy path for tests / non-bootstrapped callers).
-    if bootstrap is not None and bootstrap.ws_started:
-        ws: Any = bootstrap.ws
+    if bootstrap is not None and bootstrap.ws_started and bootstrap.ws is not None:
+        ws: FanslyWebSocket = bootstrap.ws
         ws.register_handler(
             MSG_SERVICE_EVENT,
             _make_ws_handler(simulator, queue, budget),
@@ -1435,39 +1606,40 @@ async def _run_daemon_body(
 
     exit_code = EXIT_SUCCESS
 
-    try:
-        await asyncio.gather(*all_tasks, return_exceptions=False)
-    except DaemonUnrecoverableError as exc:
-        logger.error("daemon.runner: exiting (unrecoverable): {}", exc)
-        exit_code = DAEMON_UNRECOVERABLE
-    except (asyncio.CancelledError, KeyboardInterrupt):
-        pass
-    finally:
-        logger.info("daemon.runner: stopping tasks")
-        stop_event.set()
-        refresh_event.set()  # wake _following_refresh_loop so it can exit
-
-        # Cancel pollers FIRST (stop producing new work)
-        for task in poller_tasks:
-            task.cancel()
-        await asyncio.gather(*poller_tasks, return_exceptions=True)
-
-        # Drain worker — let it process remaining queue items, but cap the wait
+    async with _daemon_stash_context(config):
         try:
-            await asyncio.wait_for(worker_task, timeout=30.0)
-        except TimeoutError:
-            logger.warning("daemon.runner: worker did not drain in 30s; cancelling")
-            worker_task.cancel()
-            await asyncio.gather(worker_task, return_exceptions=True)
+            await asyncio.gather(*all_tasks, return_exceptions=False)
+        except DaemonUnrecoverableError as exc:
+            logger.error("daemon.runner: exiting (unrecoverable): {}", exc)
+            exit_code = DAEMON_UNRECOVERABLE
+        except (asyncio.CancelledError, KeyboardInterrupt):
+            pass
+        finally:
+            logger.info("daemon.runner: stopping tasks")
+            stop_event.set()
+            refresh_event.set()  # wake _following_refresh_loop so it can exit
 
-        try:
-            await ws.stop_thread()
-        except Exception as exc:
-            ws_logger.warning("daemon.runner: error stopping WebSocket - {}", exc)
+            # Cancel pollers FIRST (stop producing new work)
+            for task in poller_tasks:
+                task.cancel()
+            await asyncio.gather(*poller_tasks, return_exceptions=True)
 
-        logger.info(
-            "daemon.runner: shutdown complete at {}",
-            datetime.now(UTC).isoformat(),
-        )
+            # Drain worker — let it process remaining queue items, but cap the wait
+            try:
+                await asyncio.wait_for(worker_task, timeout=30.0)
+            except TimeoutError:
+                logger.warning("daemon.runner: worker did not drain in 30s; cancelling")
+                worker_task.cancel()
+                await asyncio.gather(worker_task, return_exceptions=True)
+
+            try:
+                await ws.stop_thread()
+            except Exception as exc:
+                ws_logger.warning("daemon.runner: error stopping WebSocket - {}", exc)
+
+            logger.info(
+                "daemon.runner: shutdown complete at {}",
+                datetime.now(UTC).isoformat(),
+            )
 
     return exit_code

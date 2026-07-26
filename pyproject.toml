@@ -1,6 +1,6 @@
 [project]
 name = "fansly-scraper"
-version = "0.14.3"
+version = "0.15.1"
 description = "Easy-to-use fansly.com content scraping tool. Enjoy your Fansly content offline anytime, anywhere in the highest possible content resolution! Fully customizable to download in bulk or single: photos, videos & audio from the timeline, messages, collection & single posts."
 authors = [
     {name ="prof79"},
@@ -45,18 +45,20 @@ sqlalchemy = {extras = ["asyncio"], version = ">=2.0.44,<3.0.0"}
 httpx = {extras = ["http2"], version = ">=0.28.1"}
 websocket-client = ">=1.8.0"
 psycopg2-binary = ">=2.9.10,<3.0.0"
-asyncpg = ">=0.30.0,<0.31.0"
+asyncpg = ">=0.30.0,<0.32.0"
 psycopg = {version = ">=3.2.10,<4.0.0", extras = ["binary", "pool"]}
 httpx-retries = ">=0.4.3"
 ffmpeg-python = ">=0.2.0"
 jsbeautifier = ">=1.15.4"
 javascript = ">=1!1.2.6"
-stash-graphql-client = ">=0.12.5"
+stash-graphql-client = ">=0.12.10"
 av = ">=17.0.0,<18.0.0"
 ruamel-yaml = ">=0.19.1,<0.21.0"
 filelock = ">=3.29.0,<4.0.0"
 prompt-toolkit = ">=3.0.52,<4.0.0"
 regex = "^2026.4.4"
+ua-generator = "^2.1.1"
+pytimeparse2 = "^1.7.1"
 
 
 [tool.poetry.group.browser-auth]
@@ -109,6 +111,7 @@ pytest-loguru = ">=0.4.0"
 factory-boy = ">=3.3.3"
 pytest-rerunfailures = ">=16.1"
 respx = ">=0.22.0,<1.0.0"
+pytest-socket = "^0.8.0"
 
 
 [tool.bandit]
@@ -215,6 +218,7 @@ max-complexity = 14
     "PLR0913", # too many arguments
     "S101",    # use of assert
     "S105",    # test fixtures use hardcoded test values
+    "S106",    # test fixtures pass hardcoded test values as kwargs
     "ANN001",  # missing type annotation for function argument
     "ANN002",  # missing type annotation for *args
     "ANN003",  # missing type annotations for **kwargs in test helpers
@@ -297,6 +301,15 @@ addopts = [
     # find-or-create-on-shared-Docker-Stash race) all run on the same xdist
     # worker. Tests without the marker still load-balance normally.
     "--dist=loadgroup",
+    # Network backstop (pytest-socket): block all sockets except localhost.
+    # respx-mocked unit tests open no real socket; integration tests legitimately
+    # reach only localhost (Postgres :5432, Stash :9999/:5000). A leaked external
+    # call (a missing respx mock falling through to real Fansly/CDN HTTP) hits a
+    # non-localhost socket and fails loudly instead of silently going to prod.
+    # --allow-unix-socket keeps asyncpg / local IPC working.
+    "--disable-socket",
+    "--allow-hosts=127.0.0.1,::1",
+    "--allow-unix-socket",
 ]
 timeout = 60
 timeout_func_only = true
@@ -390,10 +403,10 @@ python_version = "3.12"
 plugins = ["sqlalchemy.ext.mypy.plugin"]
 # Exclude directories from type checking
 exclude = [
-    "tests/",
     "venv_test/",
     "alembic/versions/",
     "scripts/",
+    "db_init_scratch.py",
 ]
 
 # Keep these basic checks
@@ -426,6 +439,15 @@ ignore_errors = true
 # Skip scripts completely
 [[tool.mypy.overrides]]
 module = "scripts.*"
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = false
+follow_imports = "skip"
+ignore_errors = true
+
+# Skip the one-off db bootstrap script (PR-supplied, not production code)
+[[tool.mypy.overrides]]
+module = "db_init_scratch"
 disallow_untyped_defs = false
 disallow_incomplete_defs = false
 check_untyped_defs = false

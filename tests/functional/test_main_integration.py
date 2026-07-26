@@ -15,6 +15,8 @@ need to set download mode + (optionally) register specific per-mode routes.
 
 import asyncio
 import logging
+from collections.abc import Callable, Coroutine
+from typing import Any
 from unittest.mock import patch
 
 import httpx
@@ -22,12 +24,17 @@ import pytest
 import respx
 
 import fansly_downloader_ng as fdng
+from api import FanslyApi
+from config import FanslyConfig
 from config.logging import init_logging_config
 from config.modes import DownloadMode
+from download.downloadstate import DownloadState
 from errors import EXIT_SUCCESS, SOME_USERS_FAILED, ConfigError
 from fansly_downloader_ng import main
 from stash import StashProcessing as _RealStashProcessing
-from tests.fixtures.api import fansly_json, run_main_and_cleanup
+from tests.fixtures.api import dump_fansly_calls, fansly_json, run_main_and_cleanup
+from tests.fixtures.utils import scaled_async_sleep
+from textio import print_info
 
 
 async def test_main_raises_config_error_when_no_creator_names(
@@ -270,7 +277,7 @@ async def test_main_returns_config_error_when_client_account_missing(
     env.register_empty_content()
 
     # Override the baseline /account/me response: no username.
-    respx.get("https://apiv3.fansly.com/api/v1/account/me").mock(
+    account_me_route = respx.get(FanslyApi.ACCOUNT_ME_ENDPOINT).mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -291,10 +298,13 @@ async def test_main_returns_config_error_when_client_account_missing(
 
     caplog.set_level(logging.ERROR)
 
-    with pytest.raises(
-        ConfigError, match="Could not retrieve client account user name"
-    ):
-        await run_main_and_cleanup(env.config)
+    try:
+        with pytest.raises(
+            ConfigError, match="Could not retrieve client account user name"
+        ):
+            await run_main_and_cleanup(env.config)
+    finally:
+        dump_fansly_calls(account_me_route.calls, "main_no_client_account")
 
 
 async def test_main_use_following_populates_user_names_from_following(
@@ -408,14 +418,17 @@ async def test_main_use_following_returns_error_when_api_raises(
     # response is returned immediately. ``_make_rate_limited_request``
     # calls ``raise_for_status()`` → ``HTTPStatusError``, which is re-
     # raised, then caught by ``account.py:473`` and wrapped as ``ApiError``.
-    respx.get(
-        url__startswith=f"https://apiv3.fansly.com/api/v1/account/{env.client_id}/following"
+    following_route = respx.get(
+        url__startswith=FanslyApi.FOLLOWING_ENDPOINT.format(env.client_id)
     ).mock(side_effect=[httpx.Response(404, json={"error": "not found"})])
     env.register_empty_content()
 
     caplog.set_level(logging.ERROR)
 
-    result = await run_main_and_cleanup(env.config)
+    try:
+        result = await run_main_and_cleanup(env.config)
+    finally:
+        dump_fansly_calls(following_route.calls, "following_404")
 
     # Outer handler returns 1.
     assert result == 1, f"Expected exit code 1, got {result}"
@@ -601,7 +614,7 @@ async def test_main_cancels_stash_task_that_exceeds_timeout(
     async def _fast_sleep(duration, *args, **kwargs):
         if duration == 1:
             # Only the stash-polling sleep uses an exact integer 1.
-            return await real_sleep(0)
+            return await scaled_async_sleep(0)
         return await real_sleep(duration, *args, **kwargs)
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
@@ -821,13 +834,16 @@ class _SelectiveSpyStashProcessing(_RealStashProcessing):
     so task_fn never leaks between tests.
     """
 
-    _spy_task_fn = None  # set per-subclass via _make_stash_processor_factory
+    # Set per-subclass via _make_stash_processor_factory.
+    _spy_task_fn: Callable[[], Coroutine[Any, Any, Any]] | None = None
 
     @classmethod
-    def from_config(cls, config, state) -> "_SelectiveSpyStashProcessing":
+    def from_config(
+        cls, config: FanslyConfig, state: DownloadState
+    ) -> "_SelectiveSpyStashProcessing":
         # Delegate to real from_config; ``cls`` ensures our subclass is
         # instantiated rather than the real class.
-        return _RealStashProcessing.from_config.__func__(cls, config, state)
+        return super().from_config(config, state)
 
     async def start_creator_processing(self) -> None:
         """Spy: skip real metadata-scan + GraphQL; install controlled task.
@@ -837,12 +853,13 @@ class _SelectiveSpyStashProcessing(_RealStashProcessing):
         metadata scan. For main()'s orchestration tests we only need
         ``_background_task`` to exist with a controlled outcome.
         """
-        if type(self)._spy_task_fn is None:
+        spy_task_fn = type(self)._spy_task_fn
+        if spy_task_fn is None:
             raise RuntimeError(
                 "_SelectiveSpyStashProcessing requires _spy_task_fn — "
                 "use _make_stash_processor_factory(task_fn=...)"
             )
-        self._background_task = asyncio.create_task(type(self)._spy_task_fn())
+        self._background_task = asyncio.create_task(spy_task_fn())
 
 
 def _make_stash_processor_factory(*, task_fn):
@@ -1035,7 +1052,7 @@ async def test_main_stash_cancellation_grace_wait_exception(
 
     async def _fast_sleep(duration, *args, **kwargs):
         if duration == 1:
-            return await real_sleep(0)
+            return await scaled_async_sleep(0)
         return await real_sleep(duration, *args, **kwargs)
 
     async def _raise_on_grace_wait(*args, **kwargs):
@@ -1212,7 +1229,7 @@ async def test_main_outer_background_block_generic_exception(
     async def _seed_task(config, state):
         config._background_tasks.append(asyncio.create_task(_quick_task()))
 
-    real_print_info = fdng.print_info
+    real_print_info = print_info
 
     def _raise_on_categorization_log(msg, *args, **kwargs):
         # Raise right after categorization so we're past the 557/559
@@ -1328,7 +1345,7 @@ async def test_main_stash_task_completes_early_in_polling_loop(
 
     async def _fast_sleep(duration, *args, **kwargs):
         if duration == 1:
-            return await real_sleep(0)
+            return await scaled_async_sleep(0)
         return await real_sleep(duration, *args, **kwargs)
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)
@@ -1642,7 +1659,7 @@ async def test_main_stash_timeout_cancel_loop_skips_done_tasks(
 
     async def _fast_sleep(duration, *args, **kwargs):
         if duration == 1:
-            return await real_sleep(0)
+            return await scaled_async_sleep(0)
         return await real_sleep(duration, *args, **kwargs)
 
     monkeypatch.setattr(asyncio, "sleep", _fast_sleep)

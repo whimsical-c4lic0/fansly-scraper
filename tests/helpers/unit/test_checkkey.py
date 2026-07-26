@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import httpx
+import pytest
 import respx
 
 from helpers.checkkey import (
@@ -18,89 +19,117 @@ from helpers.checkkey import (
     guess_check_key,
 )
 from tests.fixtures.api import dump_fansly_calls
+from tests.fixtures.utils import (
+    make_acorn_require,
+    make_eval_js,
+    make_fake_connection,
+    scaled_sync_sleep,
+)
+
+
+# Website-host URLs (scraped for main.js) — no FanslyApi.*_ENDPOINT constant
+# fits because these are the public website, not apiv3 endpoints.
+FANSLY_HOMEPAGE = "https://fansly.com/"  # CCH:api  # website root for main.js scrape, not an apiv3 endpoint
+FANSLY_HOST_BARE = "https://fansly.com"  # CCH:api  # pathless website host literal (bridge tests), not an apiv3 endpoint
+FANSLY_MAIN_JS = "https://fansly.com/main.abc123.js"  # CCH:api  # scraped website main.js asset, not an apiv3 endpoint
+
+
+def _fast_monotonic() -> object:
+    """A ``time.monotonic`` stand-in that jumps 100s per call.
+
+    The real AST fallback polls ``time.monotonic`` in its callback-wait
+    and queue-drain loops. With a no-op ``time.sleep`` and a real clock
+    those loops spin for wall-clock seconds; a clock that leaps forward
+    makes every loop hit its timeout/stable condition on the first check,
+    keeping the reconciliation tests fast and deterministic.
+    """
+    clock = [0.0]
+
+    def monotonic() -> float:
+        clock[0] += 100.0
+        return clock[0]
+
+    return monotonic
 
 
 # ── _setup_nvm_environment ──────────────────────────────────────────────
 
 
 class TestSetupNvmEnvironment:
-    def test_no_nvm_dir_is_noop(self, tmp_path, monkeypatch):
-        """Line 38: nvm_path doesn't exist → early return."""
-        monkeypatch.setenv("NVM_DIR", str(tmp_path / "nonexistent"))
-        _setup_nvm_environment()
+    @pytest.mark.parametrize(
+        ("layout", "nvm_env", "clear_node_path"),
+        [
+            # Line 38: nvm_path doesn't exist → early return.
+            pytest.param((), "missing", False, id="no-nvm-dir-early-return"),
+            # Lines 46-52, 64→68→73→77→82: real .nvmrc read (Path(__file__)
+            # is fixed); resolved version absent from tmp NVM_DIR → line 64.
+            pytest.param((".",), "tmp", False, id="nvmrc-read-version-not-installed"),
+            # Lines 55-61: versions present but none match the real .nvmrc;
+            # no PATH assertion possible (real .nvmrc version won't match).
+            pytest.param(
+                (
+                    "versions/node/v18.0.0/bin",
+                    "versions/node/v20.0.0/bin",
+                    "versions/node/v20.0.0/lib/node_modules",
+                ),
+                "tmp",
+                True,
+                id="versions-present-nvmrc-mismatch",
+            ),
+            # Lines 56-57: versions/node dir doesn't exist → return.
+            pytest.param((".",), "tmp", False, id="no-versions-dir-returns"),
+            # Lines 59-60: versions/node dir exists but is empty → return.
+            pytest.param(
+                ("versions/node",), "tmp", False, id="empty-versions-dir-returns"
+            ),
+            # Line 64: node_path (.nvmrc version) not installed → return.
+            pytest.param((".",), "tmp", False, id="node-path-not-exist-returns"),
+            # Line 68: node_path exists but bin/ dir doesn't → return.
+            pytest.param(
+                ("versions/node/v20.0.0",),
+                "tmp",
+                False,
+                id="node-bin-not-exist-returns",
+            ),
+            # Lines 81-82: NVM_DIR unset → HOME fallback won't find tmp dir.
+            pytest.param(
+                ("versions/node/v20.0.0/bin",),
+                "unset",
+                False,
+                id="nvm-dir-unset-home-fallback",
+            ),
+            # Line 77→81: no lib/node_modules → NODE_PATH not set.
+            pytest.param(
+                ("versions/node/v20.0.0/bin",),
+                "tmp",
+                True,
+                id="node-modules-missing-skips-node-path",
+            ),
+        ],
+    )
+    def test_no_crash_filesystem_layouts(
+        self, tmp_path, monkeypatch, layout, nvm_env, clear_node_path
+    ):
+        """No-crash pokes: build each nvm tree layout, run, expect no error.
 
-    def test_nvmrc_version_found(self, tmp_path, monkeypatch):
-        """Lines 46-52, 64→68→73→77→82: .nvmrc found via real project root.
-
-        We can't control Path(__file__) so the real .nvmrc is read.
-        Set NVM_DIR to tmp so the resolved version path won't exist → line 64 return.
-        This still exercises the .nvmrc read path (lines 46-48).
+        ``layout`` lists dirs to create under the tmp ``.nvm`` root ("." =
+        just the root). ``nvm_env`` selects how NVM_DIR is set: "tmp" (the
+        built tree), "missing" (points at a nonexistent path), or "unset"
+        (deleted so the HOME fallback runs). Rows carry the original
+        per-branch line references as comments so a coverage regression
+        still names its branch.
         """
         nvm_dir = tmp_path / ".nvm"
-        nvm_dir.mkdir()
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        # Real .nvmrc exists, but version won't be found in our tmp nvm_dir
-        _setup_nvm_environment()
-
-    def test_no_nvmrc_falls_back_to_latest(self, tmp_path, monkeypatch):
-        """Lines 55-61: no .nvmrc → uses latest version from versions dir.
-
-        Can't prevent the real .nvmrc from being read (Path(__file__) is fixed),
-        so this test just verifies the function doesn't crash when our tmp NVM_DIR
-        has versions but none match the .nvmrc version.
-        """
-        nvm_dir = tmp_path / ".nvm"
-        v1 = nvm_dir / "versions" / "node" / "v18.0.0" / "bin"
-        v1.mkdir(parents=True)
-        v2 = nvm_dir / "versions" / "node" / "v20.0.0" / "bin"
-        v2.mkdir(parents=True)
-        (nvm_dir / "versions" / "node" / "v20.0.0" / "lib" / "node_modules").mkdir(
-            parents=True
-        )
-
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        monkeypatch.delenv("NODE_PATH", raising=False)
-        _setup_nvm_environment()
-        # Don't assert PATH — real .nvmrc version won't match our tmp versions
-
-    def test_no_versions_dir_returns(self, tmp_path, monkeypatch):
-        """Lines 56-57: versions/node dir doesn't exist → return."""
-        nvm_dir = tmp_path / ".nvm"
-        nvm_dir.mkdir()
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        _setup_nvm_environment()
-
-    def test_empty_versions_dir_returns(self, tmp_path, monkeypatch):
-        """Lines 59-60: versions/node dir exists but is empty → return."""
-        nvm_dir = tmp_path / ".nvm"
-        (nvm_dir / "versions" / "node").mkdir(parents=True)
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        _setup_nvm_environment()
-
-    def test_node_path_not_exist_returns(self, tmp_path, monkeypatch):
-        """Line 64: node_path doesn't exist (e.g., .nvmrc points to uninstalled version)."""
-        nvm_dir = tmp_path / ".nvm"
-        nvm_dir.mkdir()
-        # .nvmrc references version that doesn't exist
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        _setup_nvm_environment()
-
-    def test_node_bin_not_exist_returns(self, tmp_path, monkeypatch):
-        """Line 68: node_path exists but bin/ dir doesn't."""
-        nvm_dir = tmp_path / ".nvm"
-        node_path = nvm_dir / "versions" / "node" / "v20.0.0"
-        node_path.mkdir(parents=True)
-        # No bin/ subdirectory
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        _setup_nvm_environment()
-
-    def test_sets_nvm_dir_if_unset(self, tmp_path, monkeypatch):
-        """Lines 81-82: NVM_DIR not in env → sets it."""
-        nvm_dir = tmp_path / ".nvm"
-        node_bin = nvm_dir / "versions" / "node" / "v20.0.0" / "bin"
-        node_bin.mkdir(parents=True)
-        monkeypatch.delenv("NVM_DIR", raising=False)
-        # HOME-based fallback won't find our tmp dir, so this tests the early return
+        for rel in layout:
+            (nvm_dir / rel).mkdir(parents=True, exist_ok=True)
+        if nvm_env == "tmp":
+            monkeypatch.setenv("NVM_DIR", str(nvm_dir))
+        elif nvm_env == "missing":
+            monkeypatch.setenv("NVM_DIR", str(tmp_path / "nonexistent"))
+        else:
+            monkeypatch.delenv("NVM_DIR", raising=False)
+        if clear_node_path:
+            monkeypatch.delenv("NODE_PATH", raising=False)
         _setup_nvm_environment()
 
     def test_path_not_duplicated(self, tmp_path, monkeypatch):
@@ -116,17 +145,6 @@ class TestSetupNvmEnvironment:
         _setup_nvm_environment()
         # Should not duplicate
         assert os.environ["PATH"].count(str(node_bin)) == 1
-
-    def test_node_modules_not_exist_skips(self, tmp_path, monkeypatch):
-        """Line 77→81: node_modules dir doesn't exist → NODE_PATH not set."""
-        nvm_dir = tmp_path / ".nvm"
-        node_bin = nvm_dir / "versions" / "node" / "v20.0.0" / "bin"
-        node_bin.mkdir(parents=True)
-        # No lib/node_modules
-        monkeypatch.setenv("NVM_DIR", str(nvm_dir))
-        monkeypatch.delenv("NODE_PATH", raising=False)
-        _setup_nvm_environment()
-        # NODE_PATH should not be set (no node_modules dir)
 
     def test_nvmrc_missing_uses_latest_version(self, tmp_path, monkeypatch):
         """Lines 55-61: nvmrc not readable → fall back to sorted-latest version dir."""
@@ -251,8 +269,10 @@ class TestValidateCheckkeyFormat:
         assert _validate_checkkey_format("") is False
 
     def test_not_string(self):
-        assert _validate_checkkey_format(12345) is False
-        assert _validate_checkkey_format(None) is False
+        # Deliberate invalid-input: exercises the `isinstance(checkkey, str)`
+        # guard in production; no in-contract (str) value can be non-str.
+        assert _validate_checkkey_format(12345) is False  # type: ignore[arg-type]
+        assert _validate_checkkey_format(None) is False  # type: ignore[arg-type]
 
     def test_no_hyphens(self):
         assert _validate_checkkey_format("abcdefghijk") is False
@@ -321,115 +341,161 @@ class TestExtractCheckkeyRegex:
 # ── extract_checkkey_from_js ────────────────────────────────────────────
 
 
+def _build_reconciliation_js(
+    regex_expr: str = "REGEXEXPR",
+    ast_expr: str = "ASTEXPR",
+) -> tuple[str, list[tuple[int, int]]]:
+    """Build real JS + the AST span that drives the reconciliation path.
+
+    The regex extractor matches ``this.checkKey_ = <regex_expr>`` and slices
+    ``regex_expr``. The AST fallback is told (via ``make_acorn_require``) to
+    "discover" an assignment whose source span points at ``ast_expr``, so
+    the regex and AST paths slice DIFFERENT expressions. A single
+    ``eval_js`` map then returns whatever value we want for each, letting
+    real ``extract_checkkey_from_js`` reconciliation logic run end-to-end.
+    """
+    js = f"this.checkKey_ = {regex_expr};\nvar astMarker = {ast_expr};"
+    ast_start = js.index(ast_expr)
+    ast_spans = [(ast_start, ast_start + len(ast_expr))]
+    return js, ast_spans
+
+
 class TestExtractCheckkeyFromJs:
-    def test_regex_matches_expected(self):
-        """Lines 322-326: regex succeeds and matches expected → fast return."""
-        js = "this.checkKey_ = expr;"
-        with patch(
-            "helpers.checkkey._extract_checkkey_regex",
-            return_value="oybZy8-fySzis-bubayf",
+    """Real regex-vs-AST reconciliation over real JS; only the JSPyBridge
+    leaves (``eval_js``, ``require``/acorn) are patched.
+
+    Replaces nine tests that stubbed ``_extract_checkkey_regex`` and
+    ``_extract_checkkey_ast_fallback`` directly — which bypassed the real
+    regex extractor, the expression slicer, and the reconciliation
+    branches the function exists to exercise. Here the real internals run;
+    only the Node-subprocess boundary is faked.
+
+    FINDING (dead defensive branches, not a bug): two of the nine old
+    stubbed tests asserted ``regex_checkkey`` was *truthy but invalid
+    format* — a state ``_extract_checkkey_regex`` can never return, since
+    it runs ``_validate_checkkey_format`` itself and returns None on
+    failure (checkkey.py lines 279-283). So the "regex failed validation"
+    arms in ``extract_checkkey_from_js`` (the ``return expected_checkkey``
+    fallback and the no-expected fall-through-to-AST) are unreachable via
+    the real path; only the stubs feeding impossible inputs ever hit them.
+    They're now marked ``# pragma: no cover`` with the invariant
+    documented in place (Option A: surface + annotate, no papering over).
+    """
+
+    @pytest.mark.parametrize(
+        ("regex_value", "ast_value", "expected_checkkey", "result"),
+        [
+            # Regex matches expected → fast path, AST never runs (lines 322-326).
+            pytest.param(
+                "oybZy8-fySzis-bubayf",
+                None,
+                "oybZy8-fySzis-bubayf",
+                "oybZy8-fySzis-bubayf",
+                id="regex-matches-expected",
+            ),
+            # Regex != expected, AST == regex → AST confirms regex (lines 336-342).
+            pytest.param(
+                "new-key-value1",
+                "new-key-value1",
+                "old-key-value1",
+                "new-key-value1",
+                id="regex-mismatch-ast-confirms-regex",
+            ),
+            # Regex != expected, AST == expected → AST confirms expected (lines 343-348).
+            pytest.param(
+                "wrong-key-val1",
+                "old-key-value1",
+                "old-key-value1",
+                "old-key-value1",
+                id="regex-mismatch-ast-confirms-expected",
+            ),
+            # All three differ → trust AST as authoritative (lines 350-356).
+            pytest.param(
+                "regex-key-val1",
+                "third-key-val1",
+                "expected-keyv1",
+                "third-key-val1",
+                id="regex-mismatch-ast-third-value",
+            ),
+            # AST fails (None), regex still valid → trust regex (lines 358-364).
+            pytest.param(
+                "valid-key-value",
+                None,
+                "different-keyv1",
+                "valid-key-value",
+                id="regex-mismatch-ast-fails-regex-valid",
+            ),
+            # Regex succeeds, no expected → validate + return regex (lines 372-375).
+            pytest.param(
+                "good-regex-keyv1",
+                None,
+                None,
+                "good-regex-keyv1",
+                id="regex-success-no-expected",
+            ),
+        ],
+    )
+    def test_reconciliation_branches(
+        self, regex_value, ast_value, expected_checkkey, result
+    ):
+        """Drive each reconciliation branch with real JS + leaf-only patches.
+
+        ``regex_value`` is what ``eval_js`` returns for the regex-matched
+        expression; ``ast_value`` is what it returns for the AST-discovered
+        expression (or ``None`` to make the AST fallback yield nothing —
+        either by mapping the AST expr to ``None`` so validation rejects
+        it, no: we simulate AST failure by having acorn find no assignment).
+        """
+        js, ast_spans = _build_reconciliation_js()
+        eval_map = {"REGEXEXPR": regex_value}
+
+        if ast_value is None:
+            # AST fallback finds NO this.checkKey_ assignment → returns None,
+            # exercising the real "AST failed" reconciliation arms.
+            fake_require = make_acorn_require(spans=[])
+        else:
+            eval_map["ASTEXPR"] = ast_value
+            fake_require = make_acorn_require(spans=ast_spans)
+
+        with (
+            patch("helpers.checkkey.eval_js", make_eval_js(eval_map)),
+            patch("helpers.checkkey.require", side_effect=fake_require),
+            patch("helpers.checkkey.connection", make_fake_connection()),
+            patch("helpers.checkkey.globalThis", MagicMock()),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
+            patch("helpers.checkkey.time.monotonic", side_effect=_fast_monotonic()),
         ):
-            result = extract_checkkey_from_js(
-                js, expected_checkkey="oybZy8-fySzis-bubayf"
+            extracted = extract_checkkey_from_js(
+                js, expected_checkkey=expected_checkkey
             )
-        assert result == "oybZy8-fySzis-bubayf"
 
-    def test_regex_mismatch_ast_confirms_regex(self):
-        """Lines 336-342: regex != expected, AST == regex → return AST (confirms regex)."""
-        with (
-            patch(
-                "helpers.checkkey._extract_checkkey_regex",
-                return_value="new-key-value1",
-            ),
-            patch(
-                "helpers.checkkey._extract_checkkey_ast_fallback",
-                return_value="new-key-value1",
-            ),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey="old-key-value1")
-        assert result == "new-key-value1"
-
-    def test_regex_mismatch_ast_confirms_expected(self):
-        """Lines 343-348: regex != expected, AST == expected → return AST."""
-        with (
-            patch(
-                "helpers.checkkey._extract_checkkey_regex",
-                return_value="wrong-key-val1",
-            ),
-            patch(
-                "helpers.checkkey._extract_checkkey_ast_fallback",
-                return_value="old-key-value1",
-            ),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey="old-key-value1")
-        assert result == "old-key-value1"
-
-    def test_regex_mismatch_ast_returns_third_value(self):
-        """Lines 350-356: all three differ → trust AST."""
-        with (
-            patch(
-                "helpers.checkkey._extract_checkkey_regex",
-                return_value="regex-key-val1",
-            ),
-            patch(
-                "helpers.checkkey._extract_checkkey_ast_fallback",
-                return_value="third-key-val1",
-            ),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey="expected-keyv1")
-        assert result == "third-key-val1"
-
-    def test_regex_mismatch_ast_fails_regex_valid(self):
-        """Lines 358-363: AST fails, regex passes validation → return regex."""
-        with (
-            patch(
-                "helpers.checkkey._extract_checkkey_regex",
-                return_value="valid-key-value",
-            ),
-            patch("helpers.checkkey._extract_checkkey_ast_fallback", return_value=None),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey="different-keyv1")
-        assert result == "valid-key-value"
-
-    def test_regex_mismatch_ast_fails_regex_invalid(self):
-        """Lines 366-369: AST fails, regex fails validation → return expected."""
-        with (
-            patch("helpers.checkkey._extract_checkkey_regex", return_value="!invalid!"),
-            patch("helpers.checkkey._extract_checkkey_ast_fallback", return_value=None),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey="fallback-key-v1")
-        assert result == "fallback-key-v1"
-
-    def test_regex_succeeds_no_expected(self):
-        """Lines 372-374: regex succeeds, no expected → validate and return."""
-        with patch(
-            "helpers.checkkey._extract_checkkey_regex", return_value="good-regex-keyv1"
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey=None)
-        assert result == "good-regex-keyv1"
-
-    def test_regex_succeeds_no_expected_invalid_format(self):
-        """Lines 376-378: regex succeeds, no expected, but fails validation → fall to AST."""
-        with (
-            patch("helpers.checkkey._extract_checkkey_regex", return_value="x"),
-            patch(
-                "helpers.checkkey._extract_checkkey_ast_fallback",
-                return_value="ast-fallback-v1",
-            ),
-        ):
-            result = extract_checkkey_from_js("js", expected_checkkey=None)
-        assert result == "ast-fallback-v1"
+        assert extracted == result
 
     def test_regex_fails_falls_to_ast(self):
-        """Lines 382-383: regex returns None → AST fallback."""
+        """Regex finds no assignment → real AST fallback supplies the key.
+
+        No ``this.checkKey_`` text means the real regex extractor returns
+        None (no internal stub), so production falls through to the AST
+        path, which the acorn leaf drives to discover the assignment.
+        """
+        js = "var astMarker = ASTEXPR;"
+        ast_start = js.index("ASTEXPR")
+        spans = [(ast_start, ast_start + len("ASTEXPR"))]
+
         with (
-            patch("helpers.checkkey._extract_checkkey_regex", return_value=None),
             patch(
-                "helpers.checkkey._extract_checkkey_ast_fallback",
-                return_value="ast-key-value1",
+                "helpers.checkkey.eval_js", make_eval_js({"ASTEXPR": "ast-key-value1"})
             ),
+            patch(
+                "helpers.checkkey.require", side_effect=make_acorn_require(spans=spans)
+            ),
+            patch("helpers.checkkey.connection", make_fake_connection()),
+            patch("helpers.checkkey.globalThis", MagicMock()),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
+            patch("helpers.checkkey.time.monotonic", side_effect=_fast_monotonic()),
         ):
-            result = extract_checkkey_from_js("js")
+            result = extract_checkkey_from_js(js)
+
         assert result == "ast-key-value1"
 
 
@@ -503,7 +569,7 @@ class TestExtractCheckkeyAstFallback:
             patch("helpers.checkkey.connection", mock_conn),
             patch("helpers.checkkey.globalThis", MagicMock()),
             patch("helpers.checkkey.time.monotonic", side_effect=fast_monotonic),
-            patch("helpers.checkkey.time.sleep"),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
         ):
             result = _extract_checkkey_ast_fallback(js)
 
@@ -535,7 +601,7 @@ class TestExtractCheckkeyAstFallback:
             patch("helpers.checkkey.connection", mock_conn),
             patch("helpers.checkkey.globalThis", MagicMock()),
             patch("helpers.checkkey.time.monotonic", side_effect=fast_monotonic),
-            patch("helpers.checkkey.time.sleep"),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
         ):
             result = _extract_checkkey_ast_fallback("var x = 1;")
 
@@ -626,7 +692,7 @@ class TestExtractCheckkeyAstFallback:
             patch("helpers.checkkey.connection", mock_conn),
             patch("helpers.checkkey.globalThis", MagicMock()),
             patch("helpers.checkkey.time.monotonic", side_effect=fast_monotonic),
-            patch("helpers.checkkey.time.sleep"),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
         ):
             result = _extract_checkkey_ast_fallback("var x = 1;")
 
@@ -677,7 +743,7 @@ class TestExtractCheckkeyAstFallback:
             patch("helpers.checkkey.connection", mock_conn),
             patch("helpers.checkkey.globalThis", MagicMock()),
             patch("helpers.checkkey.time.monotonic", side_effect=fast_monotonic),
-            patch("helpers.checkkey.time.sleep"),
+            patch("helpers.checkkey.time.sleep", scaled_sync_sleep),
         ):
             result = _extract_checkkey_ast_fallback(js)
 
@@ -716,10 +782,10 @@ class TestGuessCheckKey:
         html = '<script src="main.abc123.js"></script>'
         js_content = 'this.checkKey_ = "test";'
 
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=[httpx.Response(200, text=html)]
         )
-        mainjs_route = respx.get("https://fansly.com/main.abc123.js").mock(
+        mainjs_route = respx.get(FANSLY_MAIN_JS).mock(
             side_effect=[httpx.Response(200, text=js_content)]
         )
         try:
@@ -737,7 +803,7 @@ class TestGuessCheckKey:
 
     def test_homepage_non_200(self, mock_shutdown, respx_fansly_api):
         """Homepage returns non-200 → default key."""
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=[httpx.Response(503, text="down")]
         )
         try:
@@ -750,7 +816,7 @@ class TestGuessCheckKey:
 
     def test_no_main_js_in_html(self, mock_shutdown, respx_fansly_api):
         """main.js URL not found in HTML → default key."""
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=[httpx.Response(200, text="<html>no scripts</html>")]
         )
         try:
@@ -764,10 +830,10 @@ class TestGuessCheckKey:
     def test_main_js_non_200(self, mock_shutdown, respx_fansly_api):
         """Lines 784-788: main.js download fails → default key."""
         html = '<script src="main.abc123.js"></script>'
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=[httpx.Response(200, text=html)]
         )
-        mainjs_route = respx.get("https://fansly.com/main.abc123.js").mock(
+        mainjs_route = respx.get(FANSLY_MAIN_JS).mock(
             side_effect=[httpx.Response(404, text="not found")]
         )
         try:
@@ -782,10 +848,10 @@ class TestGuessCheckKey:
     def test_extraction_returns_none(self, mock_shutdown, respx_fansly_api):
         """Lines 800-807: extraction returns None → fall back to default."""
         html = '<script src="main.abc123.js"></script>'
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=[httpx.Response(200, text=html)]
         )
-        mainjs_route = respx.get("https://fansly.com/main.abc123.js").mock(
+        mainjs_route = respx.get(FANSLY_MAIN_JS).mock(
             side_effect=[httpx.Response(200, text="var x;")]
         )
         try:
@@ -803,7 +869,7 @@ class TestGuessCheckKey:
 
     def test_network_error(self, mock_shutdown, respx_fansly_api):
         """httpx.RequestError → default key."""
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=httpx.ConnectError("connection refused")
         )
         try:
@@ -816,7 +882,7 @@ class TestGuessCheckKey:
 
     def test_unexpected_exception(self, mock_shutdown, respx_fansly_api):
         """Unexpected error → default key."""
-        homepage_route = respx.get("https://fansly.com/").mock(
+        homepage_route = respx.get(FANSLY_HOMEPAGE).mock(
             side_effect=RuntimeError("boom")
         )
         try:
@@ -853,13 +919,17 @@ class TestJsBridgeShutdown:
                 return_value="oybZy8-fySzis-bubayf",
             ),
         ):
-            respx.get("https://fansly.com").mock(
+            homepage_route = respx.get(FANSLY_HOST_BARE).mock(
                 side_effect=[httpx.Response(200, text=html)]
             )
-            respx.get("https://fansly.com/main.abc123.js").mock(
+            mainjs_route = respx.get(FANSLY_MAIN_JS).mock(
                 side_effect=[httpx.Response(200, text=js_content)]
             )
-            guess_check_key("Mozilla/5.0")
+            try:
+                guess_check_key("Mozilla/5.0")
+            finally:
+                dump_fansly_calls(homepage_route.calls, "bridge-success-homepage")
+                dump_fansly_calls(mainjs_route.calls, "bridge-success-mainjs")
 
         mock_connection.stop.assert_called_once()
 
@@ -869,8 +939,13 @@ class TestJsBridgeShutdown:
             respx.mock,
             patch("helpers.checkkey.connection") as mock_connection,
         ):
-            respx.get("https://fansly.com").mock(side_effect=httpx.ConnectError("boom"))
-            guess_check_key("Mozilla/5.0")
+            homepage_route = respx.get(FANSLY_HOST_BARE).mock(
+                side_effect=httpx.ConnectError("boom")
+            )
+            try:
+                guess_check_key("Mozilla/5.0")
+            finally:
+                dump_fansly_calls(homepage_route.calls, "bridge-network-error")
 
         mock_connection.stop.assert_called_once()
 
@@ -880,8 +955,13 @@ class TestJsBridgeShutdown:
             respx.mock,
             patch("helpers.checkkey.connection") as mock_connection,
         ):
-            respx.get("https://fansly.com").mock(side_effect=RuntimeError("boom"))
-            guess_check_key("Mozilla/5.0")
+            homepage_route = respx.get(FANSLY_HOST_BARE).mock(
+                side_effect=RuntimeError("boom")
+            )
+            try:
+                guess_check_key("Mozilla/5.0")
+            finally:
+                dump_fansly_calls(homepage_route.calls, "bridge-unexpected-exc")
 
         mock_connection.stop.assert_called_once()
 
@@ -899,14 +979,18 @@ class TestJsBridgeShutdown:
             ),
         ):
             mock_connection.stop.side_effect = RuntimeError("bridge already stopped")
-            respx.get("https://fansly.com").mock(
+            homepage_route = respx.get(FANSLY_HOST_BARE).mock(
                 side_effect=[httpx.Response(200, text=html)]
             )
-            respx.get("https://fansly.com/main.abc123.js").mock(
+            mainjs_route = respx.get(FANSLY_MAIN_JS).mock(
                 side_effect=[httpx.Response(200, text=js_content)]
             )
-            # Should NOT raise despite connection.stop throwing
-            result = guess_check_key("Mozilla/5.0")
+            try:
+                # Should NOT raise despite connection.stop throwing
+                result = guess_check_key("Mozilla/5.0")
+            finally:
+                dump_fansly_calls(homepage_route.calls, "bridge-stop-exc-homepage")
+                dump_fansly_calls(mainjs_route.calls, "bridge-stop-exc-mainjs")
 
         assert result == "oybZy8-fySzis-bubayf"
         mock_connection.stop.assert_called_once()

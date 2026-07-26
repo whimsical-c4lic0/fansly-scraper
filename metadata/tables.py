@@ -95,7 +95,12 @@ media = Table(
 media_locations = Table(
     "media_locations",
     metadata,
-    Column("mediaId", BigInteger, ForeignKey("media.id"), primary_key=True),
+    Column(
+        "mediaId",
+        BigInteger,
+        ForeignKey("media.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
     Column("locationId", BigInteger, primary_key=True),
     Column("location", String, nullable=True),
     # Explicit UC exists in the database (created by migration), redundant with PK
@@ -288,6 +293,98 @@ stub_tracker = Table(
     UniqueConstraint("table_name", "record_id", name="uix_stub_tracker"),
 )
 
+subscriptions = Table(
+    "subscriptions",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    Column(
+        "accountId",
+        BigInteger,
+        ForeignKey("accounts.id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("subscriptionTierId", BigInteger, nullable=True),
+    Column("subscriptionTierName", String, nullable=True),
+    Column("subscriptionTierColor", String, nullable=True),
+    Column("planId", BigInteger, nullable=True),
+    Column("promoId", String, nullable=True),
+    Column("giftCodeId", String, nullable=True),
+    Column("status", Integer, nullable=True, index=True),
+    Column("price", Integer, nullable=True),
+    Column("renewPrice", Integer, nullable=True),
+    Column("renewCorrelationId", String, nullable=True),
+    Column("autoRenew", Integer, nullable=True),
+    Column("billingCycle", Integer, nullable=True),
+    Column("duration", Integer, nullable=True),
+    Column("renewDate", DateTime(timezone=True), nullable=True),
+    Column("renewDatexD", DateTime(timezone=True), nullable=True),
+    Column("createdAt", DateTime(timezone=True), nullable=True),
+    Column("updatedAt", DateTime(timezone=True), nullable=True),
+    Column("endsAt", DateTime(timezone=True), nullable=True, index=True),
+    Column("promoPrice", Integer, nullable=True),
+    Column("promoDuration", Integer, nullable=True),
+    Column("promoStatus", Integer, nullable=True),
+    Column("promoStartsAt", DateTime(timezone=True), nullable=True),
+    Column("promoEndsAt", DateTime(timezone=True), nullable=True),
+    Column("version", Integer, nullable=True),
+)
+
+subscription_plans = Table(
+    "subscription_plans",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    Column(
+        "accountId",
+        BigInteger,
+        ForeignKey("accounts.id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("subscriptionTierId", BigInteger, nullable=True, index=True),
+    Column("billingCycle", Integer, nullable=True),
+    Column("price", Integer, nullable=True),
+    Column("useAmounts", Integer, nullable=True),
+)
+
+subscription_promos = Table(
+    "subscription_promos",
+    metadata,
+    Column("id", BigInteger, primary_key=True),
+    Column(
+        "planId",
+        BigInteger,
+        ForeignKey("subscription_plans.id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("status", Integer, nullable=True),
+    Column("price", Integer, nullable=True),
+    Column("duration", Integer, nullable=True),
+    Column("maxUses", Integer, nullable=True),
+    Column("maxUsesBefore", DateTime(timezone=True), nullable=True),
+    Column("newSubscribersOnly", Integer, nullable=True),
+    Column("description", String, nullable=True),
+    Column("startsAt", DateTime(timezone=True), nullable=True),
+    Column("endsAt", DateTime(timezone=True), nullable=True),
+)
+
+follow_events = Table(
+    "follow_events",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column(
+        "accountId",
+        BigInteger,
+        ForeignKey("accounts.id"),
+        nullable=False,
+        index=True,
+    ),
+    Column("observed_at", DateTime(timezone=True), nullable=False),
+    Column("following_state", Boolean, nullable=False),
+    Index("idx_follow_events_account_observed", "accountId", "observed_at"),
+)
+
 # ── Junction / Association Tables ───────────────────────────────────────
 
 account_avatar = Table(
@@ -393,8 +490,18 @@ post_hashtags = Table(
 wall_posts = Table(
     "wall_posts",
     metadata,
-    Column("wallId", BigInteger, ForeignKey("walls.id"), primary_key=True),
-    Column("postId", BigInteger, ForeignKey("posts.id"), primary_key=True),
+    Column(
+        "wallId",
+        BigInteger,
+        ForeignKey("walls.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "postId",
+        BigInteger,
+        ForeignKey("posts.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
     Index("idx_wall_posts_post", "postId"),
     Index("idx_wall_posts_wall_post", "wallId", "postId"),
 )

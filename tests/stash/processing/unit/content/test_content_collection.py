@@ -1,32 +1,21 @@
-"""Tests for collecting media from attachments and processing items with gallery.
+"""Tests for collecting media from attachments.
 
-These tests use entity_store for database persistence and respx for HTTP mocking,
-following the Pydantic EntityStore migration patterns.
+These tests use entity_store for database persistence, following the Pydantic
+EntityStore migration patterns.
 """
 
-import json
-from datetime import UTC, datetime
-from unittest.mock import AsyncMock, patch
-
-import httpx
 import pytest
-import respx
 
 from metadata import ContentType
+from metadata.entity_store import PostgresEntityStore
 from stash.processing import StashProcessing
-from tests.fixtures import (
+from tests.fixtures.metadata import (
     AccountFactory,
     AccountMediaBundleFactory,
     AccountMediaFactory,
     AttachmentFactory,
-    GroupFactory,
     MediaFactory,
-    MessageFactory,
-    PerformerFactory,
-    PostFactory,
-    StudioFactory,
 )
-from tests.fixtures.stash.stash_api_fixtures import dump_graphql_calls
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -36,52 +25,44 @@ class TestCollectMediaFromAttachments:
     These tests verify pure object manipulation without HTTP calls.
     """
 
+    @pytest.mark.parametrize(
+        "attachment_count",
+        [0, 2],
+        ids=["empty_attachments", "attachments_without_media"],
+    )
     @pytest.mark.asyncio
-    async def test_empty_attachments(
+    async def test_attachments_yield_no_media(
         self,
         respx_stash_processor: StashProcessing,
-    ):
-        """Test _collect_media_from_attachments with empty attachments."""
-        attachments = []
+        attachment_count: int,
+    ) -> None:
+        """Test _collect_media_from_attachments yields nothing.
+
+        Covers both the empty-attachments case (loop never entered) and
+        attachments whose contentId points at non-existent AccountMedia
+        (dict-lookup miss branch).
+        """
+        attachments = [
+            AttachmentFactory.build(
+                id=60001 + pos,
+                contentType=ContentType.ACCOUNT_MEDIA,
+                contentId=snowflake_id(),  # Non-existent AccountMedia
+                pos=pos,
+            )
+            for pos in range(attachment_count)
+        ]
+
         result = await respx_stash_processor._collect_media_from_attachments(
             attachments
         )
         assert result == []
 
     @pytest.mark.asyncio
-    async def test_attachments_no_media(
-        self,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test _collect_media_from_attachments with attachments that have no media."""
-        content_id_1 = snowflake_id()
-        content_id_2 = snowflake_id()
-
-        # Create attachments with contentType but no media relationship set
-        att1 = AttachmentFactory.build(
-            id=60001,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            contentId=content_id_1,  # Non-existent AccountMedia
-            pos=0,
-        )
-        att2 = AttachmentFactory.build(
-            id=60002,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            contentId=content_id_2,  # Non-existent AccountMedia
-            pos=1,
-        )
-
-        result = await respx_stash_processor._collect_media_from_attachments(
-            [att1, att2]
-        )
-        assert result == []
-
-    @pytest.mark.asyncio
     async def test_attachments_with_media(
         self,
-        entity_store,
+        entity_store: PostgresEntityStore,
         respx_stash_processor: StashProcessing,
-    ):
+    ) -> None:
         """Test _collect_media_from_attachments with attachments that have media."""
         acct_id = snowflake_id()
         media_id_1 = snowflake_id()
@@ -150,9 +131,9 @@ class TestCollectMediaFromAttachments:
     @pytest.mark.asyncio
     async def test_attachments_with_previews(
         self,
-        entity_store,
+        entity_store: PostgresEntityStore,
         respx_stash_processor: StashProcessing,
-    ):
+    ) -> None:
         """Test _collect_media_from_attachments collects preview media (lines 241, 250, 253).
 
         AccountMedia and bundles can have a previewId pointing to a separate
@@ -260,398 +241,3 @@ class TestCollectMediaFromAttachments:
 
         # Bundle's own preview (line 252-253)
         assert bundle_preview_id in result_ids
-
-
-class TestProcessItemsWithGallery:
-    """Test _process_items_with_gallery orchestration using respx.
-
-    These tests mock at HTTP boundary to verify the full processing pipeline.
-    """
-
-    @pytest.mark.asyncio
-    async def test_empty_items(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test _process_items_with_gallery with empty items list."""
-        acct_id = snowflake_id()
-
-        # Create real account using factory and save to entity_store
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5100", name="test_user")
-        studio = StudioFactory.build(id="10200", name="Test Studio")
-
-        # Set up respx - expect NO calls with empty items
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[]  # Empty list catches any unexpected call
-        )
-
-        # Call method with empty items (no session= parameter)
-        await respx_stash_processor._process_items_with_gallery(
-            account=account,
-            performer=performer,
-            studio=studio,
-            item_type="post",
-            items=[],
-            url_pattern_func=lambda x: f"https://example.com/post/{x.id}",
-        )
-
-        # With no items, no GraphQL calls should be made
-        assert len(graphql_route.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_item_no_attachments(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test _process_items_with_gallery with item that has no attachments."""
-        acct_id = snowflake_id()
-        post_id = snowflake_id()
-
-        # Create account and post without attachments
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        post = PostFactory.build(
-            id=post_id,
-            accountId=acct_id,
-            content="Test content",
-            createdAt=datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC),
-        )
-        # Post has no attachments by default
-        await entity_store.save(post)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5101", name="test_user")
-        studio = StudioFactory.build(id="10201", name="Test Studio")
-
-        # Set up respx - expect NO calls for items without attachments
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[]  # Empty list catches any unexpected call
-        )
-
-        # Call method (no session= parameter)
-        await respx_stash_processor._process_items_with_gallery(
-            account=account,
-            performer=performer,
-            studio=studio,
-            item_type="post",
-            items=[post],
-            url_pattern_func=lambda x: f"https://example.com/post/{x.id}",
-        )
-
-        # Items without attachments don't trigger any GraphQL calls
-        assert len(graphql_route.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_multiple_items(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test _process_items_with_gallery with multiple items."""
-        acct_id = snowflake_id()
-        post_id_1 = snowflake_id()
-        post_id_2 = snowflake_id()
-        content_id_1 = snowflake_id()
-        content_id_2 = snowflake_id()
-
-        # Create account
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        # Create posts with attachments set via Pydantic relationships
-        post1 = PostFactory.build(
-            id=post_id_1,
-            accountId=acct_id,
-            content="Test post 1",
-            createdAt=datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC),
-        )
-        att1 = AttachmentFactory.build(
-            postId=post_id_1,
-            contentId=content_id_1,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            pos=0,
-        )
-        # Use _add_to_relationship to avoid validate_assignment re-running
-        # _prepare_post_data which filters non-dict attachments to [].
-        await post1._add_to_relationship("attachments", att1)
-
-        post2 = PostFactory.build(
-            id=post_id_2,
-            accountId=acct_id,
-            content="Test post 2",
-            createdAt=datetime(2024, 5, 2, 12, 0, 0, tzinfo=UTC),
-        )
-        att2 = AttachmentFactory.build(
-            postId=post_id_2,
-            contentId=content_id_2,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            pos=0,
-        )
-        await post2._add_to_relationship("attachments", att2)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5102", name="test_user")
-        studio = StudioFactory.build(id="10202", name="Test Studio")
-
-        # Set up respx with multiple responses for gallery lookups/creates
-        generic_response = httpx.Response(
-            200,
-            json={
-                "data": {
-                    "findGalleries": {"galleries": [], "count": 0},
-                    "galleryCreate": {"id": "20000"},
-                }
-            },
-        )
-        # Allow multiple calls for 2 posts with attachments
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[generic_response] * 20  # Enough for multiple gallery lookups
-        )
-
-        # Call method (no session= parameter)
-        try:
-            await respx_stash_processor._process_items_with_gallery(
-                account=account,
-                performer=performer,
-                studio=studio,
-                item_type="post",
-                items=[post1, post2],
-                url_pattern_func=lambda x: f"https://example.com/post/{x.id}",
-            )
-        finally:
-            dump_graphql_calls(graphql_route.calls, "test_multiple_items")
-
-        # Verify GraphQL calls were made (at least one per item with attachments)
-        assert len(graphql_route.calls) > 0
-
-        # Inspect the requests to verify correct data was sent.
-        # `req["query"]` access below KeyErrors naturally if missing — no
-        # need for a tautological "query in req" pre-assertion.
-        for call in graphql_route.calls:
-            req = json.loads(call.request.content)
-            variables = req.get("variables", {})
-
-            # If this is a galleryCreate call, verify the input data
-            if "galleryCreate" in req["query"]:
-                input_data = variables.get("input", {})
-                # Gallery should have title from post content
-                assert "title" in input_data
-                # Gallery should have code matching post ID
-                if "code" in input_data:
-                    assert input_data["code"] in [str(post_id_1), str(post_id_2)]
-                # Gallery should have date
-                if "date" in input_data:
-                    assert input_data["date"].startswith("2024-05")
-
-
-class TestProcessCreatorContent:
-    """Test process_creator_posts and process_creator_messages using respx.
-
-    These tests verify the full processing workflow at HTTP boundary.
-    """
-
-    @pytest.mark.asyncio
-    async def test_process_posts_no_posts(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test process_creator_posts with no posts."""
-        acct_id = snowflake_id()
-
-        # Create account without posts in entity_store
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5103", name="test_user")
-        studio = StudioFactory.build(id="10203", name="Test Studio")
-
-        # Set up respx - expect NO calls for account without posts
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[]  # Empty list catches any unexpected call
-        )
-
-        # Call method (no session= parameter)
-        await respx_stash_processor.process_creator_posts(
-            account=account,
-            performer=performer,
-            studio=studio,
-        )
-
-        # With no posts, no GraphQL calls should be made
-        assert len(graphql_route.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_process_messages_no_messages(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test process_creator_messages with no messages."""
-        acct_id = snowflake_id()
-
-        # Create account without messages in entity_store
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5104", name="test_user")
-        studio = StudioFactory.build(id="10204", name="Test Studio")
-
-        # Set up respx - expect NO calls for account without messages
-        graphql_route = respx.post("http://localhost:9999/graphql").mock(
-            side_effect=[]  # Empty list catches any unexpected call
-        )
-
-        # Call method (no session= parameter)
-        await respx_stash_processor.process_creator_messages(
-            account=account,
-            performer=performer,
-            studio=studio,
-        )
-
-        # With no messages, no GraphQL calls should be made
-        assert len(graphql_route.calls) == 0
-
-    @pytest.mark.asyncio
-    async def test_process_posts_exception_handling(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test process_creator_posts handles exceptions during processing (lines 249-257)."""
-        acct_id = snowflake_id()
-        post_id = snowflake_id()
-        content_id = snowflake_id()
-
-        # Create account and post with attachments in entity_store
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        post = PostFactory.build(
-            id=post_id,
-            accountId=acct_id,
-            content="Test post",
-            createdAt=datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC),
-        )
-        att = AttachmentFactory.build(
-            postId=post_id,
-            contentId=content_id,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            pos=0,
-        )
-        await post._add_to_relationship("attachments", att)
-        await entity_store.save(post)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5105", name="test_user")
-        studio = StudioFactory.build(id="10205", name="Test Studio")
-
-        # Mock _process_items_with_gallery to raise an exception
-        with patch.object(
-            respx_stash_processor,
-            "_process_items_with_gallery",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("Simulated processing error"),
-        ):
-            # Call method - should catch exception and continue (no session= parameter)
-            await respx_stash_processor.process_creator_posts(
-                account=account,
-                performer=performer,
-                studio=studio,
-            )
-            # Test passes if no exception propagates (exception was caught and logged)
-
-    @pytest.mark.asyncio
-    async def test_process_messages_exception_handling(
-        self,
-        entity_store,
-        respx_stash_processor: StashProcessing,
-    ):
-        """Test process_creator_messages handles exceptions during processing (lines 129-137)."""
-        acct_id = snowflake_id()
-        group_id = snowflake_id()
-        msg_id = snowflake_id()
-        content_id = snowflake_id()
-
-        # Create account
-        account = AccountFactory.build(
-            id=acct_id,
-            username="test_user",
-            displayName="Test User",
-        )
-        await entity_store.save(account)
-
-        # Create group with proper foreign key
-        group = GroupFactory.build(id=group_id, createdBy=acct_id)
-        # Add user via _add_to_relationship to avoid validate_assignment issues
-        await group._add_to_relationship("users", account)
-        await entity_store.save(group)
-
-        # Create message with proper foreign keys and attachment
-        message = MessageFactory.build(
-            id=msg_id,
-            groupId=group_id,
-            senderId=acct_id,
-            content="Test message",
-            createdAt=datetime(2024, 5, 1, 12, 0, 0, tzinfo=UTC),
-        )
-        att = AttachmentFactory.build(
-            messageId=msg_id,
-            contentId=content_id,
-            contentType=ContentType.ACCOUNT_MEDIA,
-            pos=0,
-        )
-        await message._add_to_relationship("attachments", att)
-        await entity_store.save(message)
-
-        # Create real performer and studio
-        performer = PerformerFactory.build(id="5106", name="test_user")
-        studio = StudioFactory.build(id="10206", name="Test Studio")
-
-        # Mock _process_items_with_gallery to raise an exception
-        with patch.object(
-            respx_stash_processor,
-            "_process_items_with_gallery",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("Simulated processing error"),
-        ):
-            # Call method - should catch exception and continue (no session= parameter)
-            await respx_stash_processor.process_creator_messages(
-                account=account,
-                performer=performer,
-                studio=studio,
-            )
-            # Test passes if no exception propagates (exception was caught and logged)

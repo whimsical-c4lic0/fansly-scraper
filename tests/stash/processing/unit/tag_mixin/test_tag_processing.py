@@ -6,9 +6,11 @@ Tests migrated to use respx_stash_processor fixture for HTTP boundary mocking.
 import httpx
 import pytest
 import respx
+from stash_graphql_client import present
 
-from tests.fixtures import (
-    HashtagFactory,
+from stash.processing import StashProcessing
+from tests.fixtures.metadata import HashtagFactory
+from tests.fixtures.stash import (
     SceneFactory,
     TagFactory,
     create_find_scenes_result,
@@ -24,15 +26,6 @@ from tests.fixtures.stash.stash_api_fixtures import (
 )
 
 
-@pytest.fixture
-def mock_stash_tag():
-    """Create a mock Stash tag using factory."""
-    return TagFactory.build(
-        id="123",
-        name="test_tag",
-    )
-
-
 @pytest.mark.asyncio
 async def test_process_hashtags_to_tags_empty(respx_stash_processor):
     """Empty input short-circuits at tag.py:93 before any HTTP call."""
@@ -42,41 +35,83 @@ async def test_process_hashtags_to_tags_empty(respx_stash_processor):
 
 
 @pytest.mark.asyncio
-async def test_process_hashtags_to_tags_single(respx_stash_processor):
-    """Test processing a single hashtag to tag."""
-    # Create hashtag using factory
-    hashtag = HashtagFactory.build(value="testTag")
+async def test_process_hashtags_sequential_fallback_skips_failing_tag(
+    respx_stash_processor, monkeypatch
+):
+    """tag.py:141-142: a per-tag failure in the sequential fallback is caught.
 
-    # Create tag response
-    tag_dict = create_tag_dict(
-        id="123",
-        name="testtag",
-        aliases=[],
-        parents=[],
-        children=[],
-        description=None,
-        image_path=None,
+    Per-task GraphQL errors are swallowed by ``gather(return_exceptions=True)``,
+    so the defensive batch→sequential fallback (except at 133) is only reachable
+    via a *structural* batch failure. Replacing ``_get_or_create_tag`` with a
+    non-coroutine makes ``asyncio.gather`` raise (batch fails), and the
+    sequential ``await _get_or_create_tag(...)`` then raises ``TypeError`` too
+    (awaiting a non-awaitable) — exercising the inner per-tag except (141-142).
+    No HTTP is issued, so no respx route/dump is needed.
+    """
+    hashtag = HashtagFactory.build(value="boomTag")
+    monkeypatch.setattr(
+        respx_stash_processor, "_get_or_create_tag", lambda _name: "not-awaitable"
     )
 
-    # Mock GraphQL responses
-    find_tags_result = create_find_tags_result(count=1, tags=[tag_dict])
-    respx.post("http://localhost:9999/graphql").mock(
+    tags = await respx_stash_processor._process_hashtags_to_tags([hashtag])
+
+    # Batch failed structurally; the lone sequential tag failed too → none valid.
+    assert tags == []
+
+
+@pytest.mark.parametrize("tag_count", [1, 2], ids=["single_tag", "two_tags"])
+@pytest.mark.asyncio
+async def test_process_hashtags_to_tags_found(
+    respx_stash_processor: StashProcessing,
+    request: pytest.FixtureRequest,
+    tag_count: int,
+) -> None:
+    """Processing N found hashtags returns N tags (multiple is N=2 of single).
+
+    Hashtag values are mixed-case (``testTagN``) and the routed tag names are
+    lowercase, preserving the case-normalization behavior the original
+    single-tag test verified. One findTags call is issued per hashtag.
+    """
+    hashtags = [HashtagFactory.build(value=f"testTag{i + 1}") for i in range(tag_count)]
+    tag_dicts = [
+        create_tag_dict(
+            id=str(200 + i + 1),
+            name=f"testtag{i + 1}",
+            aliases=[],
+            parents=[],
+            children=[],
+            description=None,
+            image_path=None,
+        )
+        for i in range(tag_count)
+    ]
+
+    # Mock GraphQL responses — one findTags response per hashtag
+    graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
             httpx.Response(
                 200,
-                json=create_graphql_response("findTags", find_tags_result),
+                json=create_graphql_response(
+                    "findTags", create_find_tags_result(count=1, tags=[tag_dict])
+                ),
             )
+            for tag_dict in tag_dicts
         ]
     )
 
-    # Test processing hashtag
-    tags = await respx_stash_processor._process_hashtags_to_tags([hashtag])
+    # Test processing hashtags
+    try:
+        tags = await respx_stash_processor._process_hashtags_to_tags(hashtags)
+    finally:
+        dump_graphql_calls(graphql_route.calls, request.node.name)
 
-    # Verify tag was returned
-    assert len(tags) == 1
-    # Note: Don't assert on ID - library generates UUIDs (implementation detail)
-    assert tags[0].name == "testtag"
-    assert hasattr(tags[0], "id")  # Verify ID exists
+    # Verify all tags were returned, in hashtag order
+    assert len(tags) == tag_count
+    assert len(graphql_route.calls) == tag_count
+    for i, tag in enumerate(tags):
+        # Note: Don't assert on ID - library generates UUIDs (implementation detail)
+        assert tag.name == f"testtag{i + 1}"
+        assert hasattr(tag, "id")  # Verify ID exists
 
 
 @pytest.mark.asyncio
@@ -93,7 +128,7 @@ async def test_process_hashtags_to_tags_not_found_creates_new(respx_stash_proces
     )
 
     # Mock findTags (empty) and tagCreate responses
-    respx.post("http://localhost:9999/graphql").mock(
+    graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
             # First call: findTags by name returns empty
             httpx.Response(
@@ -116,48 +151,18 @@ async def test_process_hashtags_to_tags_not_found_creates_new(respx_stash_proces
     )
 
     # Test processing hashtag
-    tags = await respx_stash_processor._process_hashtags_to_tags([hashtag])
+    try:
+        tags = await respx_stash_processor._process_hashtags_to_tags([hashtag])
+    finally:
+        dump_graphql_calls(
+            graphql_route.calls, "process_hashtags_to_tags_not_found_creates_new"
+        )
 
     # Verify tag was created and returned
     assert len(tags) == 1
     # Note: Don't assert on ID - library generates UUIDs (implementation detail)
     assert tags[0].name == "newtag"
     assert hasattr(tags[0], "id")  # Verify ID exists
-
-
-@pytest.mark.asyncio
-async def test_process_hashtags_to_tags_multiple(respx_stash_processor):
-    """Test processing multiple hashtags."""
-    # Create hashtags using factory
-    hashtag1 = HashtagFactory.build(value="tag1")
-    hashtag2 = HashtagFactory.build(value="tag2")
-
-    # Create tag responses
-    tag1_dict = create_tag_dict(id="201", name="tag1")
-    tag2_dict = create_tag_dict(id="202", name="tag2")
-
-    # Mock GraphQL responses - need to handle two findTags calls
-    result1 = create_find_tags_result(count=1, tags=[tag1_dict])
-    result2 = create_find_tags_result(count=1, tags=[tag2_dict])
-
-    respx.post("http://localhost:9999/graphql").mock(
-        side_effect=[
-            httpx.Response(200, json=create_graphql_response("findTags", result1)),
-            httpx.Response(200, json=create_graphql_response("findTags", result2)),
-        ]
-    )
-
-    # Test processing hashtags
-    tags = await respx_stash_processor._process_hashtags_to_tags([hashtag1, hashtag2])
-
-    # Verify both tags were returned
-    assert len(tags) == 2
-    # Note: Don't assert on IDs - library generates UUIDs (implementation detail)
-    assert tags[0].name == "tag1"
-    assert tags[1].name == "tag2"
-    # Verify IDs exist
-    assert hasattr(tags[0], "id")
-    assert hasattr(tags[1], "id")
 
 
 @pytest.mark.asyncio
@@ -169,7 +174,7 @@ async def test_add_preview_tag_not_found(respx_stash_processor):
 
     # Mock empty findTags response
     empty_result = create_find_tags_result(count=0, tags=[])
-    respx.post("http://localhost:9999/graphql").mock(
+    graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -179,7 +184,10 @@ async def test_add_preview_tag_not_found(respx_stash_processor):
     )
 
     # Test with scene
-    await respx_stash_processor._add_preview_tag(scene)
+    try:
+        await respx_stash_processor._add_preview_tag(scene)
+    finally:
+        dump_graphql_calls(graphql_route.calls, "add_preview_tag_not_found")
 
     # Verify no tag was added since not found
     assert scene.tags == []
@@ -215,9 +223,10 @@ async def test_add_preview_tag_found_adds_tag(respx_stash_processor):
         dump_graphql_calls(graphql_route.calls, "test_add_preview_tag_found_adds_tag")
 
     # Verify the tag was added to scene
-    assert len(scene.tags) == 1
-    assert scene.tags[0].id == "400"
-    assert scene.tags[0].name == "Trailer"
+    scene_tags = present(scene.tags)
+    assert len(scene_tags) == 1
+    assert scene_tags[0].id == "400"
+    assert scene_tags[0].name == "Trailer"
 
     # Exact count + per-call request + response verification.
     assert len(graphql_route.calls) == 2, (
@@ -257,7 +266,7 @@ async def test_add_preview_tag_already_has_tag(respx_stash_processor):
     trailer_tag_dict = create_tag_dict(id="400", name="Trailer")
     result = create_find_tags_result(count=1, tags=[trailer_tag_dict])
 
-    respx.post("http://localhost:9999/graphql").mock(
+    graphql_route = respx.post("http://localhost:9999/graphql").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -267,8 +276,12 @@ async def test_add_preview_tag_already_has_tag(respx_stash_processor):
     )
 
     # Test with scene
-    await respx_stash_processor._add_preview_tag(scene)
+    try:
+        await respx_stash_processor._add_preview_tag(scene)
+    finally:
+        dump_graphql_calls(graphql_route.calls, "add_preview_tag_already_has_tag")
 
     # Verify the tag was NOT added again (still only one)
-    assert len(scene.tags) == 1
-    assert scene.tags[0].id == "400"
+    scene_tags = present(scene.tags)
+    assert len(scene_tags) == 1
+    assert scene_tags[0].id == "400"

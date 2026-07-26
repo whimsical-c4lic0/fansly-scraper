@@ -6,13 +6,14 @@ import asyncio
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Literal
 
 from pydantic import BaseModel, SecretStr
 from stash_graphql_client import StashClient, StashContext
 
 from api.rate_limiter import RateLimiter
 from api.rate_limiter_display import RateLimiterDisplay
+from config.media_filters import MediaFilters
 from config.modes import DownloadMode
 from config.schema import (
     CacheSection,
@@ -20,6 +21,7 @@ from config.schema import (
     LoggingSection,
     StashContextSection,
 )
+from config.wall_filters import WallFilterSpec
 
 
 if TYPE_CHECKING:
@@ -48,8 +50,8 @@ class FanslyConfig:
     # The getters will ensure they're not None when accessed
     _api: FanslyApi | None = None
     _database: Database | None = None
-    _stash: Any = None  # StashContext | None
-    _rate_limiter_display: Any = None  # RateLimiterDisplay | None
+    _stash: StashContext | None = None
+    _rate_limiter_display: RateLimiterDisplay | None = None
 
     # Command line flags
     use_following: bool = False
@@ -70,6 +72,8 @@ class FanslyConfig:
     trace: bool = False  # For very detailed logging
     # If specified on the command-line
     post_id: str | None = None
+    wall_filters: dict[str, WallFilterSpec] = field(default_factory=dict)
+    media_filters: MediaFilters = field(default_factory=MediaFilters)
 
     # Objects
     _schema: ConfigSchema | None = field(default=None)
@@ -108,6 +112,7 @@ class FanslyConfig:
     open_folder_when_finished: bool = True
     separate_messages: bool = True
     separate_previews: bool = False
+    repair_previews: bool | str = False
     separate_timeline: bool = True
     show_downloads: bool = True
     show_skipped_downloads: bool = True
@@ -132,6 +137,8 @@ class FanslyConfig:
     # Maximum number of retries for API requests that fail with 429 (rate limit)
     # Allows exponential backoff progression: 30s → 60s → 120s → 240s → 300s (max)
     api_max_retries: int = 10
+    # ids per batched /account?ids= lookup; the Fansly web client uses 5
+    account_ids_batch_size: int = 5
 
     # Rate limiting configuration
     rate_limiting_enabled: bool = True
@@ -146,7 +153,7 @@ class FanslyConfig:
     pg_host: str = "localhost"
     pg_port: int = 5432
     pg_database: str = "fansly_metadata"
-    pg_user: str = "fansly_user"
+    pg_user: str | None = "fansly_user"
     pg_password: str | None = None  # Prefer using FANSLY_PG_PASSWORD env var
 
     # PostgreSQL SSL/TLS settings
@@ -172,6 +179,14 @@ class FanslyConfig:
     # creator's stored MonitorState.lastCheckedAt.  Set via --monitor-since or
     # --full-pass CLI flags; loaded from schema.monitoring.session_baseline.
     monitoring_session_baseline: datetime | None = None
+
+    @property
+    def full_pass(self) -> bool:
+        return (
+            self.monitoring_session_baseline is not None
+            and self.monitoring_session_baseline.year <= 2020
+        )
+
     # When True, enter the post-batch monitoring daemon after the normal
     # batch download completes.  Set via --daemon / -d CLI flag.
     daemon_mode: bool = False
@@ -206,13 +221,13 @@ class FanslyConfig:
     # Loaded from schema.monitoring.livestream_manifest_poll_interval_seconds.
     monitoring_livestream_manifest_poll_interval_seconds: int = 3
 
-    # StashContext
-    # Widened to dict[str, Any] so port:int coexists with the string-valued keys.
-    # StashContext accepts a port:int, so we don't need to stringify it.
-    stash_context_conn: dict[str, Any] | None = None
+    # StashContext connection: string-valued scheme/host/apikey + int port.
+    stash_context_conn: dict[str, str | int] | None = None
     stash_mapped_path: Path | None = None
     stash_override_dldir_w_mapped: bool = False
     stash_require_stash_only_mode: bool = False
+    stash_enable_scene_split: bool | Literal["dry-run"] = False
+    stash_scan_settle_s: float = 3.5
 
     # Logging
     # ``log_levels`` is the legacy flat ``{logger_name: level_string}``
@@ -244,23 +259,21 @@ class FanslyConfig:
             token = self.get_unscrambled_token()
             user_agent = self.user_agent
 
-            # Allow empty token if username/password are provided (for login flow)
-            has_login_credentials = self.username and self.password
-
-            if (
-                user_agent
-                and self.check_key
-                and (self.token_is_valid() or has_login_credentials)
-            ):
+            # Build the api whenever user_agent + check_key are present, even
+            # with an invalid/missing token. An empty-token api is intentional
+            # for the login flow AND for browser-token probing via
+            # get_client_user_name(alternate_token=...) during validation; the
+            # real token is applied only once validated.
+            if user_agent and self.check_key:
                 # Initialize rate limiter with visual display.
                 # The display thread is NOT started here — get_api() must stay
                 # I/O-free. setup_api() starts it after bootstrap completes.
                 rate_limiter = RateLimiter(self)
                 self._rate_limiter_display = RateLimiterDisplay(rate_limiter)
 
-                # Use empty string if token is invalid (for login flow)
-                # Otherwise use the valid unscrambled token
-                api_token = token if self.token_is_valid() else ""
+                # Empty token when invalid/missing; the real unscrambled token
+                # otherwise.
+                api_token = (token or "") if self.token_is_valid() else ""
 
                 from api import FanslyApi  # noqa: PLC0415, I001  # circular-break: spawn-context subprocess unpickle fails if top-level
 
@@ -486,14 +499,16 @@ class FanslyConfig:
         Raises:
             RuntimeError: If no connection data available
         """
-        if self._stash is None:
-            if self.stash_context_conn is None:
-                raise RuntimeError("No StashContext connection data available.")
+        if self._stash is not None:
+            return self._stash
 
-            self._stash = StashContext(conn=self.stash_context_conn)
-            self._save_config()
+        if self.stash_context_conn is None:
+            raise RuntimeError("No StashContext connection data available.")
 
-        return self._stash
+        stash = StashContext(conn=self.stash_context_conn)
+        self._stash = stash
+        self._save_config()
+        return stash
 
     def get_stash_api(self) -> StashClient:
         """Get Stash API client.
@@ -531,15 +546,16 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
     if config.stash_context_conn is not None:
         conn = config.stash_context_conn
         stash_section = StashContextSection(
-            scheme=conn.get("scheme", "http"),
-            host=conn.get("host", "localhost"),
+            scheme=str(conn.get("scheme", "http")),
+            host=str(conn.get("host", "localhost")),
             port=int(conn.get("port", 9999)),
-            apikey=conn.get("apikey", ""),
+            apikey=str(conn.get("apikey", "")),
             mapped_path=str(config.stash_mapped_path)
             if config.stash_mapped_path is not None
             else None,
             override_dldir_w_mapped=config.stash_override_dldir_w_mapped,
             require_stash_only_mode=config.stash_require_stash_only_mode,
+            enable_scene_split=config.stash_enable_scene_split,
         )
 
     # Re-use the existing schema if available so we don't lose monitoring/logic
@@ -552,7 +568,7 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
     # ``_ephemeral_overrides`` (CLI flags don't pin themselves into YAML).
     # This is what lets ``model_dump(exclude_unset=True)`` in the dump
     # path stay honest across save round-trips.
-    def _maybe_set(section: BaseModel, name: str, value: Any) -> None:
+    def _maybe_set(section: BaseModel, name: str, value: object) -> None:
         if name in config._ephemeral_overrides:
             return
         current = getattr(section, name, None)
@@ -595,6 +611,7 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
     )
     _maybe_set(base.options, "separate_messages", config.separate_messages)
     _maybe_set(base.options, "separate_previews", config.separate_previews)
+    _maybe_set(base.options, "repair_previews", config.repair_previews)
     _maybe_set(base.options, "separate_timeline", config.separate_timeline)
     _maybe_set(base.options, "use_duplicate_threshold", config.use_duplicate_threshold)
     _maybe_set(
@@ -607,6 +624,7 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
     _maybe_set(base.options, "timeline_retries", config.timeline_retries)
     _maybe_set(base.options, "timeline_delay_seconds", config.timeline_delay_seconds)
     _maybe_set(base.options, "api_max_retries", config.api_max_retries)
+    _maybe_set(base.options, "account_ids_batch_size", config.account_ids_batch_size)
     _maybe_set(base.options, "rate_limiting_enabled", config.rate_limiting_enabled)
     _maybe_set(base.options, "rate_limiting_adaptive", config.rate_limiting_adaptive)
     _maybe_set(
@@ -637,6 +655,14 @@ def _rebuild_schema_from_config(config: FanslyConfig) -> ConfigSchema:
         "temp_folder",
         str(config.temp_folder) if config.temp_folder is not None else None,
     )
+
+    # filters.wall — the FanslyConfig attribute is ``wall_filters`` but the
+    # schema field is ``wall``; ``_maybe_set``'s internal ephemeral guard
+    # keys off the name it's given, so the mismatch needs an outer check
+    # against the config-side name (mirrors user_names/usernames above).
+    if "wall_filters" not in config._ephemeral_overrides:
+        _maybe_set(base.filters, "wall", config.wall_filters)
+    # filters.media is immutable at runtime (CLI overrides are ephemeral) — no write-back.
 
     # postgres
     pg_password_secret: SecretStr | None = None

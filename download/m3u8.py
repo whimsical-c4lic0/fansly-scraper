@@ -10,6 +10,7 @@ Always tries PyAV first, then FFmpeg subprocess, then segments.
 
 import concurrent.futures
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,7 +21,7 @@ from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Column
 
 from config.fanslyconfig import FanslyConfig
-from errors import M3U8Error
+from errors import M3U8Error, MediaFilteredError
 from helpers.web import get_file_name_from_url, get_qs_value, split_url
 from textio import print_debug, print_error, print_info, print_warning
 
@@ -71,19 +72,28 @@ def _get_highest_quality_variant_url(
     config: FanslyConfig,
     m3u8_url: str,
     cookies: dict[str, str],
+    max_px: int | None = None,
 ) -> str:
     """Fetch master playlist and return the highest quality variant URL.
 
-    Selects the variant with the largest resolution (width * height).
-    Falls back to guessing a 1080p variant URL if no playlists are found.
+    Selects the variant with the largest resolution (width * height) among
+    those fitting within ``max_px`` (shorter-edge pixel cap), when set.
+    Variants with an unknown resolution are never the sole cause of a skip:
+    the cap only raises when at least one variant's resolution IS known and
+    none of the known-resolution variants fit. Falls back to guessing a
+    1080p variant URL if no playlists are found.
 
     Args:
         config: The downloader configuration
         m3u8_url: URL of the master HLS manifest
         cookies: CloudFront authentication cookies
+        max_px: Shorter-edge pixel cap on the selected variant; None disables it.
 
     Returns:
         Absolute URL of the highest quality variant playlist
+
+    Raises:
+        MediaFilteredError: When every known-resolution variant exceeds max_px.
     """
     m3u8_base_url, m3u8_file_url = split_url(m3u8_url)
 
@@ -97,9 +107,23 @@ def _get_highest_quality_variant_url(
     master_playlist = M3U8(content=stream_response.text, base_uri=m3u8_base_url)
 
     if len(master_playlist.playlists) > 0:
+        candidates = master_playlist.playlists
+        if max_px is not None:
+            fitting = [
+                p
+                for p in candidates
+                if p.stream_info.resolution and min(p.stream_info.resolution) <= max_px
+            ]
+            if not fitting and any(p.stream_info.resolution for p in candidates):
+                raise MediaFilteredError("max_resolution")
+            if fitting:
+                candidates = fitting
         variant_info = max(
-            master_playlist.playlists,
-            key=lambda p: p.stream_info.resolution[0] * p.stream_info.resolution[1],
+            candidates,
+            key=lambda p: (
+                (p.stream_info.resolution or (0, 0))[0]
+                * (p.stream_info.resolution or (0, 0))[1]
+            ),
         )
         return variant_info.absolute_uri
 
@@ -114,6 +138,7 @@ def fetch_m3u8_segment_playlist(
     config: FanslyConfig,
     m3u8_url: str,
     cookies: dict[str, str] | None = None,
+    max_resolution: int | None = None,
 ) -> M3U8:
     """Fetch the M3U8 endlist with all the MPEG-TS segments.
 
@@ -121,9 +146,13 @@ def fetch_m3u8_segment_playlist(
         config: The downloader configuration.
         m3u8_url: The URL string of the M3U8 to download.
         cookies: Authentication cookies if they cannot be derived from m3u8_url.
+        max_resolution: Shorter-edge pixel cap forwarded to variant selection.
 
     Returns:
         An M3U8 endlist with segments.
+
+    Raises:
+        MediaFilteredError: When variant selection finds no fitting resolution.
     """
     if cookies is None:
         cookies = get_m3u8_cookies(m3u8_url)
@@ -159,8 +188,12 @@ def fetch_m3u8_segment_playlist(
         return playlist
 
     # Not an endlist — resolve variant and recurse
-    segments_url = _get_highest_quality_variant_url(config, m3u8_url, cookies)
-    return fetch_m3u8_segment_playlist(config, segments_url, cookies=cookies)
+    segments_url = _get_highest_quality_variant_url(
+        config, m3u8_url, cookies, max_resolution
+    )
+    return fetch_m3u8_segment_playlist(
+        config, segments_url, cookies=cookies, max_resolution=max_resolution
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +206,8 @@ def _try_direct_download_pyav(
     m3u8_url: str,
     output_path: Path,
     cookies: dict[str, str],
+    max_bytes: int | None = None,
+    max_resolution: int | None = None,
 ) -> bool:
     """Try downloading HLS video directly using PyAV (fastest path).
 
@@ -186,14 +221,23 @@ def _try_direct_download_pyav(
         m3u8_url: URL of the master HLS manifest
         output_path: Path to save the final video
         cookies: CloudFront authentication cookies
+        max_bytes: Abort threshold checked periodically against the
+            partial output file's size.
+        max_resolution: Shorter-edge pixel cap forwarded to variant selection.
 
     Returns:
         True if download succeeded, False otherwise
+
+    Raises:
+        MediaFilteredError: When the output file exceeds max_bytes, or when
+            variant selection finds no fitting resolution.
     """
     input_container = None
     output_container = None
     try:
-        variant_url = _get_highest_quality_variant_url(config, m3u8_url, cookies)
+        variant_url = _get_highest_quality_variant_url(
+            config, m3u8_url, cookies, max_resolution
+        )
         print_debug(f"PyAV direct: variant URL: {variant_url}")
         print_info("Trying PyAV fast path: in-process HLS download...")
 
@@ -234,6 +278,19 @@ def _try_direct_download_pyav(
                 packet.stream = stream_mapping[packet.stream]
                 output_container.mux(packet)
                 packet_count += 1
+                if (
+                    max_bytes is not None
+                    and packet_count % 512 == 0
+                    and output_path.exists()
+                    and output_path.stat().st_size > max_bytes
+                ):
+                    observed = output_path.stat().st_size
+                    output_container.close()
+                    output_container = None
+                    input_container.close()
+                    input_container = None
+                    output_path.unlink(missing_ok=True)
+                    raise MediaFilteredError("file_size_max", observed=observed)
 
         input_container.close()
         input_container = None
@@ -250,6 +307,8 @@ def _try_direct_download_pyav(
 
         print_warning("PyAV download produced empty or missing file")
 
+    except MediaFilteredError:
+        raise
     except av.error.FFmpegError as e:
         print_debug(f"PyAV direct download failed: {e}")
         print_info("PyAV fast path failed, trying FFmpeg subprocess...")
@@ -275,6 +334,7 @@ def _try_direct_download_ffmpeg(
     m3u8_url: str,
     output_path: Path,
     cookies: dict[str, str],
+    max_resolution: int | None = None,
 ) -> bool:
     """Try downloading HLS video using ffmpeg subprocess (fallback).
 
@@ -289,12 +349,18 @@ def _try_direct_download_ffmpeg(
         m3u8_url: URL of the master HLS manifest
         output_path: Path to save the final video
         cookies: CloudFront authentication cookies
+        max_resolution: Shorter-edge pixel cap forwarded to variant selection.
 
     Returns:
         True if direct download succeeded, False otherwise
+
+    Raises:
+        MediaFilteredError: When variant selection finds no fitting resolution.
     """
     try:
-        variant_url = _get_highest_quality_variant_url(config, m3u8_url, cookies)
+        variant_url = _get_highest_quality_variant_url(
+            config, m3u8_url, cookies, max_resolution
+        )
         print_debug(f"FFmpeg subprocess: variant URL: {variant_url}")
         print_info("Trying FFmpeg subprocess path...")
 
@@ -382,6 +448,8 @@ def _try_direct_download_ffmpeg(
 
         print_info(f"FFmpeg path succeeded! ({output_path.stat().st_size:,} bytes)")
 
+    except MediaFilteredError:
+        raise
     except ffmpeg.Error as e:
         stderr = e.stderr.decode() if e.stderr else str(e)
         print_debug(f"FFmpeg download failed: {stderr}")
@@ -564,6 +632,8 @@ def _try_segment_download(
     m3u8_url: str,
     output_path: Path,
     cookies: dict[str, str],
+    max_bytes: int | None = None,
+    max_resolution: int | None = None,
 ) -> Path:
     """Download HLS video by fetching each segment then muxing with PyAV.
 
@@ -575,12 +645,17 @@ def _try_segment_download(
         m3u8_url: URL of the master HLS manifest
         output_path: Path to save the final video
         cookies: CloudFront authentication cookies
+        max_bytes: Abort threshold for the running total of downloaded
+            segment bytes across all threads.
+        max_resolution: Shorter-edge pixel cap forwarded to variant selection.
 
     Returns:
         Path to the downloaded video file
 
     Raises:
         M3U8Error: If download or conversion fails
+        MediaFilteredError: If the running segment total exceeds max_bytes,
+            or variant selection finds no fitting resolution.
     """
     chunk_size = 1_048_576
 
@@ -588,10 +663,19 @@ def _try_segment_download(
     print_debug(f"Target output path: {output_path}")
 
     video_path = output_path.parent
-    playlist = fetch_m3u8_segment_playlist(config, m3u8_url, cookies)
+    playlist = fetch_m3u8_segment_playlist(
+        config, m3u8_url, cookies, max_resolution=max_resolution
+    )
+
+    total_bytes = 0
+    total_bytes_lock = threading.Lock()
+    abort_event = threading.Event()
 
     def download_ts(segment_uri: str, segment_full_path: Path) -> None:
         """Download a single .ts segment."""
+        nonlocal total_bytes
+        if abort_event.is_set():
+            return
         segment_response = None
         try:
             segment_response = config.get_api().get_with_ngsw_sync(
@@ -609,8 +693,15 @@ def _try_segment_download(
                 return
             with segment_full_path.open("wb") as ts_file:
                 for chunk in segment_response.iter_bytes(chunk_size):
+                    if abort_event.is_set():
+                        break
                     if chunk:
                         ts_file.write(chunk)
+                        if max_bytes is not None:
+                            with total_bytes_lock:
+                                total_bytes += len(chunk)
+                                if total_bytes > max_bytes:
+                                    abort_event.set()
         except Exception as e:
             print_debug(f"Error downloading segment {segment_uri}: {e!s}")
         finally:
@@ -648,6 +739,9 @@ def _try_segment_download(
                     description=f"Downloading segments ({max_workers} threads)",
                 )
             )
+
+        if abort_event.is_set():
+            raise MediaFilteredError("file_size_max", observed=total_bytes)
 
         # Check for missing segments
         missing_segments = [f for f in segment_files if not f.exists()]
@@ -687,7 +781,9 @@ def download_m3u8(
     config: FanslyConfig,
     m3u8_url: str,
     save_path: Path,
-    created_at: int | None = None,
+    created_at: float | None = None,
+    max_bytes: int | None = None,
+    max_resolution: int | None = None,
 ) -> Path:
     """Download M3U8 content as MP4 using three-tier strategy.
 
@@ -702,9 +798,17 @@ def download_m3u8(
         m3u8_url: The URL string of the M3U8 to download.
         save_path: The suggested file to save the video to (will use .mp4).
         created_at: Optional Unix timestamp to set as file modification time.
+        max_bytes: Abort threshold enforced by tiers 1 and 3. Tier 2
+            (ffmpeg subprocess) cannot enforce it mid-stream — the
+            downstream completion check is its backstop.
+        max_resolution: Shorter-edge pixel cap on the selected HLS variant,
+            enforced by all three tiers at variant-selection time.
 
     Returns:
         The file path of the MPEG-4 download.
+
+    Raises:
+        MediaFilteredError: When max_bytes or max_resolution is violated.
     """
     cookies = get_m3u8_cookies(m3u8_url)
 
@@ -713,23 +817,42 @@ def download_m3u8(
 
     try:
         # Tier 1: PyAV direct download (fastest — in-process)
-        if _try_direct_download_pyav(config, m3u8_url, full_path, cookies):
+        if _try_direct_download_pyav(
+            config,
+            m3u8_url,
+            full_path,
+            cookies,
+            max_bytes=max_bytes,
+            max_resolution=max_resolution,
+        ):
             if created_at:
                 os.utime(full_path, (created_at, created_at))
             return full_path
 
-        # Tier 2: FFmpeg subprocess (proven, handles edge cases)
-        if _try_direct_download_ffmpeg(config, m3u8_url, full_path, cookies):
+        # Tier 2: FFmpeg subprocess (proven, handles edge cases). Cannot
+        # enforce max_bytes mid-stream — the completion check is its backstop.
+        if _try_direct_download_ffmpeg(
+            config, m3u8_url, full_path, cookies, max_resolution=max_resolution
+        ):
             if created_at:
                 os.utime(full_path, (created_at, created_at))
             return full_path
 
         # Tier 3: Manual segment download + mux
-        result = _try_segment_download(config, m3u8_url, full_path, cookies)
+        result = _try_segment_download(
+            config,
+            m3u8_url,
+            full_path,
+            cookies,
+            max_bytes=max_bytes,
+            max_resolution=max_resolution,
+        )
         if created_at:
             os.utime(result, (created_at, created_at))
 
     except M3U8Error:
+        raise
+    except MediaFilteredError:
         raise
     except Exception as e:
         print_error(f"Failed to download HLS video from {m3u8_url}: {e}")

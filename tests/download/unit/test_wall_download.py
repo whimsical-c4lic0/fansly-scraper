@@ -7,18 +7,22 @@ Per project testing guidelines: only mock at external boundaries.
 
 import logging
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 import respx
 
 from api.fansly import FanslyApi
+from config import FanslyConfig
+from config.wall_filters import WallFilterSpec
 from download.downloadstate import DownloadState
 from download.types import DownloadType
 from download.wall import download_wall, process_wall_data, process_wall_media
-from metadata.models import Account, Post, Wall
+from download.wallfilters import resolve_wall_filter
+from metadata.entity_store import PostgresEntityStore
+from metadata.models import Account, Media, Post, Wall
 from tests.fixtures.api import dump_fansly_calls
+from tests.fixtures.utils import scaled_async_sleep
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
@@ -112,9 +116,25 @@ class TestProcessWallData:
             assert post is not None
             assert post.accountId == creator_id
 
+    @pytest.mark.parametrize(
+        "before_cursor",
+        ["0", "abc123"],
+        ids=["cursor_zero_treated_as_first_page", "nonzero_cursor_passed_through"],
+    )
     @pytest.mark.asyncio
-    async def test_cursor_zero_treated_as_first_page(self, mock_config, entity_store):
-        """Line 54: before_cursor == '0' → cursor=None in check_page_duplicates."""
+    async def test_cursor_handling(
+        self,
+        mock_config: FanslyConfig,
+        entity_store: PostgresEntityStore,
+        before_cursor: str,
+    ) -> None:
+        """Line 54: before_cursor == '0' → cursor=None in check_page_duplicates;
+        any other value is passed through as the cursor.
+
+        No HTTP request leaves this layer, so there is no request param to
+        assert on (the originals asserted completion only); both dict-branch
+        rows must keep line 54's two arms covered.
+        """
         state = DownloadState()
         state.creator_id = snowflake_id()
         await entity_store.save(
@@ -127,25 +147,7 @@ class TestProcessWallData:
             state,
             snowflake_id(),
             _wall_response(state.creator_id),
-            "0",
-        )
-
-    @pytest.mark.asyncio
-    async def test_nonzero_cursor_passed_through(self, mock_config, entity_store):
-        """Line 54: before_cursor != '0' → passed as cursor."""
-        state = DownloadState()
-        state.creator_id = snowflake_id()
-        await entity_store.save(
-            Account(id=state.creator_id, username=f"u_{state.creator_id}")
-        )
-
-        mock_config.use_pagination_duplication = False
-        await process_wall_data(
-            mock_config,
-            state,
-            snowflake_id(),
-            _wall_response(state.creator_id),
-            "abc123",
+            before_cursor,
         )
 
 
@@ -181,17 +183,34 @@ class TestProcessWallMedia:
 
     @pytest.mark.asyncio
     async def test_returns_false_propagates_to_caller(
-        self, respx_fansly_api, mock_config, entity_store, tmp_path
+        self, respx_fansly_api, mock_config, entity_store, tmp_path, monkeypatch
     ):
-        """Spy verifies process_wall_media is called and its False return
-        causes the download_wall loop to break. Uses patch(wraps=) to
-        intercept the return without running the deep download pipeline."""
+        """Real process_wall_media returns False → download_wall breaks the loop.
+
+        No internal mock: the REAL fetch → parse → download_media pipeline runs
+        end to end, and the False is produced by a genuine ``DuplicateCountError``
+        — not a forced return value.
+
+        Why so many media items: ``download_wall`` resets ``state.duplicate_count
+        = 0`` at the top (wall.py:119), so a pre-seeded count can't survive to
+        trigger the threshold. Instead we let the count accumulate organically:
+        every fetched item is already recorded in the DB as downloaded
+        (``is_downloaded`` + ``content_hash`` + ``local_filename`` set), so the
+        real ``process_media_download`` returns ``None`` (skip) and
+        ``download_media`` calls ``state.add_duplicate()`` for each — no CDN
+        request is made. For WALL the threshold is ``max(50, int(0.3 * n))`` = 50,
+        so once the running count passes 50 the real ``download_media`` raises
+        ``DuplicateCountError``; the real ``process_download_accessible_media``
+        catches it and returns False (WALL branch), the real ``process_wall_media``
+        propagates it, and ``download_wall`` breaks the pagination loop.
+        """
         config = mock_config
-        config.use_duplicate_threshold = False
+        config.use_duplicate_threshold = True
         config.use_pagination_duplication = False
         config.interactive = False
         config.timeline_retries = 0
         config.timeline_delay_seconds = 0
+        config.DUPLICATE_THRESHOLD = 50
         config.download_directory = Path(tmp_path)
         config.download_media_previews = False
         config.debug = False
@@ -205,26 +224,79 @@ class TestProcessWallMedia:
 
         await entity_store.save(Account(id=creator_id, username=state.creator_name))
 
-        wall_data = _wall_response(creator_id, post_count=3, media_count=1)
+        # Enough already-downloaded items that the running duplicate count
+        # crosses the WALL threshold (50) and download_media raises.
+        media_count = 55
+        wall_data = _wall_response(creator_id, post_count=3, media_count=media_count)
+        account_media = []
+        for am in wall_data["accountMedia"]:
+            inner_id = snowflake_id()
+            # Pre-record this media as fully downloaded so the real
+            # process_media_download returns None (skip → add_duplicate),
+            # avoiding any CDN request while still running the real pipeline.
+            await entity_store.save(
+                Media(
+                    id=inner_id,
+                    accountId=creator_id,
+                    mimetype="image/jpeg",
+                    is_downloaded=True,
+                    content_hash=f"hash_{inner_id}",
+                    local_filename=f"{inner_id}.jpg",
+                )
+            )
+            account_media.append(
+                {
+                    "id": am["id"],
+                    "accountId": creator_id,
+                    "mediaId": inner_id,
+                    "previewId": None,
+                    "createdAt": 1700000000,
+                    "deleted": False,
+                    "access": True,
+                    "mimetype": "image/jpeg",
+                    "media": {
+                        "id": inner_id,
+                        "accountId": creator_id,
+                        "mimetype": "image/jpeg",
+                        "createdAt": 1700000000,
+                        "is_downloaded": True,
+                        "content_hash": f"hash_{inner_id}",
+                        "local_filename": f"{inner_id}.jpg",
+                        "locations": [
+                            {
+                                "locationId": "1",
+                                "location": "https://cdn.example.com/img.jpg",
+                            }
+                        ],
+                    },
+                }
+            )
+
+        # short-circuit input_enter_continue's 15s fallback on error paths
+        async def _noop(_interactive):
+            return None
+
+        monkeypatch.setattr("download.common.input_enter_continue", _noop)
+        monkeypatch.setattr("download.wall.input_enter_continue", _noop)
+        monkeypatch.setattr("download.media.input_enter_continue", _noop)
+        monkeypatch.setattr("download.wall.sleep", scaled_async_sleep)
 
         route = respx.get(url__startswith=FANSLY_API).mock(
-            side_effect=[_ok(wall_data)],
+            side_effect=[_ok(wall_data), _ok(account_media)],
         )
 
-        # Spy on process_wall_media: let the call happen but override the return
-        spy = AsyncMock(return_value=False)
-        with patch("download.wall.process_wall_media", spy):
-            try:
-                await download_wall(config, state, snowflake_id())
-            finally:
-                dump_fansly_calls(route.calls, "test_returns_false_propagates")
+        try:
+            await download_wall(config, state, snowflake_id())
+        finally:
+            dump_fansly_calls(route.calls, "test_returns_false_propagates")
 
-        # Verify process_wall_media was called with the right media IDs
-        spy.assert_called_once()
-        call_args = spy.call_args
-        assert call_args[0][0] is config
-        assert call_args[0][1] is state
-        assert len(call_args[0][2]) > 0  # non-empty media IDs
+        # Real DuplicateCountError fired: duplicate count crossed threshold.
+        assert state.duplicate_count > config.DUPLICATE_THRESHOLD
+        # Loop broke after the first page: exactly the wall + account/media
+        # calls, no second pagination round.
+        assert len(route.calls) == 2
+        assert "timelinenew" in str(route.calls[0].request.url)
+        assert "account/media" in str(route.calls[1].request.url)
 
 
 # ── download_wall ───────────────────────────────────────────────────────
@@ -479,6 +551,117 @@ class TestDownloadWall:
 
         await download_wall(config, state, wall_id)
 
+    @pytest.mark.asyncio
+    async def test_access_changed_bypasses_unchanged_and_fetched_short_circuits(
+        self, respx_fansly_api, mock_config, entity_store, tmp_path, monkeypatch
+    ):
+        """state.creator_access_changed=True overrides BOTH the
+        creator_content_unchanged early-return AND the
+        fetched_timeline_duplication early-return. Without the bypass these
+        would skip the loop with zero HTTP calls; with the bypass we expect
+        at least one wall-page fetch (loop entered, paginating fully).
+        """
+        config = self._make_config(mock_config, tmp_path)
+        config.use_duplicate_threshold = True
+        config.use_pagination_duplication = True
+        config.respect_timeline_stats = True
+        creator_id = snowflake_id()
+        wall_id = snowflake_id()
+        state = self._make_state(creator_id)
+        # Both legacy short-circuits enabled — would normally skip the loop:
+        state.creator_content_unchanged = True
+        state.fetched_timeline_duplication = True
+        # Access change overrides both.
+        state.creator_access_changed = True
+        state.creator_access_change_reason = "sub-activated"
+
+        await entity_store.save(Account(id=creator_id, username=f"wall_{creator_id}"))
+        await entity_store.save(Wall(id=wall_id, name="W", accountId=creator_id))
+
+        route = respx.get(url__startswith=FANSLY_API).mock(
+            side_effect=[
+                _ok(_wall_response(creator_id, post_count=1, media_count=0)),
+                _ok(_wall_response(creator_id, post_count=0, media_count=0)),
+            ]
+        )
+        monkeypatch.setattr("download.wall.sleep", scaled_async_sleep)
+        monkeypatch.setattr("download.common.asyncio.sleep", scaled_async_sleep)
+
+        try:
+            await download_wall(config, state, wall_id)
+        finally:
+            dump_fansly_calls(
+                route.calls, "test_access_changed_bypasses_short_circuits"
+            )
+
+        # Loop entered: at least one wall-page fetched. Without the bypass
+        # both early-returns would short-circuit before any HTTP call.
+        assert route.call_count >= 1
+
+
+# ── wall_filters pipeline ────────────────────────────────────────────────
+
+
+class TestWallFilterPipeline:
+    """Filtered wall pass fetches ONLY the resolved wall's posts."""
+
+    def _make_state(self, creator_id):
+        state = DownloadState()
+        state.creator_id = creator_id
+        state.creator_name = f"wall_{creator_id}"
+        return state
+
+    def _make_config(self, mock_config, tmp_path):
+        mock_config.use_duplicate_threshold = False
+        mock_config.use_pagination_duplication = False
+        mock_config.debug = False
+        mock_config.show_downloads = True
+        mock_config.show_skipped_downloads = False
+        mock_config.interactive = False
+        mock_config.timeline_retries = 0
+        mock_config.timeline_delay_seconds = 0
+        mock_config.download_directory = Path(tmp_path)
+        mock_config.download_media_previews = False
+        return mock_config
+
+    @pytest.mark.asyncio
+    async def test_filter_prunes_wall_fetches(
+        self, respx_fansly_api, mock_config, entity_store, tmp_path
+    ):
+        """resolve_wall_filter narrows state.walls, and download_wall
+        issues wall-posts requests for only the resolved wallId."""
+        config = self._make_config(mock_config, tmp_path)
+        creator_id = snowflake_id()
+
+        await entity_store.save(Account(id=creator_id, username="creator1"))
+        wall_promos = Wall(id=snowflake_id(), accountId=creator_id, name="Promos")
+        wall_full = Wall(id=snowflake_id(), accountId=creator_id, name="FULL VIDEOS")
+        await entity_store.save(wall_promos)
+        await entity_store.save(wall_full)
+
+        state = self._make_state(creator_id)
+        state.creator_name = "creator1"
+        state.walls = {wall_promos.id, wall_full.id}
+
+        config.wall_filters = {"creator1": WallFilterSpec(includes=["FULL VIDEOS"])}
+
+        route = respx.get(url__startswith=FANSLY_API).mock(
+            side_effect=[_ok(_wall_response(creator_id, post_count=0, media_count=0))]
+        )
+
+        try:
+            resolved = await resolve_wall_filter(config, state)
+            for wall_id in sorted(resolved):
+                await download_wall(config, state, wall_id)
+        finally:
+            dump_fansly_calls(route.calls, "test_filter_prunes_wall_fetches")
+
+        assert resolved == {wall_full.id}
+        called_wall_ids = {
+            call.request.url.params.get("wallId") for call in route.calls
+        }
+        assert called_wall_ids == {str(wall_full.id)}
+
 
 # ---------------------------------------------------------------------------
 # Edge coverage — short-circuit + raise + outer exception paths
@@ -529,7 +712,10 @@ class TestDownloadWallEdges:
             side_effect=[httpx.Response(500, text="should not be called")]
         )
 
-        await download_wall(config, state, wall_id)
+        try:
+            await download_wall(config, state, wall_id)
+        finally:
+            dump_fansly_calls(route.calls, "test_creator_content_unchanged")
 
         # No HTTP call was issued — early return before the loop.
         assert len(route.calls) == 0
@@ -622,12 +808,15 @@ class TestDownloadWallEdges:
 
         # Pre-mount an empty wall response for the second iteration (which now
         # has a valid creator_id). respx_fansly_api fixture provides the route.
-        respx.get(url__startswith=FANSLY_API).mock(
+        route = respx.get(url__startswith=FANSLY_API).mock(
             side_effect=[_ok(_wall_response(creator_id, post_count=0, media_count=0))]
         )
 
         # Should NOT raise — outer except catches RuntimeError.
-        await download_wall(config, state, snowflake_id())
+        try:
+            await download_wall(config, state, snowflake_id())
+        finally:
+            dump_fansly_calls(route.calls, "test_creator_id_none_runtime_error")
 
         errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
         assert any("Unexpected error during wall download" in m for m in errors)

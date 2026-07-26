@@ -5,7 +5,6 @@ Uses real database and factory objects, mocks only Stash API calls via respx.
 
 import asyncio
 import logging
-from unittest.mock import patch
 
 import httpx
 import pytest
@@ -13,7 +12,7 @@ import respx
 from stash_graphql_client.types import Performer
 
 from metadata import Account, ContentType
-from tests.fixtures import (
+from tests.fixtures.metadata import (
     AccountMediaFactory,
     MediaFactory,
     PostFactory,
@@ -88,8 +87,6 @@ class TestBackgroundProcessing:
             urls=["https://fansly.com/test_user"],
             parent_studio=fansly_studio,
         )
-        empty_galleries = {"count": 0, "galleries": []}
-
         graphql_route = respx.post("http://localhost:9999/graphql").mock(
             side_effect=[
                 # process_creator_studio: find Fansly parent
@@ -107,14 +104,16 @@ class TestBackgroundProcessing:
                 httpx.Response(
                     200, json=create_graphql_response("studioCreate", creator_studio)
                 ),
-                # process_creator_posts: check for existing galleries (has 1 post with attachment)
+                # _run_file_first: the creator's file sweep finds nothing.
                 httpx.Response(
-                    200, json=create_graphql_response("findGalleries", empty_galleries)
+                    200, json={"data": {"findFiles": {"count": 0, "files": []}}}
                 ),
             ]
         )
 
-        # Act - let real flow execute with real database queries
+        # Act - run the full real wrapper (studio + stash_id + file-first content
+        # + cleanup). The seeded post has no Stash file, so the sweep's findFiles
+        # is empty and nothing is adjudicated.
         try:
             await respx_stash_processor._safe_background_processing(
                 account, mock_performer
@@ -131,8 +130,7 @@ class TestBackgroundProcessing:
         found_account = await entity_store.get(Account, acct_id)
         assert found_account is not None
 
-        # Verify GraphQL call sequence (no preload - continue_stash_processing
-        # is called directly, preload only happens in start_creator_processing)
+        # Verify GraphQL call sequence — the real studio flow then the real sweep.
         calls = graphql_route.calls
         assert len(calls) == 4, f"Expected 4 GraphQL calls, got {len(calls)}"
 
@@ -140,82 +138,54 @@ class TestBackgroundProcessing:
         assert_op(calls[0], "findStudios")
         assert_op(calls[1], "findStudios")
         assert_op(calls[2], "studioCreate")
-        assert_op(calls[3], "findGalleries")
-
-    @pytest.mark.asyncio
-    async def test_safe_background_processing_cancelled(
-        self, respx_stash_processor, entity_store, mock_performer, caplog
-    ):
-        """Test _safe_background_processing handles CancelledError with real DB queries.
-
-        Simulates task cancellation during GraphQL call by patching at continue_stash_processing level.
-        """
-        caplog.set_level(logging.DEBUG)
-        acct_id = snowflake_id()
-
-        # Create real account
-        account = AccountFactory.build(id=acct_id, username="test_cancel", stash_id=124)
-        await entity_store.save(account)
-
-        # Patch continue_stash_processing to raise CancelledError (simulates task cancellation).
-        # Acceptable: we're testing _safe_background_processing's error handling, not the
-        # continue_stash_processing flow itself.
-        with (
-            patch.object(
-                respx_stash_processor,
-                "continue_stash_processing",
-                side_effect=asyncio.CancelledError(),
-            ),
-            pytest.raises(asyncio.CancelledError),
-        ):
-            await respx_stash_processor._safe_background_processing(
-                account, mock_performer
-            )
-
-        # Production emits a DEBUG record from logger.debug() acknowledging cancellation.
-        debug_records = [r for r in caplog.records if r.levelname == "DEBUG"]
-        cancel_logs = [
-            r.getMessage()
-            for r in debug_records
-            if "cancelled" in r.getMessage().lower()
-        ]
-        assert len(cancel_logs) >= 1
-        # debug_print emits a separate DEBUG record (pformatted dict) tagged with the status.
-        cancel_status_logs = [
-            r.getMessage()
-            for r in debug_records
-            if "background_task_cancelled" in r.getMessage()
-        ]
-        assert len(cancel_status_logs) == 1
-        assert respx_stash_processor._cleanup_event.is_set()
+        assert_op(calls[3], "findFiles")
 
     @pytest.mark.asyncio
     async def test_safe_background_processing_exception(
         self, respx_stash_processor, entity_store, mock_performer, caplog
     ):
-        """Test _safe_background_processing handles exceptions with real DB queries.
+        """_safe_background_processing handles a failure raised by the REAL pipeline.
 
-        Simulates processing error by patching at continue_stash_processing level.
+        Drives failure through the real continue_stash_processing: the first
+        Stash GraphQL POST (findStudios in process_creator_studio) returns HTTP
+        500, so the real method raises a StashConnectionError, and
+        _safe_background_processing's generic `except Exception` branch runs
+        end-to-end (no behavior-replacing mock of continue_stash_processing).
+
+        Regression: this real path surfaced a production bug. The except block
+        logged via ``logger.exception(f"Background task failed: {e}", ...)``; the
+        f-string interpolated an exception whose repr contains literal braces
+        (``[{'message': 'boom'}]``), which loguru fed to ``str.format()`` →
+        ``KeyError('message')``, masking the real failure. Fixed in base.py to a
+        static message + ``exc_info=e`` (sibling convention, file_first.py:109).
         """
         caplog.set_level(logging.DEBUG)
         acct_id = snowflake_id()
 
-        # Create real account
-        account = AccountFactory.build(id=acct_id, username="test_error", stash_id=125)
+        # Real account; stash_id matches performer.id ("123") so the real method
+        # skips _update_account_stash_id and the first POST is findStudios.
+        account = AccountFactory.build(id=acct_id, username="test_err", stash_id=123)
         await entity_store.save(account)
+        mock_performer.id = "123"
 
-        # Patch continue_stash_processing to raise error (simulates processing failure).
-        with (
-            patch.object(
-                respx_stash_processor,
-                "continue_stash_processing",
-                side_effect=Exception("Test error"),
-            ),
-            pytest.raises(Exception, match="Test error"),
-        ):
-            await respx_stash_processor._safe_background_processing(
-                account, mock_performer
+        # 500 on the first findStudios POST drives the real failure. The error
+        # body deliberately carries braces to guard the loguru-format regression.
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[httpx.Response(500, json={"errors": [{"message": "boom"}]})]
+        )
+
+        try:
+            with pytest.raises(Exception):
+                await respx_stash_processor._safe_background_processing(
+                    account, mock_performer
+                )
+        finally:
+            dump_graphql_calls(
+                graphql_route.calls, "test_safe_background_processing_exception"
             )
+
+        # The real first GraphQL call was attempted.
+        assert graphql_route.called
 
         # logger.exception → ERROR record with exc_info attached.
         error_records = [r for r in caplog.records if r.levelname == "ERROR"]
@@ -233,6 +203,100 @@ class TestBackgroundProcessing:
             if r.levelname == "DEBUG" and "background_task_failed" in r.getMessage()
         ]
         assert len(debug_status_logs) == 1
+        assert respx_stash_processor._cleanup_event.is_set()
+
+    @pytest.mark.asyncio
+    async def test_safe_background_processing_cancelled(
+        self, respx_stash_processor, entity_store, mock_performer, caplog
+    ):
+        """_safe_background_processing handles CancelledError from the REAL pipeline.
+
+        gql's transport wraps any transport-layer exception (including a
+        respx-injected CancelledError) into TransportConnectionFailed, so a true
+        asyncio.CancelledError cannot survive injection at the respx layer.
+        Instead we spy on continue_stash_processing with ``wraps=`` so the REAL
+        method runs end-to-end (real studio + file-first flow against the four
+        seeded GraphQL responses), then raises CancelledError — mimicking task
+        cancellation at await-completion. This exercises the real method while
+        delivering a genuine CancelledError to the `except asyncio.CancelledError`
+        branch (NOT a behavior-replacing AsyncMock).
+        """
+        caplog.set_level(logging.DEBUG)
+        acct_id = snowflake_id()
+
+        account = AccountFactory.build(id=acct_id, username="test_cancel", stash_id=123)
+        await entity_store.save(account)
+        mock_performer.id = "123"
+
+        # The real continue_stash_processing needs the full successful studio +
+        # file-first response sequence to run to completion before we cancel.
+        fansly_studio = create_studio_dict(
+            id="10400", name="Fansly (network)", urls=["https://fansly.com"]
+        )
+        fansly_result = create_find_studios_result(count=1, studios=[fansly_studio])
+        creator_not_found_result = create_find_studios_result(count=0, studios=[])
+        creator_studio = create_studio_dict(
+            id="123",
+            name="test_cancel (Fansly)",
+            urls=["https://fansly.com/test_cancel"],
+            parent_studio=fansly_studio,
+        )
+        graphql_route = respx.post("http://localhost:9999/graphql").mock(
+            side_effect=[
+                httpx.Response(
+                    200, json=create_graphql_response("findStudios", fansly_result)
+                ),
+                httpx.Response(
+                    200,
+                    json=create_graphql_response(
+                        "findStudios", creator_not_found_result
+                    ),
+                ),
+                httpx.Response(
+                    200, json=create_graphql_response("studioCreate", creator_studio)
+                ),
+                httpx.Response(
+                    200, json={"data": {"findFiles": {"count": 0, "files": []}}}
+                ),
+            ]
+        )
+
+        # wraps-spy: delegate to the real bound method, then raise CancelledError.
+        real_continue = respx_stash_processor.continue_stash_processing
+
+        async def cancel_after_real(account, performer):
+            await real_continue(account, performer)
+            raise asyncio.CancelledError
+
+        respx_stash_processor.continue_stash_processing = cancel_after_real
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await respx_stash_processor._safe_background_processing(
+                    account, mock_performer
+                )
+        finally:
+            respx_stash_processor.continue_stash_processing = real_continue
+            dump_graphql_calls(
+                graphql_route.calls, "test_safe_background_processing_cancelled"
+            )
+
+        # The real pipeline ran end-to-end before the cancel.
+        assert graphql_route.called
+        assert len(graphql_route.calls) == 4
+
+        debug_records = [r for r in caplog.records if r.levelname == "DEBUG"]
+        cancel_logs = [
+            r.getMessage()
+            for r in debug_records
+            if "cancelled" in r.getMessage().lower()
+        ]
+        assert len(cancel_logs) >= 1
+        cancel_status_logs = [
+            r.getMessage()
+            for r in debug_records
+            if "background_task_cancelled" in r.getMessage()
+        ]
+        assert len(cancel_status_logs) == 1
         assert respx_stash_processor._cleanup_event.is_set()
 
     @pytest.mark.asyncio
@@ -290,10 +354,16 @@ class TestBackgroundProcessing:
                 httpx.Response(
                     200, json=create_graphql_response("studioCreate", creator_studio)
                 ),
+                # _run_file_first: the creator's file sweep finds nothing.
+                httpx.Response(
+                    200, json={"data": {"findFiles": {"count": 0, "files": []}}}
+                ),
             ]
         )
 
-        # Act - let real orchestration flow execute
+        # Act - run the real wrapper end-to-end INCLUDING the file-first content
+        # flow. The creator has no Stash files, so the sweep's findFiles is empty
+        # and no entities are adjudicated.
         try:
             await respx_stash_processor.continue_stash_processing(
                 account, mock_performer
@@ -301,12 +371,9 @@ class TestBackgroundProcessing:
         finally:
             dump_graphql_calls(graphql_route.calls, "test_continue_stash_processing")
 
-        # Assert - verify correct GraphQL requests were sent
-        # Only 3 calls: studio lookup + creation. No findGalleries because
-        # account has no posts/messages in database — _run_worker_pool exits
-        # with empty items.
+        # Assert - the real studio flow then the real file-first sweep.
         calls = graphql_route.calls
-        assert len(calls) == 3, f"Expected 3 GraphQL calls, got {len(calls)}"
+        assert len(calls) == 4, f"Expected 4 GraphQL calls, got {len(calls)}"
 
         # Verify GraphQL call sequence — studioCreate variables are part of
         # the same assertion since this test cares about the studio's identity.
@@ -318,6 +385,7 @@ class TestBackgroundProcessing:
             input__name="test_user (Fansly)",
             input__urls=["https://fansly.com/test_user"],
         )
+        assert_op(calls[3], "findFiles")
 
     @pytest.mark.asyncio
     async def test_continue_stash_processing_stash_id_update(
@@ -369,10 +437,15 @@ class TestBackgroundProcessing:
                 httpx.Response(
                     200, json=create_graphql_response("studioCreate", creator_studio)
                 ),
+                # _run_file_first: the creator's file sweep finds nothing.
+                httpx.Response(
+                    200, json={"data": {"findFiles": {"count": 0, "files": []}}}
+                ),
             ]
         )
 
-        # Act
+        # Act - run the real wrapper end-to-end (stash_id DB update + studio flow
+        # + file-first content). No Stash files → empty findFiles sweep.
         try:
             await respx_stash_processor.continue_stash_processing(
                 account, mock_performer
@@ -389,10 +462,9 @@ class TestBackgroundProcessing:
         assert updated_account is not None
         assert updated_account.stash_id == 456  # int, not str
 
-        # Verify GraphQL call sequence — no findGalleries calls because the
-        # account has no posts/messages, so _run_worker_pool exits early.
+        # Verify GraphQL call sequence — the real studio flow then the real sweep.
         calls = graphql_route.calls
-        assert len(calls) == 3, f"Expected 3 GraphQL calls, got {len(calls)}"
+        assert len(calls) == 4, f"Expected 4 GraphQL calls, got {len(calls)}"
 
         # Verify query types in order — studioCreate variables are part of
         # the same assertion since this test cares about the studio's identity.
@@ -404,6 +476,7 @@ class TestBackgroundProcessing:
             input__name="test_user2 (Fansly)",
             input__urls=["https://fansly.com/test_user2"],
         )
+        assert_op(calls[3], "findFiles")
 
     @pytest.mark.asyncio
     async def test_continue_stash_processing_missing_inputs(
@@ -468,10 +541,14 @@ class TestBackgroundProcessing:
                 httpx.Response(
                     200, json=create_graphql_response("studioCreate", creator_studio)
                 ),
+                # _run_file_first: the creator's file sweep finds nothing.
+                httpx.Response(
+                    200, json={"data": {"findFiles": {"count": 0, "files": []}}}
+                ),
             ]
         )
 
-        # Act - Pass Performer object directly
+        # Act - Pass Performer object directly; run the full real wrapper.
         try:
             await respx_stash_processor.continue_stash_processing(account, performer)
         finally:
@@ -480,10 +557,9 @@ class TestBackgroundProcessing:
                 "test_continue_stash_processing_performer_dict",
             )
 
-        # Verify GraphQL call sequence — no findGalleries calls because the
-        # account has no posts/messages, so _run_worker_pool exits early.
+        # Verify GraphQL call sequence — the real studio flow then the real sweep.
         calls = graphql_route.calls
-        assert len(calls) == 3, f"Expected 3 GraphQL calls, got {len(calls)}"
+        assert len(calls) == 4, f"Expected 4 GraphQL calls, got {len(calls)}"
 
         # Verify query types in order — studioCreate variables are part of
         # the same assertion since this test cares about the studio's identity.
@@ -495,6 +571,7 @@ class TestBackgroundProcessing:
             input__name="test_user3 (Fansly)",
             input__urls=["https://fansly.com/test_user3"],
         )
+        assert_op(calls[3], "findFiles")
 
     @pytest.mark.asyncio
     async def test_continue_stash_processing_invalid_performer_type(

@@ -1,15 +1,10 @@
 """Web Utilities"""
 
-import platform
-import re
-import traceback
-from collections import OrderedDict, namedtuple
+from collections import OrderedDict
 from typing import NamedTuple
 from urllib.parse import parse_qs, urlparse, urlunparse
 
 import httpx
-
-from textio import print_error, print_warning
 
 
 def strip_url_params(url: str) -> str:
@@ -64,15 +59,14 @@ def get_qs_value(url: str, key: str, default: str | None = None) -> str | None:
     qs = parsed_url.query
     parsed_qs = parse_qs(qs)
 
-    result = parsed_qs.get(key, default)
+    if key not in parsed_qs:
+        return default
 
-    if result is default:
-        return result
-
-    if len(result) == 0:
+    values = parsed_qs[key]
+    if len(values) == 0:
         return None
 
-    return result[0]
+    return values[0]
 
 
 def get_flat_qs_dict(url: str) -> dict[str, str]:
@@ -102,7 +96,14 @@ def get_flat_qs_dict(url: str) -> dict[str, str]:
     return new_dict
 
 
-def split_url(url: str) -> NamedTuple:
+class SplitURL(NamedTuple):
+    """Result of :func:`split_url` — base and file-name URLs."""
+
+    base_url: str
+    file_url: str
+
+
+def split_url(url: str) -> SplitURL:
     """Splits an URL into absolue base and file name URLs
     without query strings et al.
 
@@ -124,64 +125,7 @@ def split_url(url: str) -> NamedTuple:
     # Base URL
     base_url = file_url.rsplit("/", 1)[0]
 
-    SplitURL = namedtuple("SplitURL", ["base_url", "file_url"])
-
     return SplitURL(base_url, file_url)
-
-
-def guess_user_agent(user_agents: dict, based_on_browser: str, default_ua: str) -> str:
-    """Returns the guessed browser's user agent or a default one."""
-
-    if based_on_browser == "Microsoft Edge":
-        based_on_browser = "Edg"  # msedge only reports "Edg" as its identifier
-
-        # could do the same for opera, opera gx, brave. but those are not supported by @jnrbsn's repo. so we just return chrome ua
-        # in general his repo, does not provide the most accurate latest user-agents, if I am borred some time in the future,
-        # I might just write my own similar repo and use that instead
-
-    os_name = platform.system()
-
-    try:
-        if os_name == "Windows":
-            for user_agent in user_agents:
-                if based_on_browser in user_agent and "Windows" in user_agent:
-                    match = re.search(r"Windows NT ([\d.]+)", user_agent)
-                    if match:
-                        os_version = match.group(1)
-                        # Plain capture — group(1) is always a substring of user_agent.
-                        if os_version in user_agent:  # pragma: no cover
-                            return user_agent
-
-        elif os_name == "Darwin":  # macOS
-            for user_agent in user_agents:
-                if based_on_browser in user_agent and "Macintosh" in user_agent:
-                    match = re.search(r"Mac OS X ([\d_.]+)", user_agent)
-                    if match:
-                        os_version = match.group(1).replace("_", ".")
-                        if os_version in user_agent:
-                            return user_agent
-
-        elif os_name == "Linux":
-            for user_agent in user_agents:
-                if based_on_browser in user_agent and "Linux" in user_agent:
-                    match = re.search(r"Linux ([\d.]+)", user_agent)
-                    if match:
-                        os_version = match.group(1)
-                        # Plain capture — group(1) is always a substring of user_agent.
-                        if os_version in user_agent:  # pragma: no cover
-                            return user_agent
-
-    except Exception:
-        print_error(
-            f"Regexing user-agent from online source failed: {traceback.format_exc()}",
-            4,
-        )
-
-    print_warning(
-        f"Missing user-agent for {based_on_browser} & OS: {os_name}. Chrome & Windows UA will be used instead."
-    )
-
-    return default_ua
 
 
 def get_release_info_from_github(current_program_version: str) -> dict | None:

@@ -1,10 +1,11 @@
 """Argument Parsing and Configuration Mapping"""
 
 import argparse
+import json
 from datetime import UTC, datetime
 from functools import partial
 from pathlib import Path
-from typing import Any, get_args
+from typing import get_args
 
 from pydantic import BaseModel, SecretStr
 
@@ -15,6 +16,7 @@ from helpers.rich_progress import get_rich_console
 
 from .config import parse_items_from_line, sanitize_creator_names
 from .fanslyconfig import FanslyConfig
+from .media_filters import parse_duration, parse_size, resolution_threshold
 from .modes import DownloadMode
 from .schema import (
     CacheSection,
@@ -28,6 +30,7 @@ from .schema import (
     StashContextSection,
     TargetedCreatorSection,
 )
+from .wall_filters import WallFilterSpec, normalize_wall_filters
 
 
 _GENERATE_CONFIG_HEADER = """\
@@ -91,12 +94,12 @@ _SHOW_CONFIG_SECTIONS: list[tuple[str, type[BaseModel]]] = [
 ]
 
 
-def _is_blank_eligible(annotation: Any) -> bool:
+def _is_blank_eligible(annotation: object) -> bool:
     """True iff the field's type annotation includes ``None`` (X | None / Optional[X])."""
     return type(None) in get_args(annotation)
 
 
-def _format_field_value(value: Any, *, blank_eligible: bool) -> str:
+def _format_field_value(value: object, *, blank_eligible: bool) -> str:
     """Render a field's value for ``--show-config`` output.
 
     Rules:
@@ -325,6 +328,19 @@ def parse_args() -> argparse.Namespace:
         "A post ID must be at least 10 characters and consist of digits only."
         "Example - https://fansly.com/post/1283998432982 -> ID is: 1283998432982",
     )
+    download_modes.add_argument(
+        "--wall-filters",
+        required=False,
+        default=None,
+        metavar="SPEC",
+        dest="download_mode_wall_filters",
+        help='Use "Wall" download mode restricted to specific wall(s). '
+        "SPEC is either a JSON mapping of creators to wall lists/specs "
+        '(\'{"creator1": ["FULL VIDEOS"]}\') or, together with exactly '
+        "one -u creator, a comma-separated list of wall names/IDs "
+        "('FULL VIDEOS,Promos'). Wall names are matched "
+        "case-insensitively; all-digit tokens of 10+ chars are wall IDs.",
+    )
 
     # endregion Download Modes
 
@@ -487,6 +503,54 @@ def parse_args() -> argparse.Namespace:
         "Higher values allow exponential backoff to reach maximum backoff time "
         "(30s → 60s → 120s → 240s → 300s max) before giving up. "
         "Lower values may cause downloads to fail during sustained rate limiting.",
+    )
+    parser.add_argument(
+        "--file-size-min",
+        required=False,
+        default=None,
+        metavar="SIZE",
+        dest="file_size_min",
+        help="Skip media smaller than SIZE (e.g. 100KB, 5MB, raw bytes). "
+        "0 disables the limit for this run. Ephemeral override of "
+        "filters.media in config.yaml.",
+    )
+    parser.add_argument(
+        "--file-size-max",
+        required=False,
+        default=None,
+        metavar="SIZE",
+        dest="file_size_max",
+        help="Skip media larger than SIZE (e.g. 4GB). 0 disables for this run.",
+    )
+    parser.add_argument(
+        "--duration-min",
+        required=False,
+        default=None,
+        metavar="DURATION",
+        dest="duration_min",
+        help="Skip videos shorter than DURATION (e.g. 3, 0:03, 45s). "
+        "0 disables for this run.",
+    )
+    parser.add_argument(
+        "--duration-max",
+        required=False,
+        default=None,
+        metavar="DURATION",
+        dest="duration_max",
+        help="Skip videos longer than DURATION (e.g. 5400, 1:30:00, 2h). "
+        "0 disables for this run.",
+    )
+    parser.add_argument(
+        "--max-resolution",
+        required=False,
+        default=None,
+        metavar="RES",
+        dest="max_resolution",
+        help="Cap download resolution to a tier (240p, 360p, 480p, 720p, "
+        "1080p, 1440p, 4k) or a shorter-edge pixel integer. Renditions above "
+        "the cap are downscaled to the highest that fits, or skipped if none "
+        "fits. 'off' / 'none' / 0 disables for this run. Ephemeral override "
+        "of filters.media.",
     )
 
     # PostgreSQL arguments
@@ -793,7 +857,100 @@ def _handle_download_mode(
         config._ephemeral_overrides.add("download_mode")
         return True, True
 
+    # --wall-filters implies (and enforces, via the mutually-exclusive
+    # group) WALL mode; the SPEC itself is applied later by
+    # _apply_cli_wall_filters once -u has been processed.
+    if args.download_mode_wall_filters is not None:
+        config.download_mode = DownloadMode.WALL
+        config._ephemeral_overrides.add("download_mode")
+        return True, True
+
     return config_overridden, download_mode_set
+
+
+def _apply_cli_wall_filters(args: argparse.Namespace, config: FanslyConfig) -> None:
+    """Parse --wall-filters SPEC (JSON or bare form) onto the config.
+
+    Args:
+        args: Parsed CLI namespace.
+        config: The configuration to apply the ephemeral filter to.
+
+    Raises:
+        ConfigError: On invalid JSON, a -u/JSON-key mismatch, or a bare
+            SPEC without exactly one -u creator.
+    """
+    if args.download_mode_wall_filters is None:
+        return
+
+    raw = args.download_mode_wall_filters.strip()
+    if raw.startswith("{"):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise ConfigError(
+                f"Argument error - --wall-filters is not valid JSON: {e}"
+            ) from e
+        filters = normalize_wall_filters(parsed)
+        if not filters:
+            raise ConfigError("Argument error - --wall-filters got an empty spec.")
+        keys = set(filters)
+        if args.users is not None:
+            if config.user_names != keys:
+                raise ConfigError(
+                    "Argument error - the -u list must exactly match the "
+                    "--wall-filters JSON keys. "
+                    f"-u gave: {', '.join(sorted(config.user_names or set()))}; "
+                    f"--wall-filters JSON keys: {', '.join(sorted(keys))}."
+                )
+        else:
+            config.user_names = set(keys)
+            config._ephemeral_overrides.add("user_names")
+    else:
+        if (
+            args.users is None
+            or config.user_names is None
+            or len(config.user_names) != 1
+        ):
+            raise ConfigError(
+                "Argument error - the bare --wall-filters form requires "
+                "exactly one -u creator."
+            )
+        tokens = [t.strip() for t in raw.split(",") if t.strip()]
+        if not tokens:
+            raise ConfigError("Argument error - --wall-filters got an empty spec.")
+        filters = {next(iter(config.user_names)): WallFilterSpec(includes=tokens)}
+
+    config.wall_filters = filters
+    config._ephemeral_overrides.add("wall_filters")
+
+
+def _apply_media_filter_args(args: argparse.Namespace, config: FanslyConfig) -> None:
+    """Apply --file-size-*/--duration-*/--max-resolution as ephemeral global-layer overrides."""
+    update: dict[str, int | float | str | None] = {}
+    if args.file_size_min is not None:
+        update["file_size_min"] = parse_size(args.file_size_min)
+    if args.file_size_max is not None:
+        update["file_size_max"] = parse_size(args.file_size_max)
+    if args.duration_min is not None:
+        update["duration_min"] = parse_duration(args.duration_min)
+    if args.duration_max is not None:
+        update["duration_max"] = parse_duration(args.duration_max)
+    if args.max_resolution is not None:
+        raw = args.max_resolution.strip()
+        if raw.lower() in ("off", "none", "0"):
+            update["max_resolution"] = None
+        else:
+            resolution_threshold(raw)  # validate; raises ConfigError on garbage
+            update["max_resolution"] = raw
+    if not update:
+        return
+    config.media_filters = config.media_filters.model_copy(update=update)
+    config.media_filters.ensure_valid("CLI")
+    for creator in config.media_filters.by_creator:
+        config.media_filters.for_creator(creator, None).ensure_valid(
+            f"CLI+by_creator.{creator}"
+        )
+    config._ephemeral_overrides.add("media_filters")
 
 
 def _handle_path_settings(
@@ -989,6 +1146,9 @@ def map_args_to_config(args: argparse.Namespace, config: FanslyConfig) -> bool:
     _, mode_set = _handle_download_mode(args, config)
     if mode_set:
         download_mode_set = True
+
+    _apply_cli_wall_filters(args, config)
+    _apply_media_filter_args(args, config)
 
     _handle_not_none_settings(args, config)
     _handle_boolean_settings(args, config)

@@ -20,7 +20,7 @@ import random
 import time
 from datetime import UTC, datetime
 
-import factory
+from factory.base import Factory
 from factory.declarations import LazyAttribute, LazyFunction, Sequence
 from faker import Faker
 from faker.providers import BaseProvider
@@ -128,7 +128,7 @@ class FanslyContentProvider(BaseProvider):
     MEDIUM_TEMPLATES = [
         "Do you like my outfit? 😈\n\n{hashtags}",
         "Living the dream! 😎💜\n\n{hashtags}",
-        "Will it go in….\n\n{hashtags}",
+        "Will it go in...\n\n{hashtags}",
         "Do you immediately shove it in me, or will you give me a good spanking first? 😈\n\n{hashtags}",
         "Slide my panties to the side and pleasure me 🥵🥵\n\n{hashtags}",
         "And here are a few impressions from yesterday's session 🥺\n\n{hashtags}",
@@ -250,7 +250,7 @@ fake = Faker()
 fake.add_provider(FanslyContentProvider)
 
 
-class BaseFactory(factory.Factory):
+class BaseFactory(Factory):
     """Base factory for all Pydantic model factories.
 
     Creates in-memory model instances with realistic defaults.
@@ -707,7 +707,9 @@ async def create_groups_from_messages(messages: list[dict]) -> None:
 
             existing = store.get_from_cache(Group, group_id)
             if not existing:
-                created_by_id = int(msg.get("senderId") or msg.get("recipientId"))
+                sender = msg.get("senderId") or msg.get("recipientId")
+                assert sender is not None
+                created_by_id = int(sender)
                 group = Group(id=group_id, createdBy=created_by_id)
                 await store.save(group)
 

@@ -1,17 +1,18 @@
 """Configuration Validation"""
 
-# import re
 import asyncio
 import importlib.util
+import platform
+import re
 from pathlib import Path
 
-import httpx
+import ua_generator
+from ua_generator.options import Options
 
 from config.logging import textio_logger
 from config.modes import DownloadMode
 from errors import ConfigError
 from helpers.browser import open_get_started_url
-from helpers.web import guess_user_agent
 from pathio.pathio import ask_correct_dir
 from textio.prompts import aconfirm, aprompt_text
 from textio.textio import input_enter_continue
@@ -269,68 +270,94 @@ async def validate_adjust_token(config: FanslyConfig) -> None:
         )
 
 
+# Host os.platform.system() -> ua_generator platform token.
+_HOST_OS_TO_UA_PLATFORM = {
+    "Windows": "windows",
+    "Darwin": "macos",
+    "Linux": "linux",
+}
+
+# Normalised browser name (from parse_browser_from_string) -> ua_generator
+# browser token. Chromium-based browsers ua_generator doesn't model
+# (Brave, Opera, Opera GX) report a Chrome-family UA, so they map to chrome.
+_BROWSER_NAME_TO_UA_BROWSER = {
+    "Chrome": "chrome",
+    "Chromium": "chrome",
+    "Microsoft Edge": "edge",
+    "Edge": "edge",
+    "Firefox": "firefox",
+    "Brave": "chrome",
+    "Opera": "chrome",
+    "Opera GX": "chrome",
+}
+
+# ua_generator version policy: bias toward recent versions, capped to the
+# latest few per browser, so generated UAs stay current and plausible.
+_UA_OPTIONS = Options(
+    weighted_versions=True,
+    latest_versions={"chrome": 3, "edge": 3, "firefox": 1, "safari": 3},
+)
+
+# Real browsers freeze the macOS version token in the UA regardless of the
+# actual OS: Chromium and Safari report "10_15_7", Firefox reports "10.15".
+# ua_generator does not model this and emits the literal selected version
+# (e.g. "26_5"), which no real browser produces — so normalise it.
+_MACOS_TOKEN_RE = re.compile(r"Mac OS X [\d_.]+")
+
+
+def _freeze_macos_token(user_agent: str, ua_browser: str) -> str:
+    """Pin the ``Mac OS X`` token to the value real browsers freeze it at."""
+    frozen = "10.15" if ua_browser == "firefox" else "10_15_7"
+    return _MACOS_TOKEN_RE.sub(f"Mac OS X {frozen}", user_agent)
+
+
 def validate_adjust_user_agent(config: FanslyConfig) -> None:
-    # validate input value for "user_agent" in config.ini
     """Validates the input value for `user_agent` in `config.ini`.
+
+    When the configured user-agent is missing or implausible, generate a
+    real desktop user-agent with ua_generator, matched to the host OS and
+    (when known) the browser the auth token came from, then persist it.
 
     :param FanslyConfig config: The configuration to validate and correct.
     """
+    if config.useragent_is_valid():
+        return
 
-    # if no matches / error just set random UA
-    ua_if_failed = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.0.0 Safari/537.36"
+    textio_logger.warning(
+        f"Browser user-agent '{config.user_agent}' in config.ini is most likely incorrect."
+    )
 
-    based_on_browser = config.token_from_browser_name or "Chrome"
-
-    if not config.useragent_is_valid():
-        textio_logger.warning(
-            f"Browser user-agent '{config.user_agent}' in config.ini is most likely incorrect."
-        )
-
-        if config.token_from_browser_name is not None:
-            textio_logger.info(
-                f"Adjusting it with an educated guess based on the combination of your \n"
-                f"{19 * ' '}operating system & specific browser."
-            )
-
-        else:
-            textio_logger.info(
-                f"Adjusting it with an educated guess, hardcoded for Chrome browser."
-                f"\n{19 * ' '}If you're not using Chrome you might want to replace it in the config.ini file later on."
-                f"\n{19 * ' '}More information regarding this topic is on the Fansly Downloader NG Wiki."
-            )
-
-        try:
-            # thanks Jonathan Robson (@jnrbsn) - for continuously providing these up-to-date user-agents
-            user_agent_response = httpx.get(
-                "https://jnrbsn.github.io/user-agents/user-agents.json",
-                headers={
-                    "User-Agent": ua_if_failed,
-                    "accept-language": "en-US,en;q=0.9",
-                },
-                timeout=30.0,
-                follow_redirects=True,
-            )
-
-            if user_agent_response.status_code == 200:
-                config_user_agent = guess_user_agent(
-                    user_agent_response.json(),
-                    based_on_browser,
-                    default_ua=ua_if_failed,
-                )
-            else:
-                config_user_agent = ua_if_failed
-
-        except httpx.HTTPError:
-            config_user_agent = ua_if_failed
-
-        # save useragent modification to config file
-        config.user_agent = config_user_agent
-
-        save_config_or_raise(config)
-
+    if config.token_from_browser_name is not None:
         textio_logger.info(
-            "Success! Applied a browser user-agent to config.ini file.\n"
+            f"Adjusting it with an educated guess based on the combination of your \n"
+            f"{19 * ' '}operating system & specific browser."
         )
+    else:
+        textio_logger.info(
+            f"Adjusting it with an educated guess, hardcoded for Chrome browser."
+            f"\n{19 * ' '}If you're not using Chrome you might want to replace it in the config.ini file later on."
+            f"\n{19 * ' '}More information regarding this topic is on the Fansly Downloader NG Wiki."
+        )
+
+    ua_platform = _HOST_OS_TO_UA_PLATFORM.get(platform.system(), "windows")
+    ua_browser = _BROWSER_NAME_TO_UA_BROWSER.get(
+        config.token_from_browser_name or "", "chrome"
+    )
+    # ua_generator types platform/browser as a closed Literal; our lookup
+    # dicts only ever yield valid tokens, so a plain str is correct at runtime.
+    user_agent = ua_generator.generate(
+        device="desktop",
+        platform=ua_platform,  # type: ignore[arg-type]
+        browser=ua_browser,  # type: ignore[arg-type]
+        options=_UA_OPTIONS,
+    ).text
+    if ua_platform == "macos":
+        user_agent = _freeze_macos_token(user_agent, ua_browser)
+    config.user_agent = user_agent
+
+    save_config_or_raise(config)
+
+    textio_logger.info("Success! Applied a browser user-agent to config.ini file.\n")
 
 
 async def validate_adjust_check_key(config: FanslyConfig) -> None:
@@ -359,7 +386,11 @@ async def validate_adjust_check_key(config: FanslyConfig) -> None:
 
             return
 
-        textio_logger.warning("Web retrieval of check key failed!")
+        # pragma: no cover — defensive: guess_check_key always returns a key
+        # (every failure path falls back to its hardcoded default), so this
+        # warning is unreachable today; kept as a guard against future changes
+        # to the guess_check_key contract.
+        textio_logger.warning("Web retrieval of check key failed!")  # pragma: no cover
 
     textio_logger.warning(
         f"Make sure, checking the main.js sources of the Fansly homepage, "
@@ -512,6 +543,83 @@ async def validate_adjust_download_mode(
                 done = True
 
 
+def _derive_wall_filter_scope(config: FanslyConfig) -> None:
+    """Make wall_filters keys the run's creator scope; narrow on -u subset."""
+    filter_keys = set(config.wall_filters)
+    if "user_names" in config._ephemeral_overrides and config.user_names:
+        unknown = config.user_names - filter_keys
+        if unknown:
+            raise ConfigError(
+                "Configuration error - -u creator(s) not present in "
+                f"wall_filters: {', '.join(sorted(unknown))}."
+            )
+        config.wall_filters = {
+            key: spec
+            for key, spec in config.wall_filters.items()
+            if key in config.user_names
+        }
+        config._ephemeral_overrides.add("wall_filters")
+    else:
+        config.user_names = filter_keys
+        config._ephemeral_overrides.add("user_names")
+
+
+async def validate_adjust_wall_filters(config: FanslyConfig) -> None:
+    """Enforce WALL-only mode, resolve empty specs, derive creator scope.
+
+    Args:
+        config: The configuration to validate and adjust.
+
+    Raises:
+        ConfigError: On a non-WALL download_mode, an unresolvable empty
+            spec, or a -u creator missing from the wall_filters keys.
+    """
+    if not config.wall_filters:
+        return
+
+    if config.download_mode != DownloadMode.WALL:
+        raise ConfigError(
+            "Configuration error - wall_filters requires download_mode: wall "
+            f"(current mode: {config.download_mode})."
+        )
+
+    if config.use_following:
+        raise ConfigError(
+            "Configuration error - wall_filters cannot be combined with "
+            "use_following; wall_filters defines the creator scope."
+        )
+
+    for creator, spec in config.wall_filters.items():
+        if spec.all_walls or not spec.is_empty:
+            continue
+        if not config.interactive:
+            raise ConfigError(
+                f"Configuration error - wall_filters entry '{creator}' is "
+                "empty; list wall name(s)/ID(s) or remove the entry."
+            )
+        if await aconfirm(
+            f"\n{20 * ' '}► wall_filters entry '{creator}' is empty. "
+            "Download ALL walls for this creator?",
+            default=False,
+        ):
+            spec.all_walls = True
+            config._ephemeral_overrides.add("wall_filters")
+            continue
+        entries = await aprompt_text(
+            f"\n{20 * ' '}► Enter wall name(s)/snowflake ID(s) for "
+            f"'{creator}' (comma-separated): "
+        )
+        spec.includes = [t.strip() for t in entries.split(",") if t.strip()]
+        config._ephemeral_overrides.add("wall_filters")
+        if not spec.includes:
+            raise ConfigError(
+                "Configuration error - no walls provided for wall_filters "
+                f"entry '{creator}'."
+            )
+
+    _derive_wall_filter_scope(config)
+
+
 async def validate_adjust_config(config: FanslyConfig, download_mode_set: bool) -> None:
     """Validates all input values from `config.ini`
     and corrects them if possible.
@@ -519,6 +627,8 @@ async def validate_adjust_config(config: FanslyConfig, download_mode_set: bool) 
     :param FanslyConfig config: The configuration to validate and correct.
     :param bool download_mode_set: Indicates whether a download mode as been set using args
     """
+    await validate_adjust_wall_filters(config)
+
     if not await validate_creator_names(config):
         raise ConfigError("Configuration error - no valid creator name specified.")
 
@@ -533,5 +643,5 @@ async def validate_adjust_config(config: FanslyConfig, download_mode_set: bool) 
     await validate_adjust_download_directory(config)
 
     await validate_adjust_download_mode(
-        config, download_mode_set
+        config, download_mode_set or bool(config.wall_filters)
     )  # don't prompt if download mode has specifically been set with args

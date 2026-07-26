@@ -7,8 +7,12 @@ and story states.
 from __future__ import annotations
 
 import copy
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
+from pydantic import JsonValue
+from stash_graphql_client.types import is_set
+
+from helpers.common import JsonDict, expect_dict, expect_int, expect_list
 from textio import json_output
 
 from .entity_store import PostgresEntityStore
@@ -27,7 +31,7 @@ if TYPE_CHECKING:
 
 async def process_media_bundles_data(
     config: FanslyConfig,
-    data: dict[str, Any],
+    data: JsonDict,
     id_fields: list[str] | None = None,
 ) -> None:
     """Process media bundles from data."""
@@ -37,24 +41,27 @@ async def process_media_bundles_data(
     if "accountMediaBundles" not in data:
         return
 
-    account_id = None
-    if data.get("messages") or data.get("posts"):
-        first_item = (data.get("messages") or data.get("posts"))[0]
+    account_id: JsonValue = None
+    raw_items = data.get("messages") or data.get("posts")
+    items = expect_list(raw_items, "messages/posts") if raw_items else None
+    if items:
+        first_item = expect_dict(items[0], "message/post item")
         for field in id_fields:
             if account_id := first_item.get(field):
                 break
 
     if account_id:
-        account_id = int(account_id)
         await process_media_bundles(
             config=config,
-            account_id=account_id,
-            media_bundles=data["accountMediaBundles"],
+            account_id=expect_int(account_id, "senderId/recipientId"),
+            media_bundles=expect_list(
+                data["accountMediaBundles"], "accountMediaBundles"
+            ),
         )
 
 
 async def _process_single_bundle(
-    bundle: dict,
+    bundle: JsonDict,
     account_id: int,
     config: FanslyConfig,
 ) -> None:
@@ -73,7 +80,9 @@ async def _process_single_bundle(
     bundle.setdefault("accountId", account_id)
 
     # Capture all accountMediaIds before model_validate resolves (and drops) them
-    all_media_ids = [int(mid) for mid in bundle.get("accountMediaIds", [])]
+    raw_ids = bundle.get("accountMediaIds")
+    ids_list = expect_list(raw_ids, "accountMediaIds") if raw_ids is not None else []
+    all_media_ids = [expect_int(mid, "accountMediaId") for mid in ids_list]
 
     bundle_obj = AccountMediaBundle.model_validate(bundle)
 
@@ -90,7 +99,7 @@ async def _process_single_bundle(
         )
 
     # Save preview Media first if resolved (FK constraint)
-    if bundle_obj.preview:
+    if is_set(bundle_obj.preview) and bundle_obj.preview is not None:
         await store.save(bundle_obj.preview)
 
     await store.save(bundle_obj)
@@ -156,13 +165,13 @@ async def _backfill_missing_account_media(
 async def process_media_bundles(
     config: FanslyConfig,
     account_id: int,
-    media_bundles: list[dict],
+    media_bundles: list[JsonValue],
 ) -> None:
     """Process media bundles for an account."""
     media_bundles = copy.deepcopy(media_bundles)
     for bundle in media_bundles:
         await _process_single_bundle(
-            bundle=bundle,
+            bundle=expect_dict(bundle, "media bundle"),
             account_id=account_id,
             config=config,
         )
@@ -170,7 +179,7 @@ async def process_media_bundles(
 
 async def process_account_data(
     config: FanslyConfig,
-    data: dict[str, Any],
+    data: JsonDict,
     state: DownloadState | None = None,  # noqa: ARG001
 ) -> None:
     """Process account data from the API and store in the database.
@@ -183,6 +192,10 @@ async def process_account_data(
     Walls still need async processing (stale-wall deletion, wall_posts junction).
     """
     from .stub_tracker import remove_stub  # noqa: PLC0415, I001  # circular: metadata.stub_tracker → metadata.account via models
+    from .subscriptions import (  # noqa: PLC0415  # circular: metadata.subscriptions → metadata.account via models
+        _access_changed_accounts,
+        apply_subscription_snapshot,
+    )
     from .wall import process_account_walls  # noqa: PLC0415  # circular: metadata.wall → metadata.account
 
     store = get_store()
@@ -191,23 +204,41 @@ async def process_account_data(
     if "id" not in data:
         return
 
+    # Pop embedded singular `subscription` BEFORE Account.model_validate so
+    # the model's has_many resolver doesn't pre-cache the new Subscription
+    # row — that would defeat the snapshot-vs-cache transition detection
+    # by making prev_state == new_state at the apply_subscription_snapshot
+    # call below.
+    embedded_sub = data.pop("subscription", None)
+
     account = Account.model_validate(data)
 
     # save() handles related-entity ordering + junction-FK stub creation.
     await store.save(account)
 
-    if account.timelineStats:
+    if is_set(account.timelineStats) and account.timelineStats is not None:
         await store.save(account.timelineStats)
-    if account.mediaStoryState:
+    if is_set(account.mediaStoryState) and account.mediaStoryState is not None:
         await store.save(account.mediaStoryState)
+
+    # Subscription FKs to Account → run AFTER store.save(account) so the
+    # subscriptions.accountId FK satisfies. The snapshot-diff detector
+    # sees a cache miss for the sub.id (no other code path validated it
+    # yet) and bootstrap-activation fires correctly on first observation.
+    if isinstance(embedded_sub, dict):
+        transition = await apply_subscription_snapshot(embedded_sub)
+        if transition is not None:
+            account_id, reason = transition
+            _access_changed_accounts[account_id] = reason
 
     # Walls need async processing (stale-wall deletion logic)
     if "walls" in data:
         await process_account_walls(
             config=config,
             account=account,
-            walls_data=data["walls"],
+            walls_data=expect_list(data["walls"], "walls"),
         )
 
     # Remove stub tracking
-    await remove_stub("accounts", account.id)
+    if account.id is not None:
+        await remove_stub("accounts", account.id)

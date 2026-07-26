@@ -23,14 +23,16 @@ import respx
 from stash_graphql_client.errors import StashVersionError
 from stash_graphql_client.types.job import JobStatus
 
-from tests.fixtures import (
+from metadata.entity_store import PostgresEntityStore
+from stash.processing import StashProcessing
+from tests.fixtures.metadata.metadata_factories import AccountFactory
+from tests.fixtures.stash import (
     create_find_performers_result,
     create_find_studios_result,
     create_graphql_response,
     create_performer_dict,
     create_studio_dict,
 )
-from tests.fixtures.metadata.metadata_factories import AccountFactory
 from tests.fixtures.stash.stash_api_fixtures import (
     assert_op,
     assert_op_with_vars,
@@ -212,7 +214,12 @@ class TestCreatorProcessing:
         await processor.context.get_client()
 
         # Call process_creator (no session= parameter)
-        account, performer = await processor.process_creator()
+        try:
+            account, performer = await processor.process_creator()
+        finally:
+            dump_graphql_calls(
+                graphql_route.calls, "test_process_creator_creates_new_performer"
+            )
 
         # Verify results
         assert account.id == real_account.id
@@ -325,11 +332,32 @@ class TestCreatorProcessing:
         not_configured = [m for m in warnings if "not configured" in m]
         assert len(not_configured) == 1
 
+    @pytest.mark.parametrize(
+        ("raised_exc", "expected_error_substring", "expected_warning_count"),
+        [
+            (StashVersionError("Server too old"), "too old", 1),
+            (RuntimeError("Connection refused"), "Failed to initialize", None),
+        ],
+        ids=["stash_version_error", "runtime_error"],
+    )
     @pytest.mark.asyncio
-    async def test_start_creator_processing_stash_version_error(
-        self, entity_store, respx_stash_processor, caplog
-    ):
-        """Test start_creator_processing when Stash server is too old (lines 379-382)."""
+    async def test_start_creator_processing_get_client_error(
+        self,
+        entity_store: PostgresEntityStore,
+        respx_stash_processor: StashProcessing,
+        caplog: pytest.LogCaptureFixture,
+        raised_exc: Exception,
+        expected_error_substring: str,
+        expected_warning_count: int | None,
+    ) -> None:
+        """start_creator_processing logs and returns when get_client raises.
+
+        stash_version_error: Stash server too old (lines 379-382) → exactly one
+        ERROR containing "too old" plus exactly one WARNING.
+        runtime_error: client init failure (lines 383-385) → exactly one ERROR
+        containing "Failed to initialize"; no warning-count column (the
+        original test captured at ERROR level only).
+        """
         caplog.set_level(logging.WARNING)
         processor = respx_stash_processor
         processor.config.stash_context_conn = {
@@ -343,41 +371,18 @@ class TestCreatorProcessing:
             processor.context,
             "get_client",
             new_callable=AsyncMock,
-            side_effect=StashVersionError("Server too old"),
+            side_effect=raised_exc,
         ):
             await processor.start_creator_processing()
 
         errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-        warnings = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
-        too_old_errors = [m for m in errors if "too old" in m]
-        assert len(too_old_errors) == 1
-        assert len(warnings) == 1
-
-    @pytest.mark.asyncio
-    async def test_start_creator_processing_runtime_error(
-        self, entity_store, respx_stash_processor, caplog
-    ):
-        """Test start_creator_processing when client init fails (lines 383-385)."""
-        caplog.set_level(logging.ERROR)
-        processor = respx_stash_processor
-        processor.config.stash_context_conn = {
-            "scheme": "http",
-            "host": "localhost",
-            "port": "9999",
-            "apikey": "",
-        }
-
-        with patch.object(
-            processor.context,
-            "get_client",
-            new_callable=AsyncMock,
-            side_effect=RuntimeError("Connection refused"),
-        ):
-            await processor.start_creator_processing()
-
-        errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-        init_errors = [m for m in errors if "Failed to initialize" in m]
-        assert len(init_errors) == 1
+        matching_errors = [m for m in errors if expected_error_substring in m]
+        assert len(matching_errors) == 1
+        if expected_warning_count is not None:
+            warnings = [
+                r.getMessage() for r in caplog.records if r.levelname == "WARNING"
+            ]
+            assert len(warnings) == expected_warning_count
 
     @pytest.mark.asyncio
     async def test_start_creator_processing_with_stash_context(
@@ -441,15 +446,15 @@ class TestCreatorProcessing:
                 httpx.Response(
                     200, json=create_graphql_response("findJob", finished_job_dict)
                 ),
-                # === Preload: _preload_creator_media() (after scan) ===
-                # Scenes and images only — galleries are cached on-demand
+                # Not a preload (retired): respx feeds these empties in order to the
+                # performer search's name+alias tiers (count=0 → falls to url tier).
                 httpx.Response(
                     200, json=create_graphql_response("findScenes", empty_scenes)
                 ),
                 httpx.Response(
                     200, json=create_graphql_response("findImages", empty_images)
                 ),
-                # process_creator: findPerformers query
+                # findPerformers url-tier (returns the match)
                 httpx.Response(
                     200,
                     json=create_graphql_response(
@@ -470,27 +475,21 @@ class TestCreatorProcessing:
             processor.config._background_tasks = []
 
         # Call start_creator_processing - orchestration under test
-        await processor.start_creator_processing()
+        try:
+            await processor.start_creator_processing()
+        finally:
+            dump_graphql_calls(graphql_route.calls, "start_creator_processing")
 
-        # === PERMANENT GraphQL call sequence assertions ===
-        # 1 connect + 2 scan + 2 media preload + 1 findPerformers = 6
-        # (shared preload removed — uses lazy filter→find_one pattern instead)
+        # 6 calls: connect, scan (metadataScan + findJob), then the performer
+        # fuzzy-search's 3 findPerformers tiers (name/alias/url). No preload.
         assert len(graphql_route.calls) == 6, (
             f"Expected exactly 6 GraphQL calls, got {len(graphql_route.calls)}"
         )
-
-        # Call 0: connect_async
-        # Calls 1-3: _preload_stash_entities (findPerformers, findTags, findStudios)
-        # Call 4: metadataScan (scan_creator_folder)
-        # Call 0: connect_async
-        # Call 1: metadataScan (scan_creator_folder)
+        assert_op(graphql_route.calls[0], "ConfigurationDefaults")
         assert_op(graphql_route.calls[1], "metadataScan")
-
-        # Call 2: findJob (scan_creator_folder)
         assert_op(graphql_route.calls[2], "findJob")
-
-        # Calls 3-4: _preload_creator_media (findScenes, findImages)
-        # Call 5: findPerformers (process_creator)
+        assert_op(graphql_route.calls[3], "findPerformers")
+        assert_op(graphql_route.calls[4], "findPerformers")
         assert_op(graphql_route.calls[5], "findPerformers")
 
         # Verify orchestration: background task was created
@@ -554,7 +553,10 @@ class TestCreatorProcessing:
         await processor.context.get_client()
 
         # Call scan_creator_folder - uses respx-mocked HTTP
-        await processor.scan_creator_folder()
+        try:
+            await processor.scan_creator_folder()
+        finally:
+            dump_graphql_calls(graphql_route.calls, "test_scan_creator_folder")
 
         # Verify respx was hit 4 times (connect_async + metadataScan + 2x findJob)
         assert graphql_route.call_count == 4
@@ -645,19 +647,28 @@ class TestCreatorProcessing:
     async def test_scan_creator_folder_no_base_path(
         self, respx_stash_processor, tmp_path, caplog
     ):
-        """Test scan_creator_folder creates and uses download_path when base_path is None."""
+        """Test scan_creator_folder creates and uses download_path when base_path is None.
+
+        Exercises the REAL ``set_create_directory_for_download`` helper (no patch):
+        with ``base_path``/``download_path`` cleared, production calls the helper,
+        which creates a real directory under ``config.download_directory`` and
+        returns it. We then assert the real created path landed on
+        ``state.download_path``/``state.base_path`` and was sent to metadataScan.
+        """
         caplog.set_level(logging.INFO)
         processor = respx_stash_processor
-        # Setup: No base_path
+        # Setup: No base_path / download_path so the real path-creation runs.
         processor.state.base_path = None
         processor.state.download_path = None
 
-        # Create real path for testing
-        created_path = tmp_path / "created_path"
-        created_path.mkdir(parents=True, exist_ok=True)
+        # Point the real download root at an isolated tmp dir; the real helper
+        # creates the creator subdirectory underneath it on disk.
+        download_root = tmp_path / "downloads"
+        download_root.mkdir(parents=True, exist_ok=True)
+        processor.config.download_directory = download_root
 
         # Create Job instances using factory
-        finished_job = JobFactory(
+        finished_job = JobFactory.build(
             id="job_456",
             status=JobStatus.FINISHED,
             description="Scanning metadata",
@@ -683,22 +694,28 @@ class TestCreatorProcessing:
         # Initialize client
         await processor.context.get_client()
 
-        # set_create_directory_for_download is a leaf utility that creates an
-        # actual directory on disk; patching it lets the test stay hermetic.
-        with patch(
-            "stash.processing.base.set_create_directory_for_download"
-        ) as mock_set_path:
-            mock_set_path.return_value = created_path
-
-            # Call scan_creator_folder
+        # Call scan_creator_folder — the REAL set_create_directory_for_download
+        # runs and creates the creator directory on disk.
+        try:
             await processor.scan_creator_folder()
+        finally:
+            dump_graphql_calls(
+                graphql_route.calls, "test_scan_creator_folder_no_base_path"
+            )
+
+        # The real helper created the directory under download_root and stored it.
+        created_path = processor.state.download_path
+        assert created_path is not None
+        assert created_path.exists()
+        assert created_path.is_dir()
+        assert download_root in created_path.parents or created_path == download_root
 
         # === PERMANENT GraphQL call sequence assertions ===
         assert len(graphql_route.calls) == 3, (
             f"Expected exactly 3 GraphQL calls, got {len(graphql_route.calls)}"
         )
 
-        # Call 2: metadataScan mutation with created path
+        # Call 2: metadataScan mutation with the real created path
         assert_op(graphql_route.calls[1], "metadataScan")
         call2_body = json.loads(graphql_route.calls[1].request.content)
         assert str(created_path) in call2_body["variables"]["input"]["paths"]
@@ -711,8 +728,6 @@ class TestCreatorProcessing:
             "No download path set, attempting to create one..." in m
             for m in info_messages
         )
-        mock_set_path.assert_called_once_with(processor.config, processor.state)
-        assert processor.state.download_path == created_path
         # After fix: base_path should be updated to download_path
         assert processor.state.base_path == created_path
 
@@ -769,7 +784,13 @@ class TestCreatorProcessing:
         await processor.context.get_client()
 
         # Call scan_creator_folder - handles error gracefully and continues
-        await processor.scan_creator_folder()
+        try:
+            await processor.scan_creator_folder()
+        finally:
+            dump_graphql_calls(
+                graphql_route.calls,
+                "test_scan_creator_folder_wait_for_job_exception_handling",
+            )
 
         # Verify respx was hit 4 times (connect_async + metadataScan + 2x findJob)
         assert graphql_route.call_count == 4

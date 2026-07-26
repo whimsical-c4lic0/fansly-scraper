@@ -8,23 +8,30 @@ import shutil
 import tempfile
 import traceback
 from asyncio import sleep as async_sleep
+from collections.abc import Sequence
 from pathlib import Path
-from typing import BinaryIO
+from typing import IO
 
 from rich.progress import BarColumn, Progress, TextColumn
 from rich.table import Column
 
 from config import FanslyConfig
-from errors import DownloadError, DuplicateCountError, M3U8Error, MediaError
+from errors import (
+    DownloadError,
+    DuplicateCountError,
+    M3U8Error,
+    MediaError,
+    MediaFilteredError,
+)
 from fileio.dedupe import dedupe_media_file, get_filename_only
 from fileio.fnmanip import get_hash_for_image, get_hash_for_other_content
-from helpers.common import batch_list
+from helpers.common import batch_list, expect_dict
 from helpers.rich_progress import get_progress_manager
 from helpers.timer import timing_jitter
 from media import parse_media_info
 from metadata import process_media_download
 from metadata.media import process_media_info
-from metadata.models import Media, get_store
+from metadata.models import AccountMedia, AccountMediaBundle, Media, get_store
 from pathio import get_media_save_path, set_create_directory_for_download
 from textio import (
     input_enter_continue,
@@ -36,13 +43,58 @@ from textio import (
 
 from .downloadstate import DownloadState
 from .m3u8 import download_m3u8
+from .mediafilters import (
+    check_media_filters,
+    estimate_stream_size_gate,
+    record_filter_observation,
+    resolve_media_filters,
+)
 from .types import DownloadType
+
+
+def _media_type_label(mimetype: str | None) -> str:
+    """Extract the media-type label from a mimetype for display.
+
+    ``"image/jpeg"`` -> ``"image"``. Returns a safe fallback for a missing or
+    slash-less mimetype so progress and dedup messages never crash on an unset
+    value (Media.mimetype is typed ``str | None``).
+    """
+    if not mimetype:
+        return "media"
+    parts = mimetype.split("/")
+    return parts[-2] if len(parts) >= 2 else mimetype
+
+
+def _print_filtered_skip(config: FanslyConfig, media: Media, reason: str) -> None:
+    """Print the standard filtered-skip line, honoring the display toggles."""
+    if config.show_downloads and config.show_skipped_downloads:
+        print_info(
+            f"Filtered [{reason}]: {_media_type_label(media.mimetype)} "
+            f"'{media.get_file_name()}' -> skipped"
+        )
+
+
+async def handle_filtered_skip(
+    config: FanslyConfig,
+    state: DownloadState,
+    media: Media,
+    reason: str,
+    *,
+    observed: int | None = None,
+    estimated: int | None = None,
+) -> None:
+    """Record a filtered-skip observation, print the skip line, and count it."""
+    await record_filter_observation(
+        media, reason=reason, observed=observed, estimated=estimated
+    )
+    _print_filtered_skip(config, media, reason)
+    state.filtered_count += 1
 
 
 async def fetch_and_process_media(
     config: FanslyConfig,
     state: DownloadState,
-    media_ids: list[int | str],
+    media_ids: Sequence[int | str],
     post_id: str | None = None,
 ) -> list[Media]:
     """Fetch accountMedia from API, persist to DB, select download variants.
@@ -70,18 +122,40 @@ async def fetch_and_process_media(
 
             response = await api.get_account_media(media_ids_str)
             media_infos = api.get_json_response_contents(response)
+            if not isinstance(media_infos, list):
+                raise TypeError("Fansly API: expected an account-media array response")
 
             # Persist Media + AccountMedia via Pydantic pipeline
             await process_media_info(config, {"batch": media_infos})
 
             # Select best variant for each item
             for info in media_infos:
+                filters = resolve_media_filters(config, state)
+                max_px = filters.max_resolution_px if filters else None
                 try:
+                    media_dict = expect_dict(info, "media info")
                     all_media.append(
                         await parse_media_info(
-                            state, info, post_id, interactive=config.interactive
+                            state,
+                            media_dict,
+                            post_id,
+                            interactive=config.interactive,
+                            max_px=max_px,
                         )
                     )
+                except MediaFilteredError as e:
+                    skipped = (
+                        get_store().get_from_cache(Media, e.media_id)
+                        if e.media_id is not None
+                        else None
+                    )
+                    if skipped is not None:
+                        await handle_filtered_skip(config, state, skipped, e.reason)
+                    else:
+                        print_debug(
+                            f"Filtered [{e.reason}]: media_id {e.media_id} not "
+                            f"found in cache; skip could not be recorded."
+                        )
                 except Exception:
                     print_error(
                         f"Unexpected error parsing "
@@ -100,6 +174,75 @@ async def fetch_and_process_media(
     ]
 
 
+async def refresh_locked_account_media(
+    config: FanslyConfig,
+    creator_id: int,
+) -> int:
+    """Re-fetch AccountMedia / AccountMediaBundle for ``creator_id`` whose
+    access state could have flipped after a subscription / follow change.
+
+    Filter — only rows that can actually transition state:
+        AccountMedia:        deleted=False AND access=False
+        AccountMediaBundle:  deleted=False AND access=False
+                             AND purchased=False AND whitelisted=False
+
+    Bundle's own access/purchased/whitelisted columns are not refreshed
+    directly (no dedicated bundle endpoint); we re-fetch the bundle's
+    constituent AccountMedia and trust the bundle's own state to refresh
+    on the next natural pagination encounter.
+
+    Returns:
+        Number of AccountMedia IDs queued for refresh (post-dedup).
+    """
+    store = get_store()
+
+    locked_am = store.filter(
+        AccountMedia,
+        lambda am: am.accountId == creator_id and not am.deleted and not am.access,
+    )
+    locked_bundles = store.filter(
+        AccountMediaBundle,
+        lambda b: (
+            b.accountId == creator_id
+            and not b.deleted
+            and not b.access
+            and not b.purchased
+            and not b.whitelisted
+        ),
+    )
+
+    refresh_ids: set[int] = {am.id for am in locked_am if am.id is not None}
+    for bundle in locked_bundles:
+        for am in bundle.accountMedia or []:
+            if am.id is not None:
+                refresh_ids.add(am.id)
+
+    if not refresh_ids:
+        return 0
+
+    print_info(
+        f"Refreshing {len(refresh_ids)} locked AccountMedia for creator "
+        f"{creator_id} (access-change detected)."
+    )
+
+    api = config.get_api()
+    for ids in batch_list(sorted(refresh_ids), config.BATCH_SIZE):
+        media_ids_str = ",".join(str(mid) for mid in ids)
+        try:
+            response = await api.get_account_media(media_ids_str)
+            response.raise_for_status()
+            media_infos = api.get_json_response_contents(response)
+            await process_media_info(config, {"batch": media_infos})
+        except Exception:
+            print_error(
+                f"AM refresh batch failed for creator {creator_id};"
+                f"\n{traceback.format_exc()}",
+                44,
+            )
+
+    return len(refresh_ids)
+
+
 def _validate_media(media: Media) -> None:
     """Validate media has required download fields."""
     if media.mimetype is None:
@@ -114,11 +257,12 @@ def _update_media_type_stats(state: DownloadState, media: Media) -> None:
         media.preview_id if media.is_preview else (media.download_id or media.id)
     )
 
-    if "image" in media.mimetype:
+    mimetype = media.mimetype or ""
+    if "image" in mimetype:
         state.recent_photo_media_ids.add(media_id)
-    elif "video" in media.mimetype:
+    elif "video" in mimetype:
         state.recent_video_media_ids.add(media_id)
-    elif "audio" in media.mimetype:
+    elif "audio" in mimetype:
         state.recent_audio_media_ids.add(media_id)
 
 
@@ -134,7 +278,7 @@ async def _verify_existing_file(
         f"Calculating hash for existing {'preview ' if is_preview else ''}file: {check_path}"
     )
 
-    mimetype = media.preview_mimetype if is_preview else media.mimetype
+    mimetype = (media.preview_mimetype if is_preview else media.mimetype) or ""
 
     hash_func = (
         get_hash_for_image if "image" in mimetype else get_hash_for_other_content
@@ -147,7 +291,7 @@ async def _verify_existing_file(
     if media.content_hash == existing_hash:
         if config.show_downloads and config.show_skipped_downloads:
             print_info(
-                f"Deduplication [Hash]: {mimetype.split('/')[-2]} '{check_path.name}' → skipped (hash verified)"
+                f"Deduplication [Hash]: {_media_type_label(mimetype)} '{check_path.name}' → skipped (hash verified)"
             )
         state.add_duplicate()
 
@@ -172,15 +316,19 @@ async def _verify_temp_download(
     store = get_store()
     temp_path = None
     try:
-        kwargs = {"suffix": check_path.suffix, "delete": False}
-        if config.temp_folder:
-            kwargs["dir"] = config.temp_folder
-        with tempfile.NamedTemporaryFile(**kwargs) as temp_file:
+        with tempfile.NamedTemporaryFile(
+            mode="w+b",
+            suffix=check_path.suffix,
+            dir=config.temp_folder,
+            delete=False,
+        ) as temp_file:
             temp_path = Path(temp_file.name)
 
             url = media.preview_url if is_preview else media.download_url
-            mimetype = media.preview_mimetype if is_preview else media.mimetype
+            mimetype = (media.preview_mimetype if is_preview else media.mimetype) or ""
 
+            if url is None:
+                return False
             await _download_file(config, url, temp_file)
 
         hash_func = (
@@ -201,7 +349,7 @@ async def _verify_temp_download(
 
             if config.show_downloads and config.show_skipped_downloads:
                 print_info(
-                    f"Deduplication [File]: {mimetype.split('/')[-2]} '{check_path.name}' → skipped (hash verified)"
+                    f"Deduplication [File]: {_media_type_label(mimetype)} '{check_path.name}' → skipped (hash verified)"
                 )
             state.add_duplicate()
 
@@ -213,13 +361,15 @@ async def _verify_temp_download(
             return True
 
     finally:
-        if temp_path and await asyncio.to_thread(temp_path.exists):
+        if temp_path is not None and await asyncio.to_thread(temp_path.exists):
             await asyncio.to_thread(temp_path.unlink)
 
     return False
 
 
-async def _download_file(config: FanslyConfig, url: str, output_file: BinaryIO) -> None:
+async def _download_file(
+    config: FanslyConfig, url: str, output_file: IO[bytes]
+) -> None:
     """Download file from URL to output file."""
     response = None
     try:
@@ -247,14 +397,20 @@ async def _download_file(config: FanslyConfig, url: str, output_file: BinaryIO) 
 
 async def _download_regular_file(
     config: FanslyConfig,
+    state: DownloadState,
     media: Media,
     file_save_path: Path,
 ) -> None:
     """Download a regular media file with progress bar."""
+    download_url = media.download_url
+    if download_url is None:
+        raise DownloadError(
+            f"Cannot download {media.get_file_name()}: no download URL resolved."
+        )
     response = None
     try:
         response = await config.get_api().get_with_ngsw(
-            url=media.download_url,
+            url=download_url,
             stream=True,
             add_fansly_headers=False,
         )
@@ -262,6 +418,13 @@ async def _download_regular_file(
             text_column = TextColumn("", table_column=Column(ratio=1))
             bar_column = BarColumn(bar_width=60, table_column=Column(ratio=5))
             file_size = int(response.headers.get("content-length", 0))
+
+            filters = resolve_media_filters(config, state)
+            if filters is not None and file_size > 0:
+                reason = filters.size_verdict(file_size)
+                if reason:
+                    raise MediaFilteredError(reason, observed=file_size)
+
             disable_loading_bar = file_size < 20_000_000
 
             # Stream into a sibling temp file so a mid-stream crash doesn't
@@ -319,27 +482,42 @@ async def _download_m3u8_file(
 ) -> bool:
     """Download and process an m3u8 file. Returns True if duplicate."""
     store = get_store()
-    kwargs = {}
-    if config.temp_folder:
+    download_url = media.download_url
+    if download_url is None:
+        raise DownloadError(
+            f"Cannot download {media.get_file_name()}: no download URL resolved."
+        )
+    temp_folder = config.temp_folder
+    if temp_folder:
         # mkdtemp does not create intermediates; ensure the parent
         # exists or we crash with FileNotFoundError mid-download.
-        await asyncio.to_thread(
-            Path(config.temp_folder).mkdir, parents=True, exist_ok=True
-        )
-        kwargs["dir"] = config.temp_folder
-    temp_dir = Path(tempfile.mkdtemp(**kwargs))
+        await asyncio.to_thread(Path(temp_folder).mkdir, parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(dir=temp_folder))
     temp_path = temp_dir / f"temp_{check_path.name}"
 
     try:
+        await estimate_stream_size_gate(config, state, media)
+        filters = resolve_media_filters(config, state)
+        max_px = filters.max_resolution_px if filters else None
+
         # Run synchronous HLS download in thread to avoid blocking
         # the event loop (progress bars, rate limiter would freeze otherwise)
         temp_path = await asyncio.to_thread(
             download_m3u8,
             config,
-            media.download_url,
+            download_url,
             temp_path,
             media.created_at_timestamp,
+            max_bytes=filters.file_size_max if filters else None,
+            max_resolution=max_px,
         )
+
+        filters = resolve_media_filters(config, state)
+        if filters is not None:
+            final_size = (await asyncio.to_thread(temp_path.stat)).st_size
+            reason = filters.size_verdict(final_size)
+            if reason:
+                raise MediaFilteredError(reason, observed=final_size)
 
         new_hash = await asyncio.to_thread(get_hash_for_other_content, temp_path)
 
@@ -358,8 +536,8 @@ async def _download_m3u8_file(
 
             if config.show_downloads and config.show_skipped_downloads:
                 print_info(
-                    f"Deduplication [Hash]: {media.mimetype.split('/')[-2]} '{temp_path.name}' → "
-                    f"skipped (duplicate of {Path(existing_by_hash.local_filename).name})"
+                    f"Deduplication [Hash]: {_media_type_label(media.mimetype)} '{temp_path.name}' → "
+                    f"skipped (duplicate of {Path(existing_by_hash.local_filename or '').name})"
                 )
             state.add_duplicate()
             return True
@@ -419,6 +597,13 @@ async def download_media(
                 if media.is_preview and not config.download_media_previews:
                     continue
 
+                filter_reason = check_media_filters(config, state, media)
+                if filter_reason:
+                    await record_filter_observation(media, reason=filter_reason)
+                    _print_filtered_skip(config, media, filter_reason)
+                    state.filtered_count += 1
+                    continue
+
                 try:
                     _validate_media(media)
                 except MediaError as e:
@@ -431,7 +616,7 @@ async def download_media(
                     if result is None:
                         if config.show_downloads and config.show_skipped_downloads:
                             print_info(
-                                f"Deduplication [Database]: {media.mimetype.split('/')[-2]} '{media.get_file_name()}' → skipped (already downloaded)"
+                                f"Deduplication [Database]: {_media_type_label(media.mimetype)} '{media.get_file_name()}' → skipped (already downloaded)"
                             )
                         state.add_duplicate()
                         continue
@@ -460,6 +645,7 @@ async def download_media(
                     await asyncio.to_thread(file_save_dir.mkdir, parents=True)
 
                 check_path = file_save_path
+                media.local_path = str(check_path)
 
                 if await asyncio.to_thread(check_path.exists):
                     if await _verify_existing_file(config, state, media, check_path):
@@ -472,7 +658,7 @@ async def download_media(
 
                 if config.show_downloads:
                     print_info(
-                        f"Downloading {media.mimetype.split('/')[-2]} '{filename}'"
+                        f"Downloading {_media_type_label(media.mimetype)} '{filename}'"
                     )
 
                 try:
@@ -487,7 +673,9 @@ async def download_media(
                             continue
                         # _download_m3u8_file already increments vid_count
                     else:
-                        await _download_regular_file(config, media, file_save_path)
+                        await _download_regular_file(
+                            config, state, media, file_save_path
+                        )
 
                         if not await asyncio.to_thread(file_save_path.exists):
                             print_warning(
@@ -495,16 +683,27 @@ async def download_media(
                             )
                             continue
 
+                        media_mime = media.mimetype or ""
                         is_dupe = await dedupe_media_file(
-                            config, state, media.mimetype, file_save_path, media
+                            config, state, media_mime, file_save_path, media
                         )
 
-                        state.pic_count += 1 if "image" in media.mimetype else 0
-                        state.vid_count += 1 if "video" in media.mimetype else 0
+                        state.pic_count += 1 if "image" in media_mime else 0
+                        state.vid_count += 1 if "video" in media_mime else 0
 
                         if is_dupe:
                             state.add_duplicate()
 
+                except MediaFilteredError as e:
+                    await handle_filtered_skip(
+                        config,
+                        state,
+                        media,
+                        e.reason,
+                        observed=e.observed,
+                        estimated=e.estimated,
+                    )
+                    continue
                 except M3U8Error as ex:
                     print_warning(f"Skipping invalid item: {ex}")
 

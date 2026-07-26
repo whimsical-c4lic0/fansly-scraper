@@ -1,19 +1,27 @@
 """Fansly Account Information"""
 
 import asyncio
+from collections.abc import Awaitable, Callable
 from typing import Any
 
 import httpx
+from stash_graphql_client.types import is_set
 
 from config import FanslyConfig
 from config.modes import DownloadMode
 from errors import ApiAccountInfoError, ApiAuthenticationError, ApiError
+from helpers.common import expect_dict
 from helpers.timer import timing_jitter
 from metadata import Account, TimelineStats, process_account_data
 from metadata.models import get_store
+from metadata.subscriptions import (
+    consume_access_change,
+    record_follow_observation,
+)
 from textio import json_output, print_error, print_info
 
 from .downloadstate import DownloadState
+from .media import refresh_locked_account_media
 
 
 def _validate_download_mode(config: FanslyConfig, state: DownloadState) -> None:
@@ -114,10 +122,10 @@ def _extract_account_data(
         response_data = config.get_api().get_json_response_contents(response)
         # Client account info is wrapped in an 'account' key
         if isinstance(response_data, dict) and "account" in response_data:
-            return response_data["account"]
+            return expect_dict(response_data["account"], "account")
         # Creator account info is in a list
         if isinstance(response_data, list):
-            return response_data[0]
+            return expect_dict(response_data[0], "account")
 
     except httpx.HTTPStatusError as e:
         if response.status_code == 401:
@@ -174,14 +182,15 @@ def _update_state_from_account(
         state.following = account.following or False
         state.subscribed = account.subscribed or False
 
-        if not account.timelineStats:
+        timeline_stats = account.timelineStats
+        if is_set(timeline_stats) and timeline_stats is not None:
+            state.total_timeline_pictures = timeline_stats.imageCount or 0
+            state.total_timeline_videos = timeline_stats.videoCount or 0
+        else:
             raise ApiAccountInfoError(
                 f"Can not get timelineStats for creator username '{state.creator_name}'; "
                 f"you most likely misspelled it! (27)"
             )
-
-        state.total_timeline_pictures = account.timelineStats.imageCount or 0
-        state.total_timeline_videos = account.timelineStats.videoCount or 0
 
         config.DUPLICATE_THRESHOLD = int(
             0.2 * (state.total_timeline_pictures + state.total_timeline_videos)
@@ -238,6 +247,10 @@ async def get_creator_account_info(
             (w.id, w.pos, w.name, w.description) for w in preloaded_account.walls
         )
 
+    prior_following = (
+        preloaded_account.following if preloaded_account is not None else None
+    )
+
     # process_account_data MERGES API data into preloaded cache
     # (overwrites fetchedAt etc.) — hence the pre-merge snapshots above.
     await process_account_data(config=config, data=account_data, state=state)
@@ -254,7 +267,8 @@ async def get_creator_account_info(
     # flags that look at this field). Unreliable alone — see notes above.
     if (
         db_fetched_at
-        and account.timelineStats
+        and is_set(account.timelineStats)
+        and account.timelineStats is not None
         and account.timelineStats.fetchedAt == db_fetched_at
     ):
         state.fetched_timeline_duplication = True
@@ -265,7 +279,7 @@ async def get_creator_account_info(
     # match while counts change (post added to existing wall). Only
     # when BOTH are identical is it safe to skip the timeline+wall scan.
     api_stats_snapshot: tuple | None = None
-    if account.timelineStats:
+    if is_set(account.timelineStats) and account.timelineStats is not None:
         api_stats_snapshot = (
             account.timelineStats.imageCount,
             account.timelineStats.videoCount,
@@ -290,9 +304,32 @@ async def get_creator_account_info(
     if counts_match and walls_match:
         state.creator_content_unchanged = True
 
+    if config.full_pass:
+        state.creator_access_changed = True
+        state.creator_access_change_reason = "full-pass"
+    else:
+        reason = consume_access_change(account_id)
+        if reason is not None:
+            state.creator_access_changed = True
+            state.creator_access_change_reason = reason
+
+    current_following = bool(account.following)
+    follow_transitioned = await record_follow_observation(account_id, current_following)
+    if (
+        follow_transitioned
+        and current_following
+        and prior_following is not True
+        and not state.creator_access_changed
+    ):
+        state.creator_access_changed = True
+        state.creator_access_change_reason = "follow-transition"
+
+    if state.creator_access_changed:
+        await refresh_locked_account_media(config, account_id)
+
 
 async def _make_rate_limited_request(
-    request_func: callable,
+    request_func: Callable[..., Awaitable[httpx.Response]],
     *args: Any,
     rate_limit_delay: float = 30.0,
     **kwargs: Any,
@@ -358,6 +395,8 @@ async def _get_following_page(
 
     json_output(1, f"following_list_page_{page}", response.json())
     following_data = config.get_api().get_json_response_contents(response)
+    if not isinstance(following_data, list):
+        raise TypeError("Fansly API: expected a following array response")
 
     account_ids = [
         item["accountId"]
@@ -370,16 +409,27 @@ async def _get_following_page(
 
     await asyncio.sleep(request_delay)
 
-    account_response = await _make_rate_limited_request(
-        config.get_api().get_account_info_by_id,
-        account_ids,
-        rate_limit_delay=30.0,
-    )
-    json_output(1, f"account_details_page_{page}", account_response.json())
-    account_data = config.get_api().get_json_response_contents(account_response)
-    await asyncio.sleep(timing_jitter(2, 4))
+    batch_size = config.account_ids_batch_size
+    accounts: list[dict] = []
+    for chunk_index, start in enumerate(range(0, len(account_ids), batch_size)):
+        chunk = account_ids[start : start + batch_size]
+        account_response = await _make_rate_limited_request(
+            config.get_api().get_account_info_by_id,
+            chunk,
+            rate_limit_delay=30.0,
+        )
+        json_output(
+            1,
+            f"account_details_page_{page}_chunk_{chunk_index}",
+            account_response.json(),
+        )
+        account_data = config.get_api().get_json_response_contents(account_response)
+        if not isinstance(account_data, list):
+            raise TypeError("Fansly API: expected an account-details array response")
+        accounts.extend(expect_dict(a, "account") for a in account_data)
+        await asyncio.sleep(timing_jitter(2, 4))
 
-    return account_data, len(account_ids)
+    return accounts, len(account_ids)
 
 
 async def get_following_accounts(

@@ -4,8 +4,6 @@ This module handles both content statistics (pictures, videos, etc.) and file do
 statistics (total files, sizes, etc.), as well as timing statistics.
 """
 
-from datetime import UTC, datetime
-
 from config import FanslyConfig
 from download.core import DownloadState, GlobalState
 from helpers.timer import Timer
@@ -36,32 +34,15 @@ def update_global_statistics(
     """
     # Update content statistics
     global_state.duplicate_count += download_state.duplicate_count
+    global_state.filtered_count += download_state.filtered_count
     global_state.pic_count += download_state.pic_count
     global_state.vid_count += download_state.vid_count
     global_state.total_message_items += download_state.total_message_items
     global_state.total_timeline_pictures += download_state.total_timeline_pictures
     global_state.total_timeline_videos += download_state.total_timeline_videos
 
-    # Update file download statistics
-    if not hasattr(download_state, "download_stats"):
-        download_state.download_stats = {
-            "total_count": 0,
-            "skipped_count": 0,
-            "failed_count": 0,
-            "total_size": 0,
-            "total_size_str": "0 B",
-        }
-
-    if not hasattr(global_state, "download_stats"):
-        global_state.download_stats = {
-            "start_time": datetime.now(UTC),
-            "total_count": 0,
-            "skipped_count": 0,
-            "failed_count": 0,
-            "total_size": 0,
-            "total_size_str": "0 B",
-        }
-
+    # Update file download statistics. download_stats is a GlobalState
+    # dataclass field — always present and zero-initialized.
     stats = download_state.download_stats
     global_state.download_stats["total_count"] += stats["total_count"]
     global_state.download_stats["skipped_count"] += stats["skipped_count"]
@@ -78,6 +59,11 @@ def print_statistics_helper(state: GlobalState, header: str, footer: str = "") -
         header: The header text to display
         footer: Optional footer text to display
     """
+    filtered_line = (
+        f"\n  Filtered by filters.media: {state.filtered_count}"
+        if state.filtered_count
+        else ""
+    )
     print_info(
         f"{header}"
         f"\n  Total timeline media: {state.total_timeline_pictures} pictures & {state.total_timeline_videos} videos (= {state.total_timeline_items()} items)"
@@ -85,6 +71,7 @@ def print_statistics_helper(state: GlobalState, header: str, footer: str = "") -
         f"\n  Total media (timeline & messages): {state.total_timeline_items() + state.total_message_items}"
         f"\n  Downloaded media: {state.pic_count} pictures & {state.vid_count} videos (= {state.total_downloaded_items()} items)"
         f"\n  Duplicates skipped: {state.duplicate_count}"
+        f"{filtered_line}"
         f"{footer}"
         f"\n{74 * ' '}═╝"
     )

@@ -3,12 +3,24 @@
 from asyncio import sleep
 
 from config import FanslyConfig
+from errors import DuplicatePageError
+from helpers.common import expect_dict, expect_list
 from helpers.timer import timing_jitter
 from metadata import get_store, process_groups_response, process_messages_metadata
 from metadata.models import Account
-from textio import input_enter_continue, print_error, print_info, print_warning
+from textio import (
+    input_enter_continue,
+    print_error,
+    print_info,
+    print_info_highlight,
+    print_warning,
+)
 
-from .common import get_unique_media_ids, process_download_accessible_media
+from .common import (
+    check_page_duplicates,
+    get_unique_media_ids,
+    process_download_accessible_media,
+)
 from .downloadstate import DownloadState
 from .media import fetch_and_process_media
 from .types import DownloadType
@@ -36,16 +48,21 @@ async def download_messages(config: FanslyConfig, state: DownloadState) -> None:
         await input_enter_continue(config.interactive)
         return
 
-    groups_data = config.get_api().get_json_response_contents(groups_response)
+    groups_data = expect_dict(
+        config.get_api().get_json_response_contents(groups_response),
+        "message-groups response",
+    )
     await process_groups_response(config, state, groups_data)
-    groups_list = groups_data["aggregationData"]["groups"]
+    agg = expect_dict(groups_data["aggregationData"], "aggregationData")
+    groups_list = expect_list(agg["groups"], "groups")
 
     # Find the group whose member list includes the targeted creator.
     group_id: str | None = None
     for group in groups_list:
-        for user in group["users"]:
-            if user["userId"] == state.creator_id:
-                group_id = group["id"]
+        group_obj = expect_dict(group, "group")
+        for user in expect_list(group_obj["users"], "group users"):
+            if expect_dict(user, "user")["userId"] == state.creator_id:
+                group_id = str(group_obj["id"])
                 break
         if group_id:
             break
@@ -87,11 +104,18 @@ async def download_messages_for_group(
         )
         return
 
-    groups_data = config.get_api().get_json_response_contents(groups_response)
+    groups_data = expect_dict(
+        config.get_api().get_json_response_contents(groups_response),
+        "message-groups response",
+    )
     await process_groups_response(config, state, groups_data)
-    groups_list = groups_data["aggregationData"]["groups"]
+    agg = expect_dict(groups_data["aggregationData"], "aggregationData")
+    groups_list = expect_list(agg["groups"], "groups")
 
-    target_group = next((g for g in groups_list if str(g["id"]) == group_id_str), None)
+    target_group = next(
+        (g for g in groups_list if str(expect_dict(g, "group")["id"]) == group_id_str),
+        None,
+    )
     if target_group is None:
         print_warning(
             f"Group {group_id_str} not found in available DM groups; "
@@ -102,10 +126,11 @@ async def download_messages_for_group(
     # Populate creator info from the group when the caller didn't supply it.
     # For 1:1 DMs, pick any user with a parseable ID — when state.creator_id
     # is already set by the caller (daemon senderId path), we trust it.
+    target_group = expect_dict(target_group, "target group")
     if state.creator_id is None:
-        for user in target_group["users"]:
+        for user in expect_list(target_group["users"], "group users"):
             try:
-                state.creator_id = int(user["userId"])
+                state.creator_id = int(str(expect_dict(user, "user")["userId"]))
                 break
             except (KeyError, TypeError, ValueError):
                 continue
@@ -156,7 +181,23 @@ async def _download_group_message_loop(
             return
 
         # Object contains: messages, accountMedia, accountMediaBundles, tips, tipGoals, stories
-        messages = config.get_api().get_json_response_contents(messages_response)
+        messages = expect_dict(
+            config.get_api().get_json_response_contents(messages_response),
+            "messages response",
+        )
+
+        try:
+            await check_page_duplicates(
+                config=config,
+                page_data=messages,
+                page_type="messages",
+                page_id=group_id,
+                cursor=msg_cursor if msg_cursor != "0" else None,
+                bypass=state.creator_access_changed,
+            )
+        except DuplicatePageError as e:
+            print_info_highlight(str(e))
+            return
 
         await process_messages_metadata(config, state, messages)
 
@@ -180,6 +221,7 @@ async def _download_group_message_loop(
         try:
             # Fansly rate-limiting fix
             await sleep(timing_jitter(2, 4))
-            msg_cursor = messages["messages"][-1]["id"]
+            msgs = expect_list(messages["messages"], "messages")
+            msg_cursor = str(expect_dict(msgs[-1], "message")["id"])
         except IndexError:
             return  # end of history

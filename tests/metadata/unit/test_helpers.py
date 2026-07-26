@@ -4,17 +4,18 @@ import gzip
 import json
 import logging
 import os
-import tempfile
 import time
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
+from typing import ClassVar
 from unittest.mock import patch
 
 import pytest
 from pydantic import Field as PydanticField
 
 from errors import StubNotImplementedError
+from helpers.common import parse_timestamp
 from metadata.models import (
     Account,
     AccountMediaBundle,
@@ -32,39 +33,11 @@ from metadata.models import (
     Post,
     RelationshipMetadata,
     TimelineStats,
-    _parse_timestamp,
     get_from_cache_by_type_name,
     get_store,
 )
 from tests.fixtures.utils.test_isolation import snowflake_id
 from textio.logging import SizeAndTimeRotatingFileHandler
-
-
-@pytest.fixture
-def log_setup():
-    """Set up test environment."""
-    temp_dir = Path(tempfile.mkdtemp())
-    log_filename = str(temp_dir / "test.log")
-    logger = logging.getLogger("test_logger")
-    logger.setLevel(logging.INFO)
-
-    yield str(temp_dir), log_filename, logger
-
-    # Cleanup
-    handler_list = (
-        logger.handlers.copy()
-    )  # Make a copy to avoid modification during iteration
-    for handler in handler_list:
-        logger.removeHandler(handler)
-        handler.close()
-
-    # Remove test files
-    try:
-        for file_path in temp_dir.iterdir():
-            file_path.unlink()
-        temp_dir.rmdir()
-    except OSError as e:
-        print(f"Warning: Cleanup issue: {e}")
 
 
 def test_size_based_rotation(log_setup):
@@ -259,13 +232,15 @@ def test_multiple_handlers(log_setup):
 # ── Models: Snowflake, identity, stubs, enums, timestamps ────────────────
 
 
+@pytest.mark.asyncio(loop_scope="class")
+@pytest.mark.xdist_group("helpers_models")
 class TestModelBehaviors:
     def test_snowflake_validation(self):
         with pytest.raises(Exception):
-            Media(id="bad", accountId=snowflake_id())
+            Media(id="bad", accountId=snowflake_id())  # type: ignore[arg-type]  # non-numeric id tests validation
         with pytest.raises(Exception):
             Media(id=999, accountId=snowflake_id())
-        m = Media(id=str(snowflake_id()), accountId=snowflake_id())
+        m = Media(id=str(snowflake_id()), accountId=snowflake_id())  # type: ignore[arg-type]  # str id tests int coercion
         assert isinstance(m.id, int)
 
     def test_get_store_uninitialized(self):
@@ -289,9 +264,8 @@ class TestModelBehaviors:
         assert hash(h) == hash(id(h))  # Unsaved → identity hash
         assert hash(a1) == hash((type(a1).__name__, a1.id))
 
-    @pytest.mark.asyncio
-    async def test_create_stub(self, entity_store):
-        """create_stub with fresh entity_store ensures clean identity map."""
+    async def test_create_stub(self, reset_class_store):
+        """create_stub with fresh store ensures clean identity map."""
         stub = Post.create_stub(snowflake_id(), accountId=snowflake_id())
         assert stub._is_new is True
         assert stub.id is not None
@@ -325,7 +299,7 @@ class TestModelBehaviors:
             id=snowflake_id(),
             postId=snowflake_id(),
             contentId=snowflake_id(),
-            contentType="ACCOUNT_MEDIA",
+            contentType="ACCOUNT_MEDIA",  # type: ignore[arg-type]  # enum-name str tests ContentType coercion
             pos=0,
         )
         assert att.contentType == ContentType.ACCOUNT_MEDIA
@@ -338,7 +312,7 @@ class TestModelBehaviors:
             postId=snowflake_id(),
             accountId=snowflake_id(),
             pos=0,
-            createdAt=1700000000000,
+            createdAt=1700000000000,  # type: ignore[arg-type]  # int ms tests datetime coercion
         )
         assert isinstance(pp.createdAt, datetime)
 
@@ -401,7 +375,6 @@ class TestModelBehaviors:
         assert m.width == 1920
         assert m.duration == 60.0
 
-    @pytest.mark.asyncio
     async def test_save_without_store(self):
         orig = FanslyObject._store
         try:
@@ -411,62 +384,61 @@ class TestModelBehaviors:
         finally:
             FanslyObject._store = orig
 
-    @pytest.mark.asyncio
-    async def test_save_clean_object_noop(self, entity_store):
+    async def test_save_clean_object_noop(self, class_entity_store):
         a = Account(id=snowflake_id(), username="clean")
-        await entity_store.save(a)
+        await class_entity_store.save(a)
         a.mark_clean()
         a._is_new = False
         await a.save()  # No-op, should not error
 
 
-# ── _parse_timestamp + _coerce_api_types edge cases ────────────────────
+# ── parse_timestamp + _coerce_api_types edge cases ────────────────────
 
 
 class TestTimestampAndCoercion:
     """Covers 411 (None/datetime passthrough), 416-418 (string ISO timestamp),
     534 (non-dict early return), 543 (surrogate encoding failure)."""
 
-    def test_parse_timestamp_none_and_datetime_passthrough(self):
-        assert _parse_timestamp(None) is None
+    def testparse_timestamp_none_and_datetime_passthrough(self):
+        assert parse_timestamp(None) is None
         now = datetime.now(UTC)
-        assert _parse_timestamp(now) is now
+        assert parse_timestamp(now) is now
 
-    def test_parse_timestamp_iso_string(self):
-        result = _parse_timestamp("2024-01-15T12:00:00Z")
+    def testparse_timestamp_iso_string(self):
+        result = parse_timestamp("2024-01-15T12:00:00Z")
         assert isinstance(result, datetime)
         assert result.year == 2024
         assert result.month == 1
         assert result.day == 15
 
-        result2 = _parse_timestamp("2024-06-15T00:00:00+00:00")
+        result2 = parse_timestamp("2024-06-15T00:00:00+00:00")
         assert isinstance(result2, datetime)
 
-    def test_parse_timestamp_unrecognized_type_passthrough(self):
+    def testparse_timestamp_unrecognized_type_passthrough(self):
         sentinel = [1, 2, 3]
-        assert _parse_timestamp(sentinel) is sentinel
-        assert _parse_timestamp({"key": "val"}) == {"key": "val"}
-        assert _parse_timestamp(object) is object
+        assert parse_timestamp(sentinel) is sentinel
+        assert parse_timestamp({"key": "val"}) == {"key": "val"}
+        assert parse_timestamp(object) is object
 
-    def test_parse_timestamp_float_seconds_subsecond_precision(self):
+    def testparse_timestamp_float_seconds_subsecond_precision(self):
         """Fansly WS broadcasts Message.createdAt as float seconds with ms
         decimal (observed ``1778563256.288``). Must preserve sub-second precision."""
-        result = _parse_timestamp(1778563256.288)
+        result = parse_timestamp(1778563256.288)
         assert isinstance(result, datetime)
         assert result.year == 2026
         assert result.tzinfo is UTC
         # 0.288 seconds = 288_000 microseconds; allow ±1 µs for fp rounding.
         assert abs(result.microsecond - 288_000) <= 1
 
-    def test_parse_timestamp_int_vs_float_seconds_same_instant(self):
+    def testparse_timestamp_int_vs_float_seconds_same_instant(self):
         """Int seconds and float seconds with .0 fraction must produce equal datetimes."""
-        a = _parse_timestamp(1778544106)
-        b = _parse_timestamp(1778544106.0)
+        a = parse_timestamp(1778544106)
+        b = parse_timestamp(1778544106.0)
         assert a == b
 
-    def test_parse_timestamp_float_milliseconds_above_threshold(self):
+    def testparse_timestamp_float_milliseconds_above_threshold(self):
         """Float ms (above 1e10) should divide by 1000 and still keep sub-ms precision."""
-        result = _parse_timestamp(1778563256288.5)
+        result = parse_timestamp(1778563256288.5)
         assert isinstance(result, datetime)
         assert result.year == 2026
         # 288.5 ms → 288_500 µs.
@@ -502,8 +474,14 @@ class TestTimestampAndCoercion:
 # ── _process_nested_cache_lookups all branches ─────────────────────────
 
 
+@pytest.mark.asyncio(loop_scope="class")
+@pytest.mark.xdist_group("helpers_nested_cache")
 class TestProcessNestedCacheLookups:
-    """Covers lines 666, 700, 722, 731-672, 734, 746, 753."""
+    """Covers lines 666, 700, 722, 731-672, 734, 746, 753.
+
+    Cache-resolution tests share ONE class-scoped DB and request
+    ``reset_class_store`` for a clean identity map per method.
+    """
 
     def test_store_is_none_returns_data_unchanged(self):
         orig_store = FanslyObject._store
@@ -515,8 +493,7 @@ class TestProcessNestedCacheLookups:
         finally:
             FanslyObject._store = orig_store
 
-    @pytest.mark.asyncio
-    async def test_relationship_value_none_skipped(self, entity_store):
+    async def test_relationship_value_none_skipped(self, reset_class_store):
         aid = snowflake_id()
         data = {
             "id": aid,
@@ -528,17 +505,17 @@ class TestProcessNestedCacheLookups:
         assert acct.avatar is None
         assert acct.banner is None
 
-    @pytest.mark.asyncio
-    async def test_list_items_int_cached_and_not_int_or_dict(self, entity_store):
+    async def test_list_items_int_cached_and_not_int_or_dict(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         acct = Account(id=aid, username="list_test")
-        await entity_store.save(acct)
+        await store.save(acct)
 
         cached_variant = Media(id=snowflake_id(), accountId=aid)
-        await entity_store.save(cached_variant)
+        await store.save(cached_variant)
 
         preresolved = Media(id=snowflake_id(), accountId=aid)
-        await entity_store.save(preresolved)
+        await store.save(preresolved)
 
         data = {
             "id": snowflake_id(),
@@ -552,11 +529,11 @@ class TestProcessNestedCacheLookups:
         assert cached_variant in result["variants"]
         assert preresolved in result["variants"]
 
-    @pytest.mark.asyncio
-    async def test_scalar_int_cached_with_alias(self, entity_store):
+    async def test_scalar_int_cached_with_alias(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         acct = Account(id=aid, username="alias_test")
-        await entity_store.save(acct)
+        await store.save(acct)
 
         uncached_id = snowflake_id()
         data = {"id": snowflake_id(), "accountId": aid, "account": uncached_id}
@@ -567,11 +544,11 @@ class TestProcessNestedCacheLookups:
         result2 = Media._process_nested_cache_lookups(data2)
         assert result2["account"] is acct
 
-    @pytest.mark.asyncio
-    async def test_scalar_dict_with_id_cached_and_not_cached(self, entity_store):
+    async def test_scalar_dict_with_id_cached_and_not_cached(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         cached_acct = Account(id=aid, username="cached_dict_test")
-        await entity_store.save(cached_acct)
+        await store.save(cached_acct)
 
         data = {
             "id": snowflake_id(),
@@ -591,8 +568,7 @@ class TestProcessNestedCacheLookups:
         assert isinstance(result2["account"], dict)
         assert result2["account"]["id"] == uncached_id
 
-    @pytest.mark.asyncio
-    async def test_scalar_dict_without_id_enriched(self, entity_store):
+    async def test_scalar_dict_without_id_enriched(self, reset_class_store):
         aid = snowflake_id()
         data = {
             "id": aid,
@@ -603,11 +579,11 @@ class TestProcessNestedCacheLookups:
         assert isinstance(result["timelineStats"], dict)
         assert result["timelineStats"]["imageCount"] == 42
 
-    @pytest.mark.asyncio
-    async def test_belongs_to_fk_column_cache_resolution(self, entity_store):
+    async def test_belongs_to_fk_column_cache_resolution(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         acct = Account(id=aid, username="fk_resolve_test")
-        await entity_store.save(acct)
+        await store.save(acct)
 
         data_cached = {"id": snowflake_id(), "accountId": aid}
         result = Media._process_nested_cache_lookups(data_cached)
@@ -618,11 +594,11 @@ class TestProcessNestedCacheLookups:
         result2 = Media._process_nested_cache_lookups(data_uncached)
         assert "account" not in result2
 
-    @pytest.mark.asyncio
-    async def test_alias_key_removal_for_list(self, entity_store):
+    async def test_alias_key_removal_for_list(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         acct = Account(id=aid, username="alias_list")
-        await entity_store.save(acct)
+        await store.save(acct)
 
         mention_id = snowflake_id()
         data = {
@@ -641,10 +617,11 @@ class TestProcessNestedCacheLookups:
         assert "mentions" in result
         assert "accountMentions" not in result
 
-    @pytest.mark.asyncio
-    async def test_scalar_alias_removal_all_paths(self, entity_store):
+    async def test_scalar_alias_removal_all_paths(self, reset_class_store):
+        store = reset_class_store
+
         class _AliasedParent(FanslyObject):
-            __table_name__: str = ""
+            __table_name__: ClassVar[str] = ""
             __tracked_fields__ = set()
             __relationships__ = {
                 "related": RelationshipMetadata(
@@ -664,7 +641,7 @@ class TestProcessNestedCacheLookups:
 
         aid = snowflake_id()
         acct = Account(id=aid, username="alias_scalar")
-        await entity_store.save(acct)
+        await store.save(acct)
 
         data_int_cached = {"id": snowflake_id(), "altRelated": aid}
         result1 = _AliasedParent._process_nested_cache_lookups(data_int_cached)
@@ -691,6 +668,8 @@ class TestProcessNestedCacheLookups:
 # ── to_db_dict, save, _get_id, mark_dirty, update_fields, normalize ────
 
 
+@pytest.mark.asyncio(loop_scope="class")
+@pytest.mark.xdist_group("helpers_serialization")
 class TestSerializationAndHelpers:
     def test_mark_dirty_clears_snapshot(self):
         a = Account(id=snowflake_id(), username="mark_dirty")
@@ -724,8 +703,7 @@ class TestSerializationAndHelpers:
         db2 = att.to_db_dict()
         assert db2["pos"] == 42
 
-    @pytest.mark.asyncio
-    async def test_save_calls_store_and_marks_clean(self, entity_store):
+    async def test_save_calls_store_and_marks_clean(self, class_entity_store):
         a = Account(id=snowflake_id(), username="save_test")
         a._is_new = True
         await a.save()
@@ -749,18 +727,19 @@ class TestSerializationAndHelpers:
         assert a.flags == 42
 
     def test_normalize_cdn_url_exception(self):
-        result = FanslyObject.normalize_cdn_url(12345)  # type: ignore[arg-type]
-        assert result == 12345
+        result = FanslyObject.normalize_cdn_url(12345)  # type: ignore[arg-type]  # non-str input tests passthrough
+        assert result == 12345  # type: ignore[comparison-overlap]  # non-str passthrough returns the int
 
-    def test_get_from_cache_by_type_name_unknown(self, entity_store):
-        result = get_from_cache_by_type_name(entity_store, "NonExistentType", 123)
+    def test_get_from_cache_by_type_name_unknown(self, reset_class_store):
+        result = get_from_cache_by_type_name(reset_class_store, "NonExistentType", 123)
         assert result is None
 
-    def test_get_from_cache_by_type_name_known(self, entity_store):
+    def test_get_from_cache_by_type_name_known(self, reset_class_store):
+        store = reset_class_store
         aid = snowflake_id()
         acct = Account(id=aid, username="registry_test")
-        entity_store.cache_instance(acct)
-        result = get_from_cache_by_type_name(entity_store, "Account", aid)
+        store.cache_instance(acct)
+        result = get_from_cache_by_type_name(store, "Account", aid)
         assert result is acct
 
 
@@ -813,6 +792,7 @@ class TestMediaPropertiesAndConversation:
             createdAt=datetime(2024, 6, 15, 12, 0, tzinfo=UTC),
         )
         assert m_set.created_at_timestamp > 0
+        assert m_set.createdAt is not None
         assert m_set.created_at_timestamp == m_set.createdAt.timestamp()
 
     def test_get_file_name_no_extension_no_url(self):

@@ -37,6 +37,8 @@ import httpx
 import pytest_asyncio
 import respx
 
+from api.fansly import FanslyApi
+from config.fanslyconfig import FanslyConfig
 from fansly_downloader_ng import main
 from tests.fixtures.api.fake_websocket import FakeSocket, fake_websocket_session
 from tests.fixtures.utils.test_isolation import snowflake_id
@@ -51,7 +53,7 @@ def fansly_json(payload: Any) -> dict[str, Any]:
     return {"success": "true", "response": payload}
 
 
-async def run_main_and_cleanup(config) -> int:
+async def run_main_and_cleanup(config: FanslyConfig) -> int:
     """Run ``main(config)`` and explicitly clean up the DB pool afterward.
 
     ``_async_main`` normally owns cleanup; when a test calls ``main()`` directly
@@ -63,9 +65,10 @@ async def run_main_and_cleanup(config) -> int:
     try:
         return await main(config)
     finally:
-        if getattr(config, "_database", None) is not None:
+        db = getattr(config, "_database", None)
+        if db is not None:
             with suppress(Exception):
-                await config._database.cleanup()
+                await db.cleanup()
 
 
 @dataclass
@@ -155,7 +158,7 @@ class MainIntegrationEnv:
         # Page 1: the following relationships. Second page is empty so the
         # paginator terminates.
         respx.get(
-            url__startswith=f"https://apiv3.fansly.com/api/v1/account/{self.client_id}/following"
+            url__startswith=FanslyApi.FOLLOWING_ENDPOINT.format(self.client_id)
         ).mock(
             side_effect=[
                 httpx.Response(
@@ -180,9 +183,9 @@ class MainIntegrationEnv:
                 results = [accounts_by_id[i] for i in requested if i in accounts_by_id]
                 return httpx.Response(200, json=fansly_json(results))
 
-            respx.get(
-                url__startswith="https://apiv3.fansly.com/api/v1/account?ids="
-            ).mock(side_effect=_account_by_id_lookup)
+            respx.get(url__startswith=FanslyApi.ACCOUNT_BY_ID_ENDPOINT.format("")).mock(
+                side_effect=_account_by_id_lookup
+            )
 
     def register_empty_content(self, response_count: int = 10) -> None:
         """Register every download-mode endpoint with an empty-result response.
@@ -203,7 +206,7 @@ class MainIntegrationEnv:
         their own mode-specific route BEFORE calling this (respx matches the
         most specific registered route first).
         """
-        respx.get(url__startswith="https://apiv3.fansly.com/api/v1/timelinenew/").mock(
+        respx.get(url__startswith=FanslyApi.TIMELINE_NEW_ENDPOINT.format("")).mock(
             side_effect=[
                 httpx.Response(
                     200,
@@ -220,7 +223,7 @@ class MainIntegrationEnv:
             * response_count
         )
         # messages.py:41 indexes into ``aggregationData.groups`` unconditionally.
-        respx.get("https://apiv3.fansly.com/api/v1/messaging/groups").mock(
+        respx.get(FanslyApi.MESSAGING_GROUPS_ENDPOINT).mock(
             side_effect=[
                 httpx.Response(
                     200,
@@ -229,13 +232,11 @@ class MainIntegrationEnv:
             ]
             * response_count
         )
-        respx.get("https://apiv3.fansly.com/api/v1/mediastoriesnew").mock(
+        respx.get(FanslyApi.MEDIA_STORIES_NEW_ENDPOINT).mock(
             side_effect=[httpx.Response(200, json=fansly_json({"stories": []}))]
             * response_count
         )
-        respx.get(
-            url__startswith="https://apiv3.fansly.com/api/v1/account/media/orders"
-        ).mock(
+        respx.get(url__startswith=FanslyApi.ACCOUNT_MEDIA_ORDERS_ENDPOINT).mock(
             side_effect=[
                 httpx.Response(200, json=fansly_json({"accountMediaOrders": []}))
             ]
@@ -243,7 +244,7 @@ class MainIntegrationEnv:
         )
         # Single post lookup — download/single.py:67 reads
         # ``accountMediaBundles`` and ``accountMedia`` unconditionally.
-        respx.get(url__startswith="https://apiv3.fansly.com/api/v1/post").mock(
+        respx.get(url__startswith=FanslyApi.POST_ENDPOINT).mock(
             side_effect=[
                 httpx.Response(
                     200,
@@ -261,7 +262,7 @@ class MainIntegrationEnv:
         )
         # Catch-all for account-scoped endpoints (walls, etc.) used by Wall mode.
         # This is registered LAST so more specific account/... routes win.
-        respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/").mock(
+        respx.get(url__startswith=f"{FanslyApi.BASE_URL}account/").mock(
             side_effect=[httpx.Response(200, json=fansly_json([]))] * response_count
         )
 
@@ -298,7 +299,7 @@ def mount_client_account_me_route(
         The mounted respx route — assert on ``.call_count`` for "did the
         client account fetch fire?" verification.
     """
-    return respx.get("https://apiv3.fansly.com/api/v1/account/me").mock(
+    return respx.get(FanslyApi.ACCOUNT_ME_ENDPOINT).mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -383,13 +384,13 @@ def mount_empty_creator_pipeline(
 
     routes: dict[str, respx.Route] = {}
     routes["account"] = respx.get(
-        url__startswith="https://apiv3.fansly.com/api/v1/account?usernames="
+        url__startswith=FanslyApi.ACCOUNT_BY_USERNAME_ENDPOINT.format("")
     ).mock(
         side_effect=[httpx.Response(200, json=fansly_json([account_payload]))]
         * response_count
     )
     routes["timeline"] = respx.get(
-        url__startswith=(f"https://apiv3.fansly.com/api/v1/timelinenew/{creator_id}")
+        url__startswith=FanslyApi.TIMELINE_NEW_ENDPOINT.format(creator_id)
     ).mock(
         side_effect=[
             httpx.Response(
@@ -409,7 +410,7 @@ def mount_empty_creator_pipeline(
         * response_count
     )
     routes["stories"] = respx.get(
-        url__startswith="https://apiv3.fansly.com/api/v1/mediastoriesnew"
+        url__startswith=FanslyApi.MEDIA_STORIES_NEW_ENDPOINT
     ).mock(
         side_effect=[
             httpx.Response(
@@ -429,7 +430,7 @@ def mount_empty_creator_pipeline(
         * response_count
     )
     routes["messages"] = respx.get(
-        url__startswith="https://apiv3.fansly.com/api/v1/messaging/groups"
+        url__startswith=FanslyApi.MESSAGING_GROUPS_ENDPOINT
     ).mock(
         side_effect=[
             httpx.Response(
@@ -469,10 +470,57 @@ def mount_empty_following_route(client_id: int) -> respx.Route:
         following refresh fire?" verification.
     """
     return respx.get(
-        url__startswith=(
-            f"https://apiv3.fansly.com/api/v1/account/{client_id}/following"
-        )
+        url__startswith=FanslyApi.FOLLOWING_ENDPOINT.format(client_id)
     ).mock(side_effect=[httpx.Response(200, json=fansly_json([]))])
+
+
+_M3U8_DEFAULT_PLAYLIST = (
+    "#EXTM3U\n"
+    "#EXT-X-VERSION:3\n"
+    "#EXT-X-PLAYLIST-TYPE:VOD\n"
+    "#EXT-X-TARGETDURATION:10\n"
+    "#EXTINF:10.0,\n"
+    "segment1.ts\n"
+    "#EXTINF:8.0,\n"
+    "segment2.ts\n"
+    "#EXT-X-ENDLIST\n"
+)
+
+
+def mount_m3u8_segment_routes(
+    *,
+    base_url: str = "https://example.com",
+    playlist_text: str | None = None,
+    segment_bytes: bytes = b"\x00" * 256,
+    segment_status: int = 200,
+    segment_count: int = 2,
+    segment_raises: Exception | None = None,
+) -> tuple[respx.Route, respx.Route]:
+    """Mount respx routes for an m3u8 segment download test.
+
+    Returns ``(playlist_route, segment_route)`` so callers can inspect
+    ``.calls`` and ``.call_count``. Routes are declared narrow-first
+    (segment then playlist) so the more-specific match wins.
+    """
+    if playlist_text is None:
+        playlist_text = _M3U8_DEFAULT_PLAYLIST
+    # CORS preflight blanket — pad for playlist + each segment.
+    respx.options(url__startswith=f"{base_url}/").mock(
+        side_effect=[httpx.Response(200)] * (segment_count + 2)
+    )
+    if segment_raises is not None:
+        segment_route = respx.get(url__startswith=f"{base_url}/segment").mock(
+            side_effect=[segment_raises] * segment_count
+        )
+    else:
+        segment_route = respx.get(url__startswith=f"{base_url}/segment").mock(
+            side_effect=[httpx.Response(segment_status, content=segment_bytes)]
+            * segment_count
+        )
+    playlist_route = respx.get(url__startswith=f"{base_url}/v.m3u8").mock(
+        side_effect=[httpx.Response(200, text=playlist_text)]
+    )
+    return playlist_route, segment_route
 
 
 def _register_baseline_routes(
@@ -492,14 +540,14 @@ def _register_baseline_routes(
     matches the pattern at ``tests/fixtures/stash/stash_api_fixtures.py:265``
     where the stash fixture also uses a blanket default responder.
     """
-    respx.route(method="OPTIONS", url__startswith="https://apiv3.fansly.com/").mock(
+    respx.route(method="OPTIONS", url__startswith=FanslyApi.BASE_URL).mock(
         side_effect=[httpx.Response(200)] * options_response_count
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/device/id").mock(
+    respx.get(url__startswith=FanslyApi.DEVICE_ID_ENDPOINT).mock(
         side_effect=[httpx.Response(200, json=fansly_json(device_id))]
         * get_response_count
     )
-    respx.get("https://apiv3.fansly.com/api/v1/account/me").mock(
+    respx.get(FanslyApi.ACCOUNT_ME_ENDPOINT).mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -522,7 +570,7 @@ def _register_baseline_routes(
 def _register_account_lookup_route(
     accounts_by_username: dict[str, dict[str, Any]],
 ) -> None:
-    """Register ``/api/v1/account?usernames=…`` with a pivoting responder.
+    """Register ``/api/v1/account?usernames=...`` with a pivoting responder.
 
     Both ``load_client_account_into_db`` (clientuser) and per-creator lookups
     (testcreator plus anything added via ``env.add_creator``) hit this URL.
@@ -540,9 +588,9 @@ def _register_account_lookup_route(
         ]
         return httpx.Response(200, json=fansly_json(results))
 
-    respx.get(
-        url__startswith="https://apiv3.fansly.com/api/v1/account?usernames="
-    ).mock(side_effect=_account_lookup)
+    respx.get(url__startswith=FanslyApi.ACCOUNT_BY_USERNAME_ENDPOINT.format("")).mock(
+        side_effect=_account_lookup
+    )
 
 
 @pytest_asyncio.fixture

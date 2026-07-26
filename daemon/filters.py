@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from collections.abc import Sequence
+from datetime import datetime
+from typing import TYPE_CHECKING
 
 from loguru import logger
+from pydantic import JsonValue
 
+from helpers.common import JsonDict, expect_dict, expect_list, parse_timestamp
 from metadata.models import MonitorState, get_store
 
 
@@ -21,36 +24,22 @@ if TYPE_CHECKING:
 MAX_FILTER_PAGES = 3
 
 
-def _parse_created_at(raw: Any) -> datetime | None:
-    """Coerce a post's ``createdAt`` value to a UTC datetime, or None.
-
-    Fansly returns ``createdAt`` as milliseconds since epoch in raw API
-    responses, and ``convert_ids_to_int`` preserves that int form. The
-    ``_parse_timestamp`` heuristic (``> 1e10`` -- ms) is mirrored here so
-    we can reuse the exact same boundary the metadata-model validators
-    use, without importing the private helper.
-    """
-    if isinstance(raw, datetime):
-        return raw
-    if isinstance(raw, (int, float)):
-        ts = raw / 1000 if raw > 1e10 else raw
-        return datetime.fromtimestamp(ts, UTC)
-    return None
-
-
 def _is_newer_than_baseline(
-    post: dict,
+    post: JsonDict,
     baseline: datetime,
     creator_id: int,
 ) -> bool:
     """Compare a post's createdAt to the baseline.
 
-    Returns True when the post is strictly newer than the baseline.
-    Returns True conservatively when the timestamp is unparseable so we
+    Returns True when the post is strictly newer than the baseline, and
+    True conservatively when the timestamp is missing or unparseable so we
     do not miss content.
     """
-    latest = _parse_created_at(post.get("createdAt", 0))
-    if latest is None:
+    try:
+        latest = parse_timestamp(post.get("createdAt", 0))
+    except (ValueError, TypeError):
+        latest = None
+    if not isinstance(latest, datetime):
         logger.warning(
             "daemon.filters: unrecognised createdAt for creator {} -- processing anyway",
             creator_id,
@@ -68,7 +57,7 @@ def _is_newer_than_baseline(
 
 
 def _examine_page(
-    posts: list[dict],
+    posts: Sequence[JsonValue],
     baseline: datetime,
     creator_id: int,
 ) -> bool | None:
@@ -81,7 +70,8 @@ def _examine_page(
     """
     if not posts:
         return False
-    non_pinned = [p for p in posts if not p.get("pinned", False)]
+    page = [expect_dict(p, "post") for p in posts]
+    non_pinned = [p for p in page if not p.get("pinned", False)]
     if non_pinned:
         return _is_newer_than_baseline(non_pinned[0], baseline, creator_id)
     return None  # all pinned -- keep paginating
@@ -92,7 +82,7 @@ async def should_process_creator(
     creator_id: int,
     *,
     session_baseline: datetime | None = None,
-    prefetched_posts: list[dict] | None = None,
+    prefetched_posts: Sequence[JsonValue] | None = None,
 ) -> bool:
     """Return True if the creator should be processed this daemon tick.
 
@@ -151,16 +141,23 @@ async def should_process_creator(
         if decision is not None:
             return decision
         # All pinned in prefetched -- derive cursor from oldest post
-        cursor = str(prefetched_posts[-1].get("id", "0")) if prefetched_posts else "0"
+        cursor = (
+            str(expect_dict(prefetched_posts[-1], "post").get("id", "0"))
+            if prefetched_posts
+            else "0"
+        )
     else:
         cursor = "0"
 
     # -- Paginate until non-pinned found or cap reached -----------------------
     for _page in range(MAX_FILTER_PAGES):
         try:
-            response = await config._api.get_timeline(creator_id, cursor)
-            data = config._api.get_json_response_contents(response)
-            posts: list[dict] = data.get("posts", [])
+            api = config.get_api()
+            response = await api.get_timeline(creator_id, cursor)
+            data = api.get_json_response_contents(response)
+            if not isinstance(data, dict):
+                raise TypeError("Fansly API: expected a timeline object response")
+            posts = expect_list(data.get("posts", []), "timeline posts")
         except Exception as exc:
             logger.warning(
                 "daemon.filters: timeline fetch failed for creator {} page cursor={} -- processing anyway: {}",
@@ -175,7 +172,7 @@ async def should_process_creator(
             return decision
 
         # All pinned on this page -- advance cursor to oldest post's id
-        cursor = str(posts[-1].get("id", "0"))
+        cursor = str(expect_dict(posts[-1], "post").get("id", "0"))
 
     # All MAX_FILTER_PAGES pages were pinned -- legit pinned-heavy creator
     logger.debug(

@@ -26,22 +26,6 @@ from helpers.rich_progress import ProgressManager
 
 
 # ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def progress_manager():
-    """Fresh ProgressManager per test to avoid bleed-over of task state.
-
-    The module-level _progress_manager singleton accumulates tasks across
-    tests and sessions, which would make "no tasks leaked" assertions
-    unreliable. A fresh instance per test gives each case its own slate.
-    """
-    return ProgressManager()
-
-
-# ---------------------------------------------------------------------------
 # make_dashboard factory
 # ---------------------------------------------------------------------------
 
@@ -113,60 +97,53 @@ class TestDashboardLifecycle:
 class TestDashboardState:
     """set_simulator_state / set_ws_state update the status line correctly."""
 
+    @pytest.mark.parametrize(
+        ("state", "label", "style"),
+        [
+            pytest.param("active", "ACTIVE", "bold green", id="active-green"),
+            pytest.param("idle", "IDLE", "bold yellow", id="idle-yellow"),
+            pytest.param("hidden", "HIDDEN", "dim", id="hidden-dim"),
+            pytest.param(
+                "quantum_superposition",
+                "QUANTUM_SUPERPOSITION",
+                "bold red",
+                id="unknown-falls-back-to-red",
+            ),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_simulator_state_active_shows_green(self, progress_manager):
-        dashboard = DaemonDashboard(progress=progress_manager)
-        async with dashboard:
-            dashboard.set_simulator_state("active")
-            rendered = dashboard._format_status_line()
-        assert "ACTIVE" in rendered
-        assert "bold green" in rendered
+    async def test_simulator_state_styles(
+        self, progress_manager: ProgressManager, state: str, label: str, style: str
+    ) -> None:
+        """Each simulator state renders its label in the expected style.
 
-    @pytest.mark.asyncio
-    async def test_simulator_state_idle_shows_yellow(self, progress_manager):
+        The unknown-state row verifies the bold-red fallback — a regression
+        signal for unexpected states.
+        """
         dashboard = DaemonDashboard(progress=progress_manager)
         async with dashboard:
-            dashboard.set_simulator_state("idle")
+            dashboard.set_simulator_state(state)
             rendered = dashboard._format_status_line()
-        assert "IDLE" in rendered
-        assert "bold yellow" in rendered
+        assert label in rendered
+        assert style in rendered
 
+    @pytest.mark.parametrize(
+        ("connected", "label", "style"),
+        [
+            pytest.param(True, "connected", "[green]", id="connected-green"),
+            pytest.param(False, "disconnected", "[red]", id="disconnected-red"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_simulator_state_hidden_shows_dim(self, progress_manager):
+    async def test_ws_state_styles(
+        self, progress_manager: ProgressManager, connected: bool, label: str, style: str
+    ) -> None:
         dashboard = DaemonDashboard(progress=progress_manager)
         async with dashboard:
-            dashboard.set_simulator_state("hidden")
+            dashboard.set_ws_state(connected=connected)
             rendered = dashboard._format_status_line()
-        assert "HIDDEN" in rendered
-        assert "dim" in rendered
-
-    @pytest.mark.asyncio
-    async def test_unknown_state_falls_back_to_red(self, progress_manager):
-        """An unexpected state is shown in bold red — a regression signal."""
-        dashboard = DaemonDashboard(progress=progress_manager)
-        async with dashboard:
-            dashboard.set_simulator_state("quantum_superposition")
-            rendered = dashboard._format_status_line()
-        assert "QUANTUM_SUPERPOSITION" in rendered
-        assert "bold red" in rendered
-
-    @pytest.mark.asyncio
-    async def test_ws_connected_shows_green(self, progress_manager):
-        dashboard = DaemonDashboard(progress=progress_manager)
-        async with dashboard:
-            dashboard.set_ws_state(connected=True)
-            rendered = dashboard._format_status_line()
-        assert "connected" in rendered
-        assert "[green]" in rendered
-
-    @pytest.mark.asyncio
-    async def test_ws_disconnected_shows_red(self, progress_manager):
-        dashboard = DaemonDashboard(progress=progress_manager)
-        async with dashboard:
-            dashboard.set_ws_state(connected=False)
-            rendered = dashboard._format_status_line()
-        assert "disconnected" in rendered
-        assert "[red]" in rendered
+        assert label in rendered
+        assert style in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -311,6 +288,57 @@ class TestWaitWithCountdown:
 
         assert triggered is False
         assert 0.18 <= elapsed <= 0.8, f"Expected ~0.2s duration, got {elapsed:.2f}s"
+
+    @pytest.mark.asyncio
+    async def test_fixed_duration_loop_does_not_get_stuck_at_zero_remaining(
+        self, progress_manager
+    ):
+        """After a natural timeout, the next iteration's countdown must not show 00:00.
+
+        Rich's Task.finished_time, once set, makes time_remaining short-circuit
+        to 0.0 — TimeRemainingColumn then renders "00:00". Plain
+        Progress.update() only clears finished_time when ``total`` changes.
+        Fixed-duration loops (simulator tick, following refresh) keep the same
+        total each iteration, so without an explicit reset the bar gets stuck
+        at 00:00 from the second iteration onward.
+
+        Verified mid-tick because the early-return path at the end of
+        wait_with_countdown paints completed=total_ticks (which re-finishes
+        the task). The bug manifests *during* the next countdown, not after.
+        """
+        dashboard = DaemonDashboard(progress=progress_manager)
+        stop_event = asyncio.Event()
+
+        async with dashboard:
+            # First iteration: run to natural timeout — bar hits 100% →
+            # Rich marks the task finished.
+            await dashboard.wait_with_countdown(
+                TASK_SIMULATOR, "Simulator tick", 0.15, stop_event
+            )
+            task_id = progress_manager.active_tasks[TASK_SIMULATOR]
+            task = progress_manager._groups["daemon"]._tasks[task_id]
+            assert task.finished_time is not None, (
+                "Setup precondition: first iteration should finish the bar"
+            )
+
+            # Second iteration: SAME duration. Start the wait as a background
+            # task, peek at the task state mid-countdown, then signal stop.
+            wait_task = asyncio.create_task(
+                dashboard.wait_with_countdown(
+                    TASK_SIMULATOR, "Simulator tick", 5.0, stop_event
+                )
+            )
+            try:
+                await asyncio.sleep(0.05)
+                task_mid = progress_manager._groups["daemon"]._tasks[task_id]
+                assert task_mid.finished_time is None, (
+                    "Mid-countdown: re-entering wait_with_countdown must reset "
+                    "finished_time; otherwise TimeRemainingColumn renders 00:00"
+                )
+                assert task_mid.time_remaining is None or task_mid.time_remaining > 0
+            finally:
+                stop_event.set()
+                await wait_task
 
     @pytest.mark.asyncio
     async def test_waiters_are_cleaned_up_after_return(self, progress_manager):

@@ -1,9 +1,5 @@
 """Integration tests for the fnmanip module."""
 
-import shutil
-import tempfile
-from pathlib import Path
-
 import imagehash
 import pytest
 from PIL import Image
@@ -14,68 +10,6 @@ from fileio.fnmanip import (
     get_hash_for_image,
     get_hash_for_other_content,
 )
-
-
-@pytest.fixture
-def temp_dir():
-    """Create a temporary directory for test files."""
-    temp_dir = tempfile.mkdtemp()
-    yield Path(temp_dir)
-    shutil.rmtree(temp_dir)
-
-
-@pytest.fixture
-def valid_image_file(temp_dir):
-    """Create a valid image file for testing."""
-    file_path = temp_dir / "test_image.jpg"
-
-    # Create a simple 10x10 red image
-    image = Image.new("RGB", (10, 10), color="red")
-    image.save(file_path)
-
-    return file_path
-
-
-@pytest.fixture
-def valid_mp4_file(temp_dir):
-    """Create a valid minimal MP4 file for testing."""
-    file_path = temp_dir / "valid.mp4"
-
-    # Create a minimal valid MP4 file
-    with file_path.open("wb") as f:
-        # ftyp box (24 bytes)
-        f.write(bytes.fromhex("00000018 66747970 6D703432 00000000 6D703432 00000000"))
-        # free box (16 bytes)
-        f.write(bytes.fromhex("00000010 66726565 00000000 00000000"))
-        # mdat box (16 bytes)
-        f.write(bytes.fromhex("00000010 6D646174 00000000 00000000"))
-
-    return file_path
-
-
-@pytest.fixture
-def invalid_image_file(temp_dir):
-    """Create an invalid image file for testing."""
-    file_path = temp_dir / "invalid_image.jpg"
-
-    # Create a file that's not a valid image
-    with file_path.open("wb") as f:
-        f.write(b"This is not a valid image file")
-
-    return file_path
-
-
-@pytest.fixture
-def invalid_mp4_file(temp_dir):
-    """Create an invalid MP4 file for testing."""
-    file_path = temp_dir / "invalid.mp4"
-
-    # Create an invalid MP4 file (missing ftyp box)
-    with file_path.open("wb") as f:
-        # moov box (16 bytes)
-        f.write(bytes.fromhex("00000010 6D6F6F76 00000000 00000000"))
-
-    return file_path
 
 
 class TestExtractorsIntegration:
@@ -99,7 +33,12 @@ class TestImageHashIntegration:
     """Integration tests for the image hashing functions."""
 
     def test_get_hash_for_image_with_real_file(self, valid_image_file):
-        """Test get_hash_for_image with a real image file."""
+        """Test get_hash_for_image with a real image file.
+
+        Pinning the result to the deterministic direct ``imagehash.phash``
+        computation also subsumes the former consistency test (two calls both
+        equal the same direct hash, so they equal each other).
+        """
         # Get the hash
         hash_result = get_hash_for_image(valid_image_file)
 
@@ -113,15 +52,6 @@ class TestImageHashIntegration:
 
         assert hash_result == direct_hash
 
-    def test_get_hash_for_image_consistency(self, valid_image_file):
-        """Test that get_hash_for_image returns consistent results."""
-        # Get the hash twice
-        hash1 = get_hash_for_image(valid_image_file)
-        hash2 = get_hash_for_image(valid_image_file)
-
-        # Verify the results are the same
-        assert hash1 == hash2
-
     def test_get_hash_for_image_with_invalid_file(self, invalid_image_file):
         """Test get_hash_for_image with an invalid image file."""
         # Try to get the hash of an invalid image
@@ -131,10 +61,10 @@ class TestImageHashIntegration:
         # Verify the error message
         assert "Failed to verify image" in str(excinfo.value)
 
-    def test_get_hash_for_image_with_nonexistent_file(self, temp_dir):
+    def test_get_hash_for_image_with_nonexistent_file(self, tmp_path):
         """Test get_hash_for_image with a non-existent file."""
         # Try to get the hash of a non-existent file
-        nonexistent_file = temp_dir / "nonexistent.jpg"
+        nonexistent_file = tmp_path / "nonexistent.jpg"
         with pytest.raises(Exception):
             get_hash_for_image(nonexistent_file)
 
@@ -143,7 +73,12 @@ class TestVideoHashIntegration:
     """Integration tests for the video hashing functions."""
 
     def test_get_hash_for_other_content_with_real_file(self, valid_mp4_file):
-        """Test get_hash_for_other_content with a real MP4 file."""
+        """Test get_hash_for_other_content with a real MP4 file.
+
+        Unlike the image test there is no deterministic direct-hash anchor
+        here, so the former consistency test's two-call equality assertion is
+        carried into this test rather than dropped.
+        """
         # Get the hash
         hash_result = get_hash_for_other_content(valid_mp4_file)
 
@@ -156,14 +91,8 @@ class TestVideoHashIntegration:
         # Check that it only contains hex characters
         assert all(c in "0123456789abcdef" for c in hash_result.lower())
 
-    def test_get_hash_for_other_content_consistency(self, valid_mp4_file):
-        """Test that get_hash_for_other_content returns consistent results."""
-        # Get the hash twice
-        hash1 = get_hash_for_other_content(valid_mp4_file)
-        hash2 = get_hash_for_other_content(valid_mp4_file)
-
-        # Verify the results are the same
-        assert hash1 == hash2
+        # Consistency: a second call over the same file yields the same hash.
+        assert get_hash_for_other_content(valid_mp4_file) == hash_result
 
     def test_get_hash_for_other_content_with_invalid_file(self, invalid_mp4_file):
         """Test get_hash_for_other_content with an invalid MP4 file."""
@@ -175,9 +104,9 @@ class TestVideoHashIntegration:
         assert "File header missing" in str(excinfo.value)
         assert "not an MPEG-4 file" in str(excinfo.value)
 
-    def test_get_hash_for_other_content_with_nonexistent_file(self, temp_dir):
+    def test_get_hash_for_other_content_with_nonexistent_file(self, tmp_path):
         """Test get_hash_for_other_content with a non-existent file."""
         # Try to get the hash of a non-existent file
-        nonexistent_file = temp_dir / "nonexistent.mp4"
+        nonexistent_file = tmp_path / "nonexistent.mp4"
         with pytest.raises(RuntimeError):
             get_hash_for_other_content(nonexistent_file)

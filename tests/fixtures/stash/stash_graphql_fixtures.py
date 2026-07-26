@@ -11,12 +11,11 @@ Key Principles:
 - Return data in the format that gql.Client.execute() returns
 
 Usage:
-    import respx
     import httpx
+    import respx
     from tests.fixtures.stash import create_graphql_response, create_find_tags_result
 
-    @respx.mock
-    async def test_find_tags(tag_mixin):
+    async def test_find_tags(respx_stash_processor):
         # Create response data
         tags_data = create_find_tags_result(count=1, tags=[
             {"id": "123", "name": "test", "aliases": [], "parents": [], "children": []}
@@ -33,9 +32,8 @@ Usage:
             ]
         )
 
-        # Initialize client and test
-        await tag_mixin.context.get_client()
-        result = await tag_mixin.context.client.find_tags(tag_filter={"name": {"value": "test"}})
+        client = respx_stash_processor.context.client
+        result = await client.find_tags(tag_filter={"name": {"value": "test"}})
         assert result.count == 1
 """
 
@@ -177,7 +175,7 @@ def create_performer_dict(
     gender: str | None = None,
     tags: list[dict] | None = None,
     stash_ids: list[dict] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Create a Performer dict matching the Performer type schema.
 
@@ -297,7 +295,7 @@ def create_scene_dict(
     studio: dict | None = None,
     performers: list[dict] | None = None,
     tags: list[dict] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Create a Scene dict matching the Scene type schema.
 
@@ -370,7 +368,7 @@ def create_image_dict(
     studio: dict | None = None,
     performers: list[dict] | None = None,
     tags: list[dict] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Create an Image dict matching the Image type schema.
 
@@ -398,6 +396,75 @@ def create_image_dict(
         "urls": [],
         "galleries": [],
         "organized": False,
+    }
+    base.update(kwargs)
+    return base
+
+
+def create_image_file_dict(id: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    """Create an Image ``visual_files[]`` entry SGC parses into an ImageFile.
+
+    Carries ``__typename`` (union discriminator) plus the required BaseFile/
+    ImageFile fields so the find-fragment re-fetch yields a path-resolved
+    ImageFile. Override any field via kwargs.
+
+    Args:
+        id: ImageFile ID
+        path: Absolute file path (drives ownership classification)
+        **kwargs: Additional/override fields
+
+    Returns:
+        Dict matching the ImageFile member of the VisualFile union
+    """
+    base = {
+        "__typename": "ImageFile",
+        "id": id,
+        "path": path,
+        "basename": path.rsplit("/", 1)[-1],
+        "parent_folder_id": "folder_1",
+        "size": 1,
+        "width": 800,
+        "height": 600,
+        "format": "jpg",
+        "fingerprints": [],
+        "mod_time": "2024-01-01T00:00:00Z",
+    }
+    base.update(kwargs)
+    return base
+
+
+def create_video_file_dict(id: str, path: str, **kwargs: Any) -> dict[str, Any]:
+    """Create a Scene ``files[]`` entry SGC parses into a VideoFile.
+
+    Carries ``__typename`` (the BaseFile union discriminator) plus the common
+    BaseFile/VideoFile fields so a findScenes re-fetch yields path-resolved
+    files. Override any field via kwargs.
+
+    Args:
+        id: VideoFile ID
+        path: Absolute file path (drives primary/ownership classification)
+        **kwargs: Additional/override fields
+
+    Returns:
+        Dict matching the VideoFile member of the BaseFile union
+    """
+    base = {
+        "__typename": "VideoFile",
+        "id": id,
+        "path": path,
+        "basename": path.rsplit("/", 1)[-1],
+        "parent_folder_id": "folder_1",
+        "size": 1,
+        "width": 1920,
+        "height": 1080,
+        "format": "mp4",
+        "duration": 1.0,
+        "video_codec": "h264",
+        "audio_codec": "aac",
+        "frame_rate": 30.0,
+        "bit_rate": 1,
+        "fingerprints": [],
+        "mod_time": "2024-01-01T00:00:00Z",
     }
     base.update(kwargs)
     return base
@@ -431,7 +498,7 @@ def create_gallery_dict(
     tags: list[dict] | None = None,
     scenes: list[dict] | None = None,
     images: list[dict] | None = None,
-    **kwargs,
+    **kwargs: Any,
 ) -> dict[str, Any]:
     """Create a Gallery dict matching the Gallery type schema.
 
@@ -507,7 +574,9 @@ def create_gallery_update_result(gallery: dict[str, Any]) -> dict[str, Any]:
     return gallery
 
 
-def create_find_gallery_result(gallery: dict[str, Any] | None = None) -> dict[str, Any]:
+def create_find_gallery_result(
+    gallery: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Create a findGallery query result (single gallery lookup).
 
     Args:

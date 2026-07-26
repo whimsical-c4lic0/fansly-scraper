@@ -2,11 +2,13 @@
 
 import asyncio
 import traceback
-from typing import Any
+
+from pydantic import JsonValue
 
 from config import FanslyConfig
 from errors import ApiError, DuplicateCountError, DuplicatePageError
-from metadata import Media, Post, Wall
+from helpers.common import JsonDict, expect_dict, expect_int, expect_list
+from metadata import Media, Message, Post, Wall
 from metadata.models import get_store
 from pathio import set_create_directory_for_download
 from textio import input_enter_continue, print_error, print_info, print_warning
@@ -16,27 +18,37 @@ from .media import download_media
 from .types import DownloadType
 
 
-def get_unique_media_ids(info_object: dict[str, Any]) -> list[int]:
+def get_unique_media_ids(info_object: JsonDict) -> list[int]:
     """Extracts a unique list of media IDs from `accountMedia` and
     `accountMediaBundles` of prominent Fansly API objects.
     """
-    account_media = info_object.get("accountMedia", [])
-    media_bundles = info_object.get("accountMediaBundles", [])
+    account_media = expect_list(info_object.get("accountMedia", []), "accountMedia")
+    media_bundles = expect_list(
+        info_object.get("accountMediaBundles", []), "accountMediaBundles"
+    )
 
-    def check(item: Any) -> bool:
+    def check(item: JsonValue) -> bool:
         if item is None:
             raise ApiError(
                 "Media items in response are empty - this is most probably a Fansly API/countermeasure issue."
             )
         return True
 
-    account_media_ids = [int(media["id"]) for media in account_media if check(media)]
+    account_media_ids = [
+        expect_int(expect_dict(media, "accountMedia")["id"], "id")
+        for media in account_media
+        if check(media)
+    ]
 
-    bundle_media_ids = []
-    for id_list in [
-        bundle["accountMediaIds"] for bundle in media_bundles if check(bundle)
-    ]:
-        bundle_media_ids.extend(int(mid) for mid in id_list)
+    bundle_media_ids: list[int] = []
+    for bundle in media_bundles:
+        if not check(bundle):
+            continue
+        id_list = expect_list(
+            expect_dict(bundle, "accountMediaBundle")["accountMediaIds"],
+            "accountMediaIds",
+        )
+        bundle_media_ids.extend(expect_int(mid, "accountMediaId") for mid in id_list)
 
     all_media_ids: set[int] = set()
     for media_id in account_media_ids:
@@ -47,35 +59,54 @@ def get_unique_media_ids(info_object: dict[str, Any]) -> list[int]:
     return list(all_media_ids)
 
 
+_PAGE_TYPE_CONFIG: dict[str, tuple[str, type]] = {
+    "timeline": ("posts", Post),
+    "wall": ("posts", Post),
+    "messages": ("messages", Message),
+}
+
+
 async def check_page_duplicates(
     config: FanslyConfig,
-    page_data: dict[str, Any],
+    page_data: JsonDict,
     page_type: str,
     page_id: int | str | None = None,
     cursor: int | str | None = None,
+    bypass: bool = False,
 ) -> None:
-    """Check if all posts on a page are already in metadata.
+    """Check if every item on a page is already in metadata.
+
+    Args:
+        bypass: When True, never raise — caller signals an access-change
+            that invalidates the dedup short-circuit (re-paginate fully).
 
     Raises:
-        DuplicatePageError: If all posts are already in metadata
+        DuplicatePageError: If every item is already cached and bypass is False.
     """
-    if not config.use_pagination_duplication:
+    if bypass or not config.use_pagination_duplication:
         return
 
-    if "posts" not in page_data or not page_data["posts"]:
+    page_config = _PAGE_TYPE_CONFIG.get(page_type)
+    if page_config is None:
         return
+    data_key, model_class = page_config
+
+    items_raw = page_data.get(data_key)
+    if not items_raw:
+        return
+    items = expect_list(items_raw, data_key)
 
     store = get_store()
 
-    # With preload at store init, all existing Posts are in the identity map.
-    # Cache check is O(1) per post — no DB queries needed.
-    all_posts_in_metadata = True
-    for post in page_data["posts"]:
-        if store.get_from_cache(Post, post["id"]) is None:
-            all_posts_in_metadata = False
-            break
+    all_in_metadata = all(
+        store.get_from_cache(
+            model_class, expect_int(expect_dict(item, data_key)["id"], "id")
+        )
+        is not None
+        for item in items
+    )
 
-    if all_posts_in_metadata:
+    if all_in_metadata:
         wall_name = None
         if page_type == "wall" and page_id:
             wall = await store.get(Wall, int(page_id))

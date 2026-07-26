@@ -23,21 +23,27 @@ import pytest
 import respx
 from loguru import logger
 
+from api.fansly import FanslyApi
+from config.fanslyconfig import FanslyConfig
 from daemon.runner import run_daemon
 from daemon.simulator import ActivitySimulator
-from metadata.models import MonitorState
-from tests.fixtures.api import make_ws_factory_for
-from tests.fixtures.api.api_fixtures import dump_fansly_calls
+from metadata.entity_store import PostgresEntityStore
+from metadata.models import Account, MonitorState
+from tests.fixtures.api import (
+    FakeFanslyWSServer,
+    dump_fansly_calls,
+    make_ws_factory_for,
+)
 from tests.fixtures.utils.test_isolation import snowflake_id
 
 
 # ---------------------------------------------------------------------------
-# URL constants (url__startswith because ngsw-bypass is appended)
+# URL aliases (url__startswith because ngsw-bypass is appended)
 # ---------------------------------------------------------------------------
 
-HOME_TIMELINE_URL = "https://apiv3.fansly.com/api/v1/timeline/home"
-STORY_STATES_URL = "https://apiv3.fansly.com/api/v1/mediastories/following"
-TIMELINE_NEW_BASE_URL = "https://apiv3.fansly.com/api/v1/timelinenew/"
+HOME_TIMELINE_URL = FanslyApi.TIMELINE_HOME_ENDPOINT
+STORY_STATES_URL = FanslyApi.MEDIA_STORIES_FOLLOWING_ENDPOINT
+TIMELINE_NEW_BASE_URL = FanslyApi.TIMELINE_NEW_ENDPOINT.format("")
 
 
 # ---------------------------------------------------------------------------
@@ -63,10 +69,10 @@ class TestRunDaemonE2E:
     @pytest.mark.timeout(20)
     async def test_poll_to_persist_cycle(
         self,
-        config_wired,
-        entity_store,
-        saved_account,
-        ws_server,
+        config_wired: FanslyConfig,
+        entity_store: PostgresEntityStore,
+        saved_account: Account,
+        ws_server: FakeFanslyWSServer,
     ) -> None:
         """run_daemon completes one full poll -> filter -> download -> persist cycle.
 
@@ -89,6 +95,7 @@ class TestRunDaemonE2E:
           - MonitorState row exists for the creator with a recent lastCheckedAt
             (set by mark_creator_processed after FullCreatorDownload).
         """
+        assert saved_account.id is not None
         creator_id: int = saved_account.id
         post_id: int = snowflake_id()
 
@@ -209,7 +216,7 @@ class TestRunDaemonE2E:
                 ),
             ):
                 # ── RESPX routes (inside mock context) ───────────────────────
-                respx.options(url__startswith="https://apiv3.fansly.com").mock(
+                respx.options(url__startswith=FanslyApi.BASE_URL).mock(
                     side_effect=[httpx.Response(200)]
                 )
 
@@ -272,7 +279,10 @@ class TestRunDaemonE2E:
                     ]
                 )
 
-                await _run_and_stop()
+                try:
+                    await _run_and_stop()
+                finally:
+                    dump_fansly_calls(respx.calls, "test_poll_to_persist_cycle")
         finally:
             logger.remove(sink_id)
 

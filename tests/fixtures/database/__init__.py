@@ -9,6 +9,7 @@ from .database_fixtures import (
     factory_session,
     json_conversation_data,
     mock_account,
+    mock_post,
     pg_template_db,
     # safe_name,  # Commented out - fixture is not currently defined
     session,
@@ -30,9 +31,11 @@ from .database_fixtures import (
     timeline_data,
     uuid_test_db_factory,
 )
+from .shared_db_fixtures import class_entity_store, reset_class_store
 
 
 __all__ = [
+    "class_entity_store",
     "config",
     "config_with_database",
     "conversation_data",
@@ -41,7 +44,9 @@ __all__ = [
     "factory_session",
     "json_conversation_data",
     "mock_account",
+    "mock_post",
     "pg_template_db",
+    "reset_class_store",
     # "safe_name",  # Commented out - fixture is not currently defined
     "session",
     "session_factory",

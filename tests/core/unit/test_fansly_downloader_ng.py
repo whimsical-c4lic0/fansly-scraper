@@ -5,7 +5,8 @@ import atexit
 import contextlib
 import logging
 import time
-from unittest.mock import AsyncMock
+import tomllib
+from pathlib import Path
 
 import httpx
 import pytest
@@ -47,10 +48,14 @@ from fansly_downloader_ng import (
 )
 from metadata.models import Account, get_store
 from tests.fixtures.api import dump_fansly_calls
+from tests.fixtures.utils import scaled_async_sleep
 from tests.fixtures.utils.test_isolation import snowflake_id
+from textio import print_error, print_info
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture(
+    autouse=True
+)  # CCH:autouse-fixture  # clears SUT module-level interrupt flag; must stay file-scoped
 def _clear_handle_interrupt_flag():
     """Ensure ``_handle_interrupt.interrupted`` is not set at test start.
 
@@ -105,6 +110,20 @@ def test_cleanup_database_sync_idempotent(config_with_database, caplog):
     )
     # Still idempotent after multiple calls.
     assert config._database._cleanup_done.is_set()
+
+
+def test_version_linked_to_pyproject():
+    """__version__ derives from pyproject.toml [project].version — single source of truth.
+
+    The project is not installed as a package, so _resolve_version falls back
+    to reading pyproject.toml next to the entry script.
+    """
+    pyproject = Path(fdng.__file__).parent / "pyproject.toml"
+    expected = tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+        "version"
+    ]
+    assert fdng._resolve_version() == expected
+    assert fdng.__version__ == expected
 
 
 def test_print_logo(capsys):
@@ -192,13 +211,17 @@ def test_cleanup_database_no_database():
 
 
 def _clear_atexit_cleanup_handlers() -> None:
-    """Remove any pre-registered cleanup_database_sync entries from atexit.
+    """Reset cross-test state for the cleanup_database_sync atexit handler.
 
-    _async_main's atexit-registration check walks `atexit._exithandlers` and
-    skips registration if a handler with name `cleanup_database_sync` is
-    already there. Repeated test runs can leave stale entries from prior
-    tests; clearing them ensures each test observes a fresh state.
+    Production registers the handler once per process, guarded by the
+    module-level ``_db_cleanup_atexit_registered`` flag
+    (``_register_db_cleanup_once``). That flag is process-global, so a prior
+    test in any ``pytest-randomly`` order leaves it True and the next test's
+    ``_async_main`` skips registration. Reset it so each test sees a fresh
+    state, and strip any real cleanup_database_sync entry from
+    ``atexit._exithandlers`` so tests never leak a handler into the process.
     """
+    fdng._db_cleanup_atexit_registered = False
     if not hasattr(atexit, "_exithandlers"):
         return
     atexit._exithandlers = [
@@ -334,6 +357,7 @@ async def test_async_main_registers_atexit_handler(config_with_database, caplog)
         return func
 
     with pytest.MonkeyPatch.context() as mp:
+        mp.setattr("fansly_downloader_ng._db_cleanup_atexit_registered", False)
         mp.setattr("fansly_downloader_ng.main", _fake_main)
         mp.setattr("atexit.register", _capture_register)
         result = await _async_main(config)
@@ -439,108 +463,76 @@ async def test_safe_cleanup_database_already_done_branch(config_with_database, c
     ), f"Expected skip-log, got: {info_messages}"
 
 
-async def test_safe_cleanup_database_timeout_falls_back_to_close_sync(
-    config_with_database, caplog, monkeypatch
-):
-    """_safe_cleanup_database falls back to close_sync on cleanup TimeoutError.
-
-    Covers lines 124-129: ``except TimeoutError`` branch in the inner try.
-    """
+@pytest.mark.parametrize(
+    ("cleanup_exc", "sync_exc", "expected_snippets"),
+    [
+        pytest.param(
+            TimeoutError("simulated cleanup timeout"),
+            None,
+            ["Database cleanup timed out"],
+            # Covers lines 124-129: ``except TimeoutError`` branch in the
+            # inner try — falls back to close_sync.
+            id="timeout-falls-back-to-close-sync",
+        ),
+        pytest.param(
+            TimeoutError("simulated cleanup timeout"),
+            RuntimeError("forced close boom"),
+            ["Forced cleanup also failed", "forced close boom"],
+            # Covers lines 126-129: inner try/except around ``close_sync()``
+            # — both primary cleanup AND forced fallback fail; both log.
+            id="timeout-forced-cleanup-also-fails",
+        ),
+        pytest.param(
+            RuntimeError("detailed-error boom"),
+            None,
+            ["Detailed error during database cleanup"],
+            # Covers lines 130-135: ``except Exception as detail_e`` branch.
+            id="generic-exception-falls-back",
+        ),
+        pytest.param(
+            RuntimeError("detailed-error boom"),
+            RuntimeError("sync close also boom"),
+            ["Sync cleanup also failed", "sync close also boom"],
+            # Covers lines 132-135: inner try/except around ``close_sync()``
+            # in the detailed-exception branch.
+            id="generic-exception-sync-fallback-fails",
+        ),
+    ],
+)
+async def test_safe_cleanup_database_failure_fallback_matrix(
+    config_with_database: FanslyConfig,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_exc: Exception,
+    sync_exc: Exception | None,
+    expected_snippets: list[str],
+) -> None:
+    """_safe_cleanup_database failure fallbacks — cleanup raises
+    (TimeoutError or generic), optionally close_sync raises too; the expected
+    error is logged and nothing propagates."""
     caplog.set_level(logging.ERROR)
     config = config_with_database
 
-    async def _hang_cleanup():
-        raise TimeoutError("simulated cleanup timeout")
+    async def _raise_cleanup() -> None:
+        raise cleanup_exc
 
-    monkeypatch.setattr(config._database, "cleanup", _hang_cleanup)
+    monkeypatch.setattr(config._database, "cleanup", _raise_cleanup)
 
-    await _safe_cleanup_database(config)
+    if sync_exc is not None:
 
-    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("Database cleanup timed out" in m for m in error_messages), (
-        f"Expected timeout-error log, got: {error_messages}"
-    )
+        def _raise_sync() -> None:
+            raise sync_exc
 
-
-async def test_safe_cleanup_database_timeout_forced_cleanup_also_fails(
-    config_with_database, caplog, monkeypatch
-):
-    """_safe_cleanup_database logs both failures when close_sync also raises.
-
-    Covers lines 126-129: the inner try/except around ``close_sync()`` —
-    both primary cleanup AND forced fallback fail; both errors log.
-    """
-    caplog.set_level(logging.ERROR)
-    config = config_with_database
-
-    async def _hang_cleanup():
-        raise TimeoutError("simulated cleanup timeout")
-
-    def _raise_sync():
-        raise RuntimeError("forced close boom")
-
-    monkeypatch.setattr(config._database, "cleanup", _hang_cleanup)
-    monkeypatch.setattr(config._database, "close_sync", _raise_sync)
+        monkeypatch.setattr(config._database, "close_sync", _raise_sync)
 
     await _safe_cleanup_database(config)  # Must not raise.
 
     error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
     assert any(
-        "Forced cleanup also failed" in m and "forced close boom" in m
-        for m in error_messages
-    ), f"Expected 'Forced cleanup also failed' log, got: {error_messages}"
-
-
-async def test_safe_cleanup_database_generic_exception_falls_back(
-    config_with_database, caplog, monkeypatch
-):
-    """_safe_cleanup_database falls back on non-timeout exceptions.
-
-    Covers lines 130-135: ``except Exception as detail_e`` branch.
-    """
-    caplog.set_level(logging.ERROR)
-    config = config_with_database
-
-    async def _raise_boom():
-        raise RuntimeError("detailed-error boom")
-
-    monkeypatch.setattr(config._database, "cleanup", _raise_boom)
-
-    await _safe_cleanup_database(config)
-
-    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any("Detailed error during database cleanup" in m for m in error_messages), (
-        f"Expected detailed-error log, got: {error_messages}"
+        all(snippet in m for snippet in expected_snippets) for m in error_messages
+    ), (
+        f"Expected one ERROR log containing all of {expected_snippets}, got: {error_messages}"
     )
-
-
-async def test_safe_cleanup_database_generic_exception_sync_fallback_fails(
-    config_with_database, caplog, monkeypatch
-):
-    """_safe_cleanup_database logs both when close_sync also raises.
-
-    Covers lines 132-135: inner try/except around ``close_sync()`` in the
-    detailed-exception branch.
-    """
-    caplog.set_level(logging.ERROR)
-    config = config_with_database
-
-    async def _raise_boom():
-        raise RuntimeError("detailed-error boom")
-
-    def _raise_sync():
-        raise RuntimeError("sync close also boom")
-
-    monkeypatch.setattr(config._database, "cleanup", _raise_boom)
-    monkeypatch.setattr(config._database, "close_sync", _raise_sync)
-
-    await _safe_cleanup_database(config)  # Must not raise.
-
-    error_messages = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
-    assert any(
-        "Sync cleanup also failed" in m and "sync close also boom" in m
-        for m in error_messages
-    ), f"Expected 'Sync cleanup also failed' log, got: {error_messages}"
 
 
 async def test_safe_cleanup_database_outer_exception_is_caught(
@@ -571,7 +563,7 @@ async def test_safe_cleanup_database_outer_exception_is_caught(
             _awaitable.close()
         raise RuntimeError("inner-close boom")
 
-    real_print_error = fdng.print_error
+    real_print_error = print_error
     call_count = {"n": 0}
 
     def _print_error_raises_from_inner(msg, *args, **kwargs):
@@ -1143,10 +1135,12 @@ async def test_cleanup_with_global_timeout_semaphore_exception(
 async def test_async_main_skips_atexit_when_already_registered(
     config_with_database, caplog, monkeypatch
 ):
-    """_async_main skips registering cleanup_database_sync if already in atexit chain.
+    """_async_main skips registering cleanup_database_sync when the
+    module-level ``_db_cleanup_atexit_registered`` flag is already set.
 
-    Covers the 812->819 branch: the ``any(...)`` check short-circuits
-    registration when a matching handler is already present.
+    Commit 5d7574fe1 replaced the brittle ``any(atexit._exithandlers...)``
+    introspection with the flag -- so simulating "already registered" is
+    now a flag-flip, not a hand-rolled ``_exithandlers`` mutation.
     """
     caplog.set_level(logging.INFO)
     _clear_atexit_cleanup_handlers()
@@ -1158,16 +1152,8 @@ async def test_async_main_skips_atexit_when_already_registered(
         captured_registers.append((func, args, kwargs))
         return func
 
-    # Python 3.11+ removed the public ``atexit._exithandlers`` attribute;
-    # set it via monkeypatch with ``raising=False`` so the any() check in
-    # _async_main's atexit-skip branch has something to iterate over.
-    existing = getattr(atexit, "_exithandlers", [])
-    monkeypatch.setattr(
-        atexit,
-        "_exithandlers",
-        [*existing, (cleanup_database_sync, (config,), {})],
-        raising=False,
-    )
+    # Simulate "already registered this process" via the production guard flag.
+    monkeypatch.setattr(fdng, "_db_cleanup_atexit_registered", True)
     monkeypatch.setattr("atexit.register", _capture_register)
 
     async def _fake_main(_cfg):
@@ -1421,7 +1407,11 @@ async def test_load_client_account_into_db_persists_real_account(
 
     # Real /api/v1/account?usernames=... boundary — see
     # mount_empty_creator_pipeline's account-route shape.
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account").mock(
+    respx.get(
+        url__startswith=respx_fansly_api.ACCOUNT_BY_USERNAME_ENDPOINT.format(
+            creator_name
+        )
+    ).mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -1439,9 +1429,7 @@ async def test_load_client_account_into_db_persists_real_account(
             )
         ]
     )
-    monkeypatch.setattr(
-        "fansly_downloader_ng.asyncio.sleep", AsyncMock(return_value=None)
-    )
+    monkeypatch.setattr("fansly_downloader_ng.asyncio.sleep", scaled_async_sleep)
 
     state = DownloadState()
     try:
@@ -1515,7 +1503,7 @@ async def test_cleanup_with_global_timeout_websocket_outer_exception_from_print_
 
     config._api = _FakeApi()
 
-    real_print_info = fdng.print_info
+    real_print_info = print_info
 
     def _print_info_raising(msg, *args, **kwargs):
         # Line 695: "Stopping WebSocket connection..." is OUTSIDE the

@@ -26,14 +26,14 @@ Usage:
     async def test_collections(respx_fansly_api):
         # respx_fansly_api yields a bootstrapped FanslyApi.
         # mock_config._api is wired automatically.
-        respx.get("https://apiv3.fansly.com/api/v1/account/media/orders/").mock(
+        respx.get(respx_fansly_api.ACCOUNT_MEDIA_ORDERS_ENDPOINT).mock(
             side_effect=[httpx.Response(200, json={"success": True, "response": {...}})]
         )
         # Use the yielded api directly OR mock_config._api — same instance.
         result = await respx_fansly_api.get_media_collections()
 """
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable, Sequence
 from datetime import UTC, datetime
 from typing import Any
 
@@ -44,6 +44,7 @@ import respx
 from loguru import logger
 
 from api.fansly import FanslyApi
+from config import FanslyConfig
 
 from .fake_websocket import fake_websocket_session
 
@@ -70,6 +71,50 @@ def create_mock_json_response(
         json=json_data,
         headers=headers,
     )
+
+
+def build_creator_account_info_response(
+    creator_id: int,
+    username: str,
+    *,
+    following: bool = True,
+    subscription: dict[str, Any] | None = None,
+    image_count: int = 10,
+    video_count: int = 5,
+) -> dict[str, Any]:
+    """Build a ``/api/v1/account?usernames=...`` (creator-info) response.
+
+    Shape verified against ``json/account_two_ids.json`` capture:
+    - ``id`` is a string (Snowflake serialized as str).
+    - ``subscribed`` + ``subscription`` keys are omitted when the user
+      isn't subscribed to this creator (not ``None`` — the keys are
+      genuinely absent in real responses).
+    - When subscribed, ``subscription`` is the full Subscription record
+      (same shape returned by ``/api/v1/subscriptions``).
+    - ``createdAt`` is unix epoch milliseconds.
+
+    Pydantic's ``extra="ignore"`` skips additional fields the real API
+    carries (avatar, banner, statusId, lastSeenAt, subscriptionTiers,
+    permissions, etc.) — they're not needed for access-change detection.
+    """
+    account: dict[str, Any] = {
+        "id": str(creator_id),
+        "username": username,
+        "following": following,
+        "createdAt": 1700000000000,
+        "timelineStats": {
+            "accountId": str(creator_id),
+            "imageCount": image_count,
+            "videoCount": video_count,
+        },
+    }
+    if subscription is not None:
+        account["subscribed"] = True
+        account["subscription"] = subscription
+    return {
+        "success": "true",
+        "response": [account],
+    }
 
 
 @pytest.fixture
@@ -133,8 +178,8 @@ def fansly_api_factory():
         check_key: str = "test_check_key",
         device_id: str = "test_device_id",
         device_id_timestamp: int | None = None,
-        on_device_updated=None,
-    ):
+        on_device_updated: Callable[[], Any] | None = None,
+    ) -> FanslyApi:
         """Create a FanslyApi instance with specified parameters."""
         if device_id_timestamp is None:
             device_id_timestamp = int(datetime.now(UTC).timestamp() * 1000)
@@ -184,9 +229,9 @@ def _mount_apiv3_bootstrap_routes() -> None:
     # and matches later-registered ones for the same URL).
     respx.route(
         method="OPTIONS",
-        url__startswith="https://apiv3.fansly.com",
+        url__startswith=FanslyApi.BASE_URL,
     ).mock(return_value=httpx.Response(200))
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/device/id?").mock(
+    respx.get(url__startswith=f"{FanslyApi.DEVICE_ID_ENDPOINT}?").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -194,7 +239,7 @@ def _mount_apiv3_bootstrap_routes() -> None:
             )
         ]
     )
-    respx.get(url__startswith="https://apiv3.fansly.com/api/v1/account/me?").mock(
+    respx.get(url__startswith=f"{FanslyApi.ACCOUNT_ME_ENDPOINT}?").mock(
         side_effect=[
             httpx.Response(
                 200,
@@ -220,8 +265,8 @@ def _mount_apiv3_bootstrap_routes() -> None:
 
 @pytest_asyncio.fixture
 async def respx_fansly_api(
-    mock_config,
-    no_display,
+    mock_config: FanslyConfig,
+    no_display: None,
 ) -> AsyncGenerator[FanslyApi, None]:
     """Get a bootstrapped FanslyApi via FanslyConfig.setup_api().
 
@@ -248,7 +293,7 @@ async def respx_fansly_api(
         @pytest.mark.asyncio
         async def test_timeline(respx_fansly_api):
             route = respx.get(
-                url__startswith="https://apiv3.fansly.com/api/v1/timeline"
+                url__startswith=respx_fansly_api.TIMELINE_HOME_ENDPOINT
             ).mock(side_effect=[httpx.Response(200, json={...})])
             try:
                 result = await respx_fansly_api.get_home_timeline()
@@ -272,7 +317,7 @@ async def respx_fansly_api(
         respx.clear()
         respx.route(
             method="OPTIONS",
-            url__startswith="https://apiv3.fansly.com",
+            url__startswith=FanslyApi.BASE_URL,
         ).mock(return_value=httpx.Response(200))
 
         try:
@@ -336,7 +381,9 @@ async def respx_ivs_cdn() -> AsyncGenerator[httpx.AsyncClient, None]:
 # ───────────────────────────────────────────────────────────────────────
 
 
-def dump_fansly_calls(calls, label: str = "Fansly API calls") -> None:
+def dump_fansly_calls(
+    calls: Sequence[respx.models.Call], label: str = "Fansly API calls"
+) -> None:
     """Log request/response details for each Fansly API call.
 
     Works with respx route.calls or respx.calls. Use in try/finally blocks
@@ -382,6 +429,7 @@ def dump_fansly_calls(calls, label: str = "Fansly API calls") -> None:
 
 
 __all__ = [
+    "build_creator_account_info_response",
     "create_mock_json_response",
     "dump_fansly_calls",
     "fansly_api_factory",

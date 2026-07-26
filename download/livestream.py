@@ -44,14 +44,12 @@ from download.livestream_chat import (
     unregister_chat_recorder,
 )
 from fileio.livestream import _unique_output_path
+from helpers.common import expect_dict
 from metadata.models import StreamChannel
 from pathio.livestream import _build_output_path, _get_segments_base
 
 
 # ── Constants ─────────────────────────────────────────────────────────────
-
-# Maximum concurrent segment downloads per stream.
-_PARALLEL_SEGMENT_LIMIT = 5
 
 # Maximum number of PyAV probe segments when identifying audio/video PIDs.
 _MAX_PROBE_SEGMENTS = 5
@@ -217,7 +215,11 @@ async def _record_stream(
                 monitor_task.cancel()
                 if chat_task is not None:
                     chat_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
+                    # The chat task's own crash is already surfaced by its
+                    # done-callback (_surface_chat_task_failure); draining it
+                    # here must not re-raise and abort an otherwise-complete
+                    # recording over a chat-WS hiccup.
+                    with contextlib.suppress(Exception, asyncio.CancelledError):
                         await chat_task
 
             if not segments:
@@ -296,10 +298,10 @@ async def _get_authenticated_playback_url(
         response = await api.get_streaming_channel(creator_id)
         data = api.get_json_response_contents(response)
         if isinstance(data, dict):
-            stream = data.get("stream") or {}
+            stream = expect_dict(data.get("stream") or {}, "stream")
             auth_url = stream.get("playbackUrl") or data.get("playbackUrl")
             if auth_url:
-                return auth_url
+                return str(auth_url)
     except Exception as exc:
         logger.warning(
             "download.livestream: get_streaming_channel({}) failed — {}; "
@@ -330,7 +332,9 @@ async def _resolve_variant_url(master_url: str) -> str | None:
     base_uri = f"{parsed.scheme}://{parsed.netloc}"
 
     try:
-        async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        async with httpx.AsyncClient(
+            http2=True, follow_redirects=True, timeout=15.0
+        ) as client:
             response = await client.get(master_url, headers=_IVS_MASTER_HEADERS)
             response.raise_for_status()
     except Exception as exc:
@@ -465,21 +469,11 @@ async def _poll_segments_loop(
                 jobs.append((seg_msn, abs_uri, seg_path, 6.0))
 
             if jobs:
-                sem = asyncio.Semaphore(_PARALLEL_SEGMENT_LIMIT)
-
-                async def _bounded(
-                    seg_url: str,
-                    seg_path: Path,
-                    _c: httpx.AsyncClient = client,
-                    _s: asyncio.Semaphore = sem,
-                ) -> bool:
-                    async with _s:
-                        return await _download_segment(
-                            _c, seg_url, seg_path, log_prefix
-                        )
-
                 results = await asyncio.gather(
-                    *(_bounded(u, p) for _, u, p, _ in jobs),
+                    *(
+                        _download_segment(client, u, p, log_prefix)
+                        for _, u, p, _ in jobs
+                    ),
                     return_exceptions=True,
                 )
 
@@ -913,7 +907,10 @@ def _mux_ivs_segments(  # noqa: PLR0911  # multiple early-exit paths for failure
                             packet.stream = output_video_stream
                             output.mux(packet)
                             seg_muxed_video += 1
-                        elif packet.stream is input_audio:
+                        elif (
+                            packet.stream is input_audio
+                            and output_audio_stream is not None
+                        ):
                             if seg_audio_first_ts is None:
                                 seg_audio_first_ts = min(pkt_pts, pkt_dts)
                             packet.pts = pkt_pts - seg_audio_first_ts + audio_pts_offset

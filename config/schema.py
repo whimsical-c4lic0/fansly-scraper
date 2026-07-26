@@ -16,23 +16,42 @@ from __future__ import annotations
 import io
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Literal, Self
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Self
 
 from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    JsonValue,
     PrivateAttr,
     SecretStr,
     ValidationError,
+    field_serializer,
     field_validator,
     model_validator,
 )
+from pydantic_core import ErrorDetails
 from ruamel.yaml import YAML
 from ruamel.yaml.comments import CommentedMap
 from ruamel.yaml.error import YAMLError
 
+from config.media_filters import (
+    MEDIA_FILTERS_EXAMPLE,
+    MediaFilterOverride,
+    MediaFilters,
+    parse_duration,
+    parse_size,
+    resolution_threshold,
+)
 from config.modes import DownloadMode
+from config.wall_filters import WallFilterSpec, normalize_wall_filters
+from errors import ConfigError
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from pydantic.fields import FieldInfo
 
 
 # Render-policy marker used in ``Field(json_schema_extra=_ALWAYS)``. A field
@@ -41,10 +60,10 @@ from config.modes import DownloadMode
 # ``_sync_to_map`` then forces the containing section to render. Default
 # policy is "conditional" — fields render only when in ``model_fields_set``.
 # See docs/configuration/render-policy.md (TODO) for full semantics.
-_ALWAYS: dict[str, str] = {"render": "always"}
+_ALWAYS: dict[str, JsonValue] = {"render": "always"}
 
 
-def _is_always(field_info: Any) -> bool:
+def _is_always(field_info: FieldInfo | None) -> bool:
     """Return True iff a field's json_schema_extra marks it as render=always."""
     extra = getattr(field_info, "json_schema_extra", None)
     return isinstance(extra, dict) and extra.get("render") == "always"
@@ -76,7 +95,7 @@ def _format_validation_error(exc: ValidationError, path: Path) -> str:
 # Pydantic error-type → formatter(value, ctx) → sentence. Module-level
 # dict dispatch avoids a PLR0911 return-cascade in _pretty_error_message;
 # unknown types fall through to Pydantic's own ``msg``.
-_ERROR_FORMATTERS: dict[str, Any] = {
+_ERROR_FORMATTERS: dict[str, Callable[..., str]] = {
     "extra_forbidden": lambda value, _ctx: (
         f"unknown key (value was {value!r}). Either a typo, a key "
         "that belongs in a different section, or a field that was "
@@ -108,7 +127,7 @@ _ERROR_FORMATTERS: dict[str, Any] = {
 }
 
 
-def _pretty_error_message(err: dict[str, Any]) -> str:
+def _pretty_error_message(err: ErrorDetails) -> str:
     """Render one Pydantic error dict as a plain-English sentence.
 
     Dispatches via ``_ERROR_FORMATTERS`` for known types. ``value_error``
@@ -291,6 +310,7 @@ class OptionsSection(_BaseSection):
     open_folder_when_finished: bool = True
     separate_messages: bool = True
     separate_previews: bool = False
+    repair_previews: bool | Literal["dry-run"] = False
     separate_timeline: bool = True
     use_duplicate_threshold: bool = False
     use_pagination_duplication: bool = False
@@ -300,6 +320,8 @@ class OptionsSection(_BaseSection):
     timeline_retries: int = 1
     timeline_delay_seconds: int = 60
     api_max_retries: int = 10
+    # ids per batched /account?ids= lookup; the Fansly web client uses 5
+    account_ids_batch_size: int = 5
     # Set to ``false`` to ignore the creator_content_unchanged short-circuit
     # in download/timeline.py and download/wall.py — forces a full scan even
     # when TimelineStats counts and wall structure match the DB. Conditional
@@ -320,6 +342,25 @@ class OptionsSection(_BaseSection):
         """Accept any case spelling, e.g. 'normal', 'NORMAL', 'Normal'."""
         if isinstance(v, str):
             return DownloadMode(v.upper())
+        return v
+
+    @field_validator("repair_previews", mode="before")
+    @classmethod
+    def _coerce_repair_previews(cls, v: Any) -> bool | Literal["dry-run"]:
+        """Allow true/false or the literal "dry-run"; reject any other string."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s == "dry-run":
+                return "dry-run"
+            if s in {"true", "yes", "on", "1"}:
+                return True
+            if s in {"false", "no", "off", "0"}:
+                return False
+            raise ValueError(
+                f'repair_previews must be true, false, or "dry-run"; got {v!r}'
+            )
         return v
 
 
@@ -677,6 +718,29 @@ class StashContextSection(_BaseSection):
     mapped_path: str | None = None
     override_dldir_w_mapped: bool = False
     require_stash_only_mode: bool = False
+    enable_scene_split: bool | Literal["dry-run"] = False
+    # Stash's index commit can lag the job-FINISHED signal by a few hundred
+    # ms; reading File/Scene/Image back without a settle window races.
+    scan_settle_s: float = Field(default=3.5, ge=0.0, le=30.0)
+
+    @field_validator("enable_scene_split", mode="before")
+    @classmethod
+    def _coerce_scene_split(cls, v: Any) -> bool | Literal["dry-run"]:
+        """Allow true/false or the literal "dry-run"; reject any other string."""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s == "dry-run":
+                return "dry-run"
+            if s in {"true", "yes", "on", "1"}:
+                return True
+            if s in {"false", "no", "off", "0"}:
+                return False
+            raise ValueError(
+                f'enable_scene_split must be true, false, or "dry-run"; got {v!r}'
+            )
+        return v
 
     @model_validator(mode="after")
     def _override_requires_mapped_path(self) -> StashContextSection:
@@ -747,6 +811,112 @@ class LogicSection(_BaseSection):
     main_js_pattern: str = r"\ssrc\s*=\s*\"(main\..*?\.js)\""
 
 
+class MediaFiltersSection(_BaseSection):
+    """Min/max file-size and duration limits (global + per-creator)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    file_size_min: int | None = None
+    file_size_max: int | None = None
+    duration_min: float | None = None
+    duration_max: float | None = None
+    max_resolution: int | str | None = None
+    by_creator: dict[str, MediaFilterOverride] = Field(default_factory=dict)
+
+    @field_validator("file_size_min", "file_size_max", mode="before")
+    @classmethod
+    def _parse_sizes(cls, v: Any) -> int | None:
+        try:
+            return parse_size(v)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("duration_min", "duration_max", mode="before")
+    @classmethod
+    def _parse_durations(cls, v: Any) -> float | None:
+        try:
+            return parse_duration(v)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
+
+    @field_validator("max_resolution", mode="before")
+    @classmethod
+    def _validate_max_resolution(cls, v: Any) -> int | str | None:
+        try:
+            resolution_threshold(v)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
+
+    @field_validator("by_creator", mode="before")
+    @classmethod
+    def _sanitize_creator_keys(cls, v: Any) -> Any:
+        if isinstance(v, dict):
+            sanitized: dict[str, Any] = {}
+            for key, val in v.items():
+                creator = str(key).strip().lstrip("@").lower()
+                if creator in sanitized:
+                    raise ValueError(
+                        f"media_filters: duplicate creator '{creator}' in "
+                        f"by_creator.\nExpected shape:\n{MEDIA_FILTERS_EXAMPLE}"
+                    )
+                sanitized[creator] = val
+            return sanitized
+        return v
+
+    @field_serializer("by_creator")
+    def _dump_by_creator(
+        self, v: dict[str, MediaFilterOverride]
+    ) -> dict[str, dict[str, Any]]:
+        """Dump only explicitly-set override fields so unset ones stay unset.
+
+        A wholesale ``model_dump`` per override would materialize every
+        unset field as an explicit ``null``, which round-trips back as an
+        EXPLICIT DISABLE (present in ``model_fields_set``) instead of
+        inheriting the global/creator default.
+        """
+        return {k: o.model_dump(exclude_unset=True) for k, o in v.items()}
+
+    @model_validator(mode="after")
+    def _validate_resolved_bounds(self) -> MediaFiltersSection:
+        runtime = self.to_runtime()
+        try:
+            runtime.ensure_valid("global")
+            for creator in runtime.by_creator:
+                runtime.for_creator(creator, None).ensure_valid(f"by_creator.{creator}")
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
+        return self
+
+    def to_runtime(self) -> MediaFilters:
+        """Build the frozen runtime model from this section."""
+        return MediaFilters(
+            file_size_min=self.file_size_min,
+            file_size_max=self.file_size_max,
+            duration_min=self.duration_min,
+            duration_max=self.duration_max,
+            max_resolution=self.max_resolution,
+            by_creator=dict(self.by_creator),
+        )
+
+
+class FiltersSection(_BaseSection):
+    """Content filters: per-creator wall selection and media size/duration limits."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    wall: dict[str, WallFilterSpec] = Field(default_factory=dict)
+    media: MediaFiltersSection = Field(default_factory=MediaFiltersSection)
+
+    @field_validator("wall", mode="before")
+    @classmethod
+    def _normalize_wall(cls, v: Any) -> dict[str, WallFilterSpec]:
+        try:
+            return normalize_wall_filters(v)
+        except ConfigError as exc:
+            raise ValueError(str(exc)) from exc
+
+
 class ConfigSchema(_BaseSection):
     """Root configuration schema for config.yaml.
 
@@ -775,6 +945,7 @@ class ConfigSchema(_BaseSection):
     )
     my_account: MyAccountSection = Field(default_factory=MyAccountSection)
     options: OptionsSection = Field(default_factory=OptionsSection)
+    filters: FiltersSection = Field(default_factory=FiltersSection)
     postgres: PostgresSection = Field(default_factory=PostgresSection)
     logging: LoggingSection = Field(default_factory=LoggingSection)
     # Optional, like stash_context — present in YAML only when something
@@ -841,10 +1012,7 @@ class ConfigSchema(_BaseSection):
             instance = cls.model_validate(raw)
         except ValidationError as exc:
             raise ValueError(_format_validation_error(exc, path)) from exc
-        except Exception as exc:
-            # Non-Pydantic errors (shouldn't happen here, but keep a
-            # catch so the user still gets a message rather than a raw
-            # traceback at the top level).
+        except Exception as exc:  # pragma: no cover - defensive: guards unexpected non-ValidationError failures
             raise ValueError(f"Configuration error in {path}: {exc}") from exc
 
         instance._yaml_map = data
@@ -915,7 +1083,7 @@ def _section_to_map(section: BaseModel, existing: CommentedMap | None) -> Commen
     *existing* so the on-disk file converges to the schema's view of truth.
     """
     # Explicit annotation: Pylance's inference on ruamel's partial stubs
-    # flags the subsequent `target[field_name] = …` as "None is not
+    # flags the subsequent `target[field_name] = ...` as "None is not
     # subscriptable" without it.
     target: CommentedMap = (
         existing if isinstance(existing, CommentedMap) else CommentedMap()
@@ -1005,6 +1173,7 @@ def _sync_to_map(schema: ConfigSchema, root: CommentedMap) -> None:
         "targeted_creator": schema.targeted_creator,
         "my_account": schema.my_account,
         "options": schema.options,
+        "filters": schema.filters,
         "postgres": schema.postgres,
         "cache": schema.cache,
         "logging": schema.logging,

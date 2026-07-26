@@ -2,8 +2,6 @@
 
 """Fansly Downloader NG"""
 
-__version__ = "0.14.3"
-
 import asyncio
 import atexit
 import base64
@@ -14,9 +12,11 @@ import signal
 import sys
 import threading
 import time
+import tomllib
 import traceback
-from datetime import UTC, datetime
+from importlib.metadata import PackageNotFoundError
 from importlib.metadata import version as pkg_version
+from pathlib import Path
 from time import monotonic
 from types import FrameType
 
@@ -62,6 +62,7 @@ from download.statistics import (
     print_timing_statistics,
     update_global_statistics,
 )
+from download.wallfilters import resolve_wall_filter, resolve_wall_filter_id_keys
 from errors import (
     API_ERROR,
     CONFIG_ERROR,
@@ -76,11 +77,13 @@ from errors import (
     DownloadError,
 )
 from fileio.dedupe import dedupe_init
-from helpers.common import open_location
+from fileio.preview_repair import repair_preview_folder_items
+from helpers.common import expect_dict, open_location, parse_timestamp
 from helpers.rich_progress import get_progress_manager, get_rich_console
 from helpers.timer import Timer, timing_jitter
 from metadata.account import process_account_data
 from metadata.database import Database
+from metadata.subscriptions import process_subscriptions_response
 from textio import (
     input_enter_continue,
     json_output,
@@ -90,6 +93,24 @@ from textio import (
     set_window_title,
 )
 from utils.semaphore_monitor import cleanup_semaphores, monitor_semaphores
+
+
+def _resolve_version() -> str:
+    """Resolve the program version from pyproject.toml [project].version.
+
+    Prefers installed package metadata; falls back to reading pyproject.toml
+    next to this script, since the project normally runs from a source tree.
+    """
+    try:
+        return pkg_version("fansly-scraper")
+    except PackageNotFoundError:
+        pyproject = Path(__file__).parent / "pyproject.toml"
+        return tomllib.loads(pyproject.read_text(encoding="utf-8"))["project"][
+            "version"
+        ]
+
+
+__version__ = _resolve_version()
 
 
 def _check_stash_library_version() -> None:
@@ -238,7 +259,7 @@ def _handle_interrupt(signum: int, frame: FrameType | None) -> None:  # noqa: AR
         # Second interrupt, force exit
         print_error("Second interrupt received, forcing immediate exit!")
         sys.exit(130)  # 128 + SIGINT(2)
-    _handle_interrupt.interrupted = True
+    _handle_interrupt.interrupted = True  # type: ignore[attr-defined]
     # Raise KeyboardInterrupt to break out of blocking operations
     raise KeyboardInterrupt("User interrupted operation")
 
@@ -281,7 +302,10 @@ async def load_client_account_into_db(
             "main - client-account-data",
             response.json(),
         )
-        creator_dict = api.get_json_response_contents(response)[0]
+        accounts = api.get_json_response_contents(response)
+        if not isinstance(accounts, list):
+            raise TypeError("Fansly API: expected an accounts array response")
+        creator_dict = expect_dict(accounts[0], "account")
     except Exception as e:
         print_error(f"Error getting client account info: {e}")
         print_error(f"Error getting client account info: {traceback.format_exc()}")
@@ -382,8 +406,7 @@ async def main(config: FanslyConfig) -> int:
     print_info(f"Token: {config.token}")
     print_info(f"Check Key: {config.check_key}")
     print_info(
-        f"Device ID: {api.device_id} "
-        f"({datetime.fromtimestamp(api.device_id_timestamp / 1000, tz=UTC)})"
+        f"Device ID: {api.device_id} ({parse_timestamp(api.device_id_timestamp)})"
     )
     print_info(f"Session ID: {api.session_id}")
     client_user_name = await api.get_client_user_name()
@@ -416,6 +439,33 @@ async def main(config: FanslyConfig) -> int:
                     raise
                 await asyncio.sleep(timing_jitter(0.4, 0.75))
 
+                print_info("Getting subscriptions list...")
+                try:
+                    subs_response = await config.get_api().get_subscriptions()
+                    if subs_response.status_code == 200:
+                        subs_data = config.get_api().get_json_response_contents(
+                            subs_response
+                        )
+                        if not isinstance(subs_data, dict):
+                            raise RuntimeError(
+                                "Fansly API: expected a subscriptions object response"
+                            )
+                        added = await process_subscriptions_response(subs_data)
+                        if added:
+                            print_info(
+                                f"Detected access-change for {added} "
+                                f"creator(s) from subscriptions update."
+                            )
+                    else:
+                        print_warning(
+                            f"Subscriptions fetch returned status "
+                            f"{subs_response.status_code}; skipping access-change "
+                            f"detection from /subscriptions."
+                        )
+                except Exception as e:
+                    print_warning(f"Failed to process subscriptions: {e}")
+                await asyncio.sleep(timing_jitter(0.4, 0.75))
+
                 if usernames:
                     print_info(f"Following list: {', '.join(usernames)}")
                     config.user_names = usernames
@@ -425,6 +475,9 @@ async def main(config: FanslyConfig) -> int:
             except Exception as e:
                 print_error(f"Failed to process following list: {e}")
                 return 1
+
+    if config.wall_filters:
+        await resolve_wall_filter_id_keys(config)
 
     # Process each creator
     creators_list = sorted(
@@ -471,6 +524,7 @@ async def main(config: FanslyConfig) -> int:
                             DownloadMode.STASH_ONLY,
                         ):
                             await dedupe_init(config, state)
+                            await repair_preview_folder_items(config, state)
 
                         if config.download_mode == DownloadMode.SINGLE:
                             await download_single_post(config, state)
@@ -512,20 +566,23 @@ async def main(config: FanslyConfig) -> int:
                                 )
                                 and state.walls
                             ):
-                                walls_list = sorted(state.walls)
-                                progress_mgr.add_task(
-                                    name="download_walls",
-                                    description="Processing walls",
-                                    total=len(walls_list),
-                                    parent_task="creators",
-                                    show_elapsed=True,
+                                walls_list = sorted(
+                                    await resolve_wall_filter(config, state)
                                 )
-                                for wall_id in walls_list:
-                                    await download_wall(config, state, wall_id)
-                                    progress_mgr.update_task(
-                                        "download_walls", advance=1
+                                if walls_list:
+                                    progress_mgr.add_task(
+                                        name="download_walls",
+                                        description="Processing walls",
+                                        total=len(walls_list),
+                                        parent_task="creators",
+                                        show_elapsed=True,
                                     )
-                                progress_mgr.remove_task("download_walls")
+                                    for wall_id in walls_list:
+                                        await download_wall(config, state, wall_id)
+                                        progress_mgr.update_task(
+                                            "download_walls", advance=1
+                                        )
+                                    progress_mgr.remove_task("download_walls")
 
                         update_global_statistics(
                             global_download_state, download_state=state
@@ -602,16 +659,13 @@ async def main(config: FanslyConfig) -> int:
 
             for task in config.get_background_tasks():
                 try:
-                    # Check if this is a StashProcessing task by examining the
-                    # coroutine name OR the task name (the BatchProcessingMixin
-                    # worker pool tags its consumers/producer with "stash-batch-"
-                    # so cleanup can find them without matching closure qualnames).
-                    coro_name = task.get_coro().__qualname__
-                    task_name = task.get_name()
+                    # Identify StashProcessing tasks by coroutine qualname: the
+                    # StashProcessing class methods and the
+                    # _safe_background_processing wrapper both carry it.
+                    coro_name = getattr(task.get_coro(), "__qualname__", "")
                     if (
                         "StashProcessing" in coro_name
                         or "_safe_background_processing" in coro_name
-                        or task_name.startswith("stash-batch-")
                     ):
                         stash_tasks.append(task)
                     else:
@@ -808,19 +862,14 @@ async def cleanup_with_global_timeout(config: FanslyConfig) -> None:
         try:
             # Look for tasks that belong to StashProcessing. The coroutine
             # qualname check catches the StashProcessing class methods and
-            # the _safe_background_processing wrapper; the task-name prefix
-            # check catches the BatchProcessingMixin worker pool's
-            # consumer/producer tasks, which are closure-defined and thus
-            # opaque to qualname-only filtering.
+            # the _safe_background_processing wrapper.
             stash_tasks = []
             for task in config.get_background_tasks():
                 with contextlib.suppress(Exception):
-                    coro_name = task.get_coro().__qualname__
-                    task_name = task.get_name()
+                    coro_name = getattr(task.get_coro(), "__qualname__", "")
                     if (
                         "StashProcessing" in coro_name
                         or "_safe_background_processing" in coro_name
-                        or task_name.startswith("stash-batch-")
                     ):
                         stash_tasks.append(task)
 
@@ -934,6 +983,22 @@ async def cleanup_with_global_timeout(config: FanslyConfig) -> None:
             except Exception as exc:
                 print_warning(f"logger.complete() failed: {exc!r}")
 
+        # Close enqueue=True sinks now — each owns an mp.Queue + writer
+        # thread + POSIX semaphore that costs ~1s/sink at _Py_Finalize
+        # (py-spy: 7 sinks → 8s post-atexit). Tracked-only so foreign
+        # handlers (pytest-loguru's caplog) survive. Use print() after.
+        remove_start = time.time()
+        print_info("Closing log sinks...")
+        try:
+            from config.logging import remove_tracked_handlers  # noqa: PLC0415, I001  # circular: config.logging imports FanslyConfig
+
+            remove_tracked_handlers()
+        except Exception as exc:
+            print(f"💡 remove_tracked_handlers() failed: {exc!r}", flush=True)
+        else:
+            remove_elapsed = time.time() - remove_start
+            print(f"💡 Log sinks closed in {remove_elapsed:.2f}s", flush=True)
+
         # Task #6 — post-cleanup shutdown-delay diagnostic. When
         # FDNG_SHUTDOWN_TRACE=1, dump all thread tracebacks every 1s after
         # this point. The first dump fires 1s from now, well after
@@ -942,7 +1007,10 @@ async def cleanup_with_global_timeout(config: FanslyConfig) -> None:
         # so normal runs aren't noisy. Output goes to stderr.
         if os.environ.get("FDNG_SHUTDOWN_TRACE") == "1":
             faulthandler.dump_traceback_later(1, repeat=True)
-            print_info("FDNG_SHUTDOWN_TRACE=1 — installing 1s repeating stack dump")
+            print(
+                "💡 FDNG_SHUTDOWN_TRACE=1 — installing 1s repeating stack dump",
+                flush=True,
+            )
     finally:
         # Stop the heartbeat thread regardless of how cleanup exited
         # (normal completion, early return on db_timeout, exception).
@@ -988,17 +1056,41 @@ async def _async_main(config: FanslyConfig) -> int:
         print_error(f"An unexpected error occurred: {e}\n{traceback.format_exc()}")
         exit_code = UNEXPECTED_ERROR
     finally:
+        # Sinks are closed by cleanup; print() reaches the console while the
+        # loguru emit reaches surviving handlers (caplog in tests). Funnelled
+        # through one helper so the dual-emit lives in a single marked spot.
+        def _emit_cleanup(
+            level: str, console: str, log: str, *, to_stderr: bool = False
+        ) -> None:
+            stream = sys.stderr if to_stderr else sys.stdout
+            print(console, file=stream, flush=True)  # CCH:dual-log  # sinks closed
+            logger.opt(depth=2).log(level, log)
+
         try:
             # Run cleanup with global timeout
             print_info("Starting final cleanup process...")
             await cleanup_with_global_timeout(config)
-            print_info("Cleanup completed successfully")
+            _emit_cleanup(
+                "INFO",
+                "💡 Cleanup completed successfully",
+                "Cleanup completed successfully",
+            )
         except asyncio.CancelledError:
-            print_error("Cleanup was cancelled!")
+            _emit_cleanup(
+                "ERROR",
+                "❌ Cleanup was cancelled!",
+                "Cleanup was cancelled!",
+                to_stderr=True,
+            )
             sys.exit(1)
         except Exception as e:
-            print_error(f"Fatal error during cleanup: {e}")
-            print_error(traceback.format_exc())
+            _emit_cleanup(
+                "ERROR",
+                f"❌ Fatal error during cleanup: {e}",
+                f"Fatal error during cleanup: {e}",
+                to_stderr=True,
+            )
+            print(traceback.format_exc(), flush=True, file=sys.stderr)
             sys.exit(1)
 
     return exit_code
@@ -1022,6 +1114,23 @@ if __name__ == "__main__":
             # On Windows, CTRL_C_EVENT is more reliable than SIGINT
             signal.signal(signal.CTRL_C_EVENT, _handle_interrupt)  # type: ignore
 
+    # Shutdown phase timing — bracket each step from cleanup-complete to
+    # process-exit so we can name which native finalizer costs the 3-8s.
+    # Plain print() because loguru sinks may be gone by here. Cheap to
+    # remove once the offending phase is identified and fixed.
+    _shutdown_t0: list[float | None] = [None]  # list so closures can mutate
+
+    def _shutdown_phase(label: str) -> None:
+        now = time.time()
+        if _shutdown_t0[0] is None:
+            _shutdown_t0[0] = now
+            delta = 0.0
+        else:
+            delta = now - _shutdown_t0[0]
+        print(f"💡 shutdown +{delta:.3f}s — {label}", flush=True)
+
+    atexit.register(lambda: _shutdown_phase("atexit fired"))
+
     try:
         # Get event loop
         loop = asyncio.new_event_loop()
@@ -1029,6 +1138,7 @@ if __name__ == "__main__":
 
         # Run async main without debug mode to prevent task execution messages
         exit_code = asyncio.run(_async_main(config))
+        _shutdown_phase("asyncio.run() returned")
 
         # Exit with code
         sys.exit(exit_code)
@@ -1038,11 +1148,13 @@ if __name__ == "__main__":
         print_error(traceback.format_exc())
         sys.exit(UNEXPECTED_ERROR)
     finally:
+        _shutdown_phase("entering outer finally")
         # Clean up event loop
         with contextlib.suppress(Exception):
             if not loop.is_closed():
                 loop.stop()
                 loop.close()
+        _shutdown_phase("loop closed; falling through to Py_Finalize")
 
         # # Force exit after 5 seconds
         # print_warning("Forcing program exit in 5 seconds...")

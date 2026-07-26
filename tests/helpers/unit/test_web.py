@@ -1,47 +1,58 @@
 """Unit tests for helpers/web.py"""
 
-import logging
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import httpx
+import pytest
+import respx
 
 from helpers.web import (
     get_file_name_from_url,
     get_flat_qs_dict,
     get_qs_value,
     get_release_info_from_github,
-    guess_user_agent,
     split_url,
     strip_url_params,
+)
+from tests.fixtures.api import dump_fansly_calls
+
+
+GITHUB_RELEASES_URL = (
+    "https://api.github.com/repos/prof79/fansly-downloader-ng/releases/latest"
 )
 
 
 class TestGetFileNameFromUrl:
     """Tests for the get_file_name_from_url function."""
 
-    def test_get_file_name_from_url_simple(self):
-        """Test get_file_name_from_url with a simple URL."""
-        url = "https://example.com/path/to/file.txt"
-        result = get_file_name_from_url(url)
-        assert result == "file.txt"
-
-    def test_get_file_name_from_url_no_file(self):
-        """Test get_file_name_from_url with URL ending in directory."""
-        url = "https://example.com/path/to/directory/"
-        result = get_file_name_from_url(url)
-        assert result == ""
-
-    def test_get_file_name_from_url_with_query_string(self):
-        """Test get_file_name_from_url with query string."""
-        url = "https://example.com/path/file.txt?key=value&foo=bar"
-        result = get_file_name_from_url(url)
-        assert result == "file.txt"
-
-    def test_get_file_name_from_url_complex(self):
-        """Test get_file_name_from_url with complex URL."""
-        url = "https://example.com/path/to/document.pdf?download=true#section1"
-        result = get_file_name_from_url(url)
-        assert result == "document.pdf"
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            pytest.param(
+                "https://example.com/path/to/file.txt",
+                "file.txt",
+                id="simple-path",
+            ),
+            pytest.param(
+                "https://example.com/path/to/directory/",
+                "",
+                id="trailing-slash-no-file",
+            ),
+            pytest.param(
+                "https://example.com/path/file.txt?key=value&foo=bar",
+                "file.txt",
+                id="query-string-stripped",
+            ),
+            pytest.param(
+                "https://example.com/path/to/document.pdf?download=true#section1",
+                "document.pdf",
+                id="query-and-fragment-stripped",
+            ),
+        ],
+    )
+    def test_get_file_name_from_url(self, url: str, expected: str) -> None:
+        """get_file_name_from_url extracts the basename, ignoring query/fragment."""
+        assert get_file_name_from_url(url) == expected
 
 
 class TestGetQsValue:
@@ -154,266 +165,144 @@ class TestGetFlatQsDict:
 class TestSplitUrl:
     """Tests for the split_url function."""
 
-    def test_split_url_basic(self):
-        """Test split_url with basic URL."""
-        url = "https://example.com/path/to/file.txt"
+    @pytest.mark.parametrize(
+        ("url", "expected_base", "expected_file"),
+        [
+            pytest.param(
+                "https://example.com/path/to/file.txt",
+                "https://example.com/path/to",
+                "https://example.com/path/to/file.txt",
+                id="basic-path",
+            ),
+            pytest.param(
+                "https://example.com/path/to/file.txt?key=value&foo=bar",
+                "https://example.com/path/to",
+                "https://example.com/path/to/file.txt",
+                id="query-string-stripped",
+            ),
+            pytest.param(
+                "https://example.com/file.txt",
+                "https://example.com",
+                "https://example.com/file.txt",
+                id="root-level-file",
+            ),
+            pytest.param(
+                "https://example.com/path/file.txt#section1",
+                "https://example.com/path",
+                "https://example.com/path/file.txt",
+                id="fragment-stripped",
+            ),
+        ],
+    )
+    def test_split_url(self, url: str, expected_base: str, expected_file: str) -> None:
+        """split_url yields base_url/file_url with query string and fragment gone."""
         result = split_url(url)
-        assert result.base_url == "https://example.com/path/to"
-        assert result.file_url == "https://example.com/path/to/file.txt"
-
-    def test_split_url_with_query_string(self):
-        """Test split_url with query string (query string is stripped)."""
-        url = "https://example.com/path/to/file.txt?key=value&foo=bar"
-        result = split_url(url)
-        assert result.base_url == "https://example.com/path/to"
-        assert result.file_url == "https://example.com/path/to/file.txt"
-
-    def test_split_url_root(self):
-        """Test split_url with root URL."""
-        url = "https://example.com/file.txt"
-        result = split_url(url)
-        assert result.base_url == "https://example.com"
-        assert result.file_url == "https://example.com/file.txt"
-
-    def test_split_url_with_fragment(self):
-        """Test split_url with URL fragment (fragment is stripped)."""
-        url = "https://example.com/path/file.txt#section1"
-        result = split_url(url)
-        assert result.base_url == "https://example.com/path"
-        assert result.file_url == "https://example.com/path/file.txt"
-
-
-class TestGuessUserAgent:
-    """Tests for the guess_user_agent function."""
-
-    def test_guess_user_agent_windows_chrome(self):
-        """Test guess_user_agent for Windows Chrome."""
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="Windows"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua")
-            assert "Windows NT 10.0" in result
-            assert "Chrome" in result
-
-    def test_guess_user_agent_macos_chrome(self):
-        """Test guess_user_agent for macOS Chrome.
-
-        Note: The function extracts the OS version with underscores (10_15_7),
-        converts to dots (10.15.7), then checks if the dotted version exists
-        in the original UA string. For this to work, the UA must contain the
-        dotted version.
-        """
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-            # Use a UA with dotted version that will be found after conversion
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7; 10.15.7) AppleWebKit/537.36 Chrome/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="Darwin"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua")
-            assert "Mac OS X 10_15_7" in result
-            assert "Chrome" in result
-
-    def test_guess_user_agent_linux_chrome(self):
-        """Test guess_user_agent for Linux Chrome."""
-        user_agents = [
-            "Mozilla/5.0 (X11; Linux 5.10) AppleWebKit/537.36 Chrome/120.0.0.0",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="Linux"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua")
-            assert "Linux 5.10" in result
-            assert "Chrome" in result
-
-    def test_guess_user_agent_edge(self):
-        """Test guess_user_agent for Microsoft Edge (Edg)."""
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Edg/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="Windows"):
-            result = guess_user_agent(user_agents, "Microsoft Edge", "default_ua")
-            assert "Windows NT 10.0" in result
-            assert "Edg" in result
-
-    def test_guess_user_agent_no_match_returns_default(self):
-        """Test guess_user_agent returns default when no match found."""
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="Darwin"):
-            # Looking for Chrome on macOS, but only have Windows UA
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_exception_returns_default(self):
-        """Test guess_user_agent returns default on exception."""
-        user_agents = ["invalid_user_agent_without_regex_match"]
-        with patch("platform.system", return_value="Windows"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_regex_exception(self, caplog):
-        """Test guess_user_agent exception handler (lines 158-159)."""
-        caplog.set_level(logging.ERROR)
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0"
-        ]
-        # Mock re.search to raise an exception to trigger exception handler.
-        with (
-            patch("platform.system", return_value="Windows"),
-            patch("helpers.web.re.search", side_effect=Exception("Regex error")),
-        ):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-
-        # Returns the default fallback on exception.
-        assert result == "default_ua_fallback"
-        # The exception handler emits print_error → loguru ERROR record.
-        error_messages = [
-            r.getMessage() for r in caplog.records if r.levelname == "ERROR"
-        ]
-        regex_errors = [m for m in error_messages if "Regexing user-agent" in m]
-        assert len(regex_errors) == 1
-
-    def test_guess_user_agent_empty_list(self):
-        """Test guess_user_agent with empty user agent list."""
-        user_agents = []
-        with patch("platform.system", return_value="Windows"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua")
-            assert result == "default_ua"
-
-    def test_guess_user_agent_windows_no_nt_pattern(self):
-        """Windows UA matches host-substring guard but lacks 'Windows NT N' (149→146)."""
-        user_agents = [
-            "Mozilla/5.0 (Windows; en-US) Chrome/120.0.0.0",  # no NT version
-        ]
-        with patch("platform.system", return_value="Windows"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_macos_no_version_pattern(self):
-        """macOS UA matches host-substring guard but lacks 'Mac OS X N' (158→155)."""
-        user_agents = [
-            "Mozilla/5.0 (Macintosh; en-US) Chrome/120.0.0.0",  # no Mac OS X version
-        ]
-        with patch("platform.system", return_value="Darwin"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_unknown_os_falls_through(self):
-        """OS not in {Windows, Darwin, Linux} skips all branches (163→178)."""
-        user_agents = [
-            "Mozilla/5.0 (X11; FreeBSD) Chrome/120.0.0.0",
-        ]
-        with patch("platform.system", return_value="FreeBSD"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_linux_empty_list(self):
-        """Linux + empty user_agents → for-loop body skipped (164→178)."""
-        with patch("platform.system", return_value="Linux"):
-            result = guess_user_agent([], "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
-
-    def test_guess_user_agent_linux_first_ua_filtered(self):
-        """Linux loop continues past UAs missing browser or 'Linux' substring (165→164)."""
-        user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; ...) Chrome/120.0.0.0",  # no Linux substring
-            "Mozilla/5.0 (X11; Linux 5.10) AppleWebKit/537.36 Chrome/120.0.0.0",  # match
-        ]
-        with patch("platform.system", return_value="Linux"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua")
-            assert "Linux 5.10" in result
-
-    def test_guess_user_agent_linux_no_version_pattern(self):
-        """Linux UA matches host-substring guard but lacks 'Linux N' (167→164)."""
-        user_agents = [
-            "Mozilla/5.0 (X11; Linux) Chrome/120.0.0.0",  # no version after Linux
-        ]
-        with patch("platform.system", return_value="Linux"):
-            result = guess_user_agent(user_agents, "Chrome", "default_ua_fallback")
-            assert result == "default_ua_fallback"
+        assert result.base_url == expected_base
+        assert result.file_url == expected_file
 
 
 class TestGetReleaseInfoFromGithub:
     """Tests for the get_release_info_from_github function."""
 
-    def test_get_release_info_success(self):
-        """Test get_release_info_from_github with successful response."""
-        mock_response = MagicMock()
-        mock_response.status_code = 200
-        mock_response.json.return_value = {
+    def test_get_release_info_all_arms(self):
+        """Drive the real ``get_release_info_from_github`` over a single respx
+        route on the GitHub releases URL, covering every branch in call order.
+
+        Replaces five ``patch("httpx.get", ...)`` tests (a respx-rule
+        violation: HTTP must be intercepted by respx, never by patching httpx
+        directly). ``httpx.get`` is sync, so we drive a sync ``respx.mock``
+        context here -- the existing async ``respx_*`` fixtures bootstrap a
+        Fansly/async client and cannot serve a plain sync GitHub request.
+
+        One route, one ``side_effect`` list, consumed in order:
+
+        1. 200 + JSON       -> returns the parsed release dict
+        2. 204              -> passes raise_for_status(), then non-200 guard
+                               returns None (a 4xx/5xx would raise first and
+                               skip the guard, so a 2xx-non-200 is required to
+                               exercise the ``status_code != 200`` branch)
+        3. ConnectError     -> network error caught -> None
+        4. TimeoutException -> timeout caught -> None
+        5. 500              -> raise_for_status() raises HTTPStatusError -> None
+
+        The request itself is asserted via ``route.calls`` (the
+        ``user-agent`` header carries the program version).
+        """
+        release_json = {
             "tag_name": "v1.2.3",
             "name": "Release 1.2.3",
             "body": "Release notes",
         }
 
-        with patch("httpx.get", return_value=mock_response) as mock_get:
-            result = get_release_info_from_github("1.0.0")
-            assert result == {
-                "tag_name": "v1.2.3",
-                "name": "Release 1.2.3",
-                "body": "Release notes",
-            }
-            mock_get.assert_called_once()
-            # Verify correct headers
-            call_kwargs = mock_get.call_args.kwargs
-            assert "Fansly Downloader NG 1.0.0" in call_kwargs["headers"]["user-agent"]
+        with (
+            respx.mock(assert_all_called=True) as respx_mock
+        ):  # CCH:respx-mock  # sync httpx.get; async respx_* fixtures serve only Fansly/async clients
+            route = respx_mock.get(GITHUB_RELEASES_URL).mock(
+                side_effect=[
+                    httpx.Response(200, json=release_json),
+                    httpx.Response(204),
+                    httpx.ConnectError("Network error"),
+                    httpx.TimeoutException("Timeout"),
+                    httpx.Response(500),
+                ]
+            )
 
-    def test_get_release_info_non_200_status(self):
-        """Test get_release_info_from_github with non-200 status code."""
-        mock_response = MagicMock()
-        mock_response.status_code = 404
+            try:
+                # Arm 1: success
+                assert get_release_info_from_github("1.0.0") == release_json
+                # Arm 2: non-200 (204) status -- passes raise_for_status()
+                assert get_release_info_from_github("1.0.0") is None
+                # Arm 3: network error
+                assert get_release_info_from_github("1.0.0") is None
+                # Arm 4: timeout
+                assert get_release_info_from_github("1.0.0") is None
+                # Arm 5: HTTP 500 -> raise_for_status raises
+                assert get_release_info_from_github("1.0.0") is None
+            finally:
+                dump_fansly_calls(route.calls, "GitHub release info calls")
 
-        with patch("httpx.get", return_value=mock_response):
-            result = get_release_info_from_github("1.0.0")
-            assert result is None
-
-    def test_get_release_info_network_error(self):
-        """Test get_release_info_from_github with network error."""
-        with patch("httpx.get", side_effect=httpx.ConnectError("Network error")):
-            result = get_release_info_from_github("1.0.0")
-            assert result is None
-
-    def test_get_release_info_timeout(self):
-        """Test get_release_info_from_github with timeout."""
-        with patch("httpx.get", side_effect=httpx.TimeoutException("Timeout")):
-            result = get_release_info_from_github("1.0.0")
-            assert result is None
-
-    def test_get_release_info_http_error(self):
-        """Test get_release_info_from_github with HTTP error."""
-        mock_response = MagicMock()
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "Error", request=MagicMock(), response=mock_response
-        )
-
-        with patch("httpx.get", return_value=mock_response):
-            result = get_release_info_from_github("1.0.0")
-            assert result is None
+            assert route.called
+            assert route.call_count == 5
+            # Every request carries the version-stamped user-agent header.
+            for call in route.calls:
+                assert (
+                    call.request.headers["user-agent"] == "Fansly Downloader NG 1.0.0"
+                )
 
 
 class TestStripUrlParams:
     """Lines 15-25: strip_url_params removes query string + fragment."""
 
-    def test_url_with_query_string_stripped(self):
-        result = strip_url_params("https://fansly.com/post/123?foo=1&bar=2")
-        assert result == "https://fansly.com/post/123"
-
-    def test_url_with_fragment_stripped(self):
-        result = strip_url_params("https://fansly.com/post/123#section")
-        assert result == "https://fansly.com/post/123"
-
-    def test_url_with_both_query_and_fragment_stripped(self):
-        result = strip_url_params("https://example.com/path?a=1&b=2#frag")
-        assert result == "https://example.com/path"
-
-    def test_url_without_query_or_fragment_unchanged(self):
-        result = strip_url_params("https://fansly.com/post/123")
-        assert result == "https://fansly.com/post/123"
-
-    def test_url_preserves_scheme_and_netloc(self):
-        result = strip_url_params(
-            "https://cdn.fansly.com/media/abc.mp4?Key-Pair-Id=K123&Signature=xyz"
-        )
-        assert result == "https://cdn.fansly.com/media/abc.mp4"
+    @pytest.mark.parametrize(
+        ("url", "expected"),
+        [
+            pytest.param(
+                "https://fansly.com/post/123?foo=1&bar=2",
+                "https://fansly.com/post/123",
+                id="query-string-stripped",
+            ),
+            pytest.param(
+                "https://fansly.com/post/123#section",
+                "https://fansly.com/post/123",
+                id="fragment-stripped",
+            ),
+            pytest.param(
+                "https://example.com/path?a=1&b=2#frag",
+                "https://example.com/path",
+                id="query-and-fragment-stripped",
+            ),
+            pytest.param(
+                "https://fansly.com/post/123",
+                "https://fansly.com/post/123",
+                id="no-params-unchanged",
+            ),
+            pytest.param(
+                "https://cdn.fansly.com/media/abc.mp4?Key-Pair-Id=K123&Signature=xyz",
+                "https://cdn.fansly.com/media/abc.mp4",
+                id="scheme-and-netloc-preserved",
+            ),
+        ],
+    )
+    def test_strip_url_params(self, url: str, expected: str) -> None:
+        """strip_url_params removes query string and fragment, keeping the rest."""
+        assert strip_url_params(url) == expected
